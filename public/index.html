@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>3D School Attendance</title>
+    <link rel="icon" href="cdoc-logo.png" type="image/png" />
+    <link rel="stylesheet" href="../src/styles/App.css" />
+    <script>
+      (function () {
+        try {
+          var p = window.location.pathname || '';
+          var last = p.split('/').filter(Boolean).pop() || '';
+          if (last.toLowerCase() === 'public' && !p.endsWith('/')) {
+            var q = window.location.search || '';
+            var h = window.location.hash || '';
+            window.location.replace(p + '/' + q + h);
+          }
+        } catch (e) {
+          // If this fails, fall through and let the page load as-is.
+        }
+      })();
+    </script>
+
+    <!-- Bootstrap CSS and Icons -->
+    <link href="vendor/bootstrap/bootstrap.min.css" rel="stylesheet">
+    <link href="vendor/bootstrap-icons/bootstrap-icons.css" rel="stylesheet">
+
+    <link rel="stylesheet" href="vendor/sweetalert2/sweetalert2.min.css" />
+
+    <!-- Enable Tailwind CSS via Play CDN for development / quick access -->
+         <!-- Enable Tailwind CSS via Play CDN for development / quick access -->
+    <script src="vendor/three/three.min.js"></script>
+    <script src="vendor/three/OrbitControls.js"></script>
+    <script src="vendor/three/GLTFLoader.js"></script>
+    <script src="vendor/three/OBJLoader.js"></script>
+    <script src="vendor/three/STLLoader.js"></script>
+    <script src="vendor/fflate/fflate.min.js"></script>
+    <script src="vendor/three/NURBSUtils.js"></script>
+    <script src="vendor/three/NURBSCurve.js"></script>
+    <script src="vendor/three/FBXLoader.js"></script>
+    <script src="vendor/html2pdf/html2pdf.bundle.min.js"></script>
+    <script src="vendor/tailwind/tailwindcss.js"></script>
+    <script>
+      // Optional: configure Tailwind if you need to extend theme or preserve class names
+      tailwind.config = {
+        theme: {
+          extend: {
+            // ensure the green matches your header if you want a custom shade
+            colors: {
+              // keep default palette; override only if necessary
+            }
+          }
+        }
+      }
+    </script>
+
+    <!-- Small custom styles (scrollbar) referenced by the app) -->
+    <style>
+      .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+      .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+      .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.6); border-radius: 9999px; }
+      .custom-scrollbar { scrollbar-width: thin; scrollbar-color: rgba(148,163,184,0.6) transparent; }
+    </style>
+  </head>
+  <body>
+    <!-- Inline SVG wave (vector, not an external image). Placed before #root so it's behind the app content. -->
+    <div id="bg-wave" aria-hidden="true">
+      <svg viewBox="0 0 1652 1168" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M0 500 C30 840 190 1030 470 1030 C760 1030 1090 860 1652 460 L1652 1168 L0 1168 Z" fill="#218f57" />
+      </svg>
+    </div>
+    <div id="root"></div>
+
+    <!-- Simple runtime error overlay to help debug blank page in browser -->
+    <div id="js-error-overlay" style="display:none;position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,0.85);color:#fff;padding:20px;z-index:99999;overflow:auto;white-space:pre-wrap;font-family:monospace;">
+      <div style="font-size:18px;font-weight:bold;margin-bottom:10px;">JavaScript Error</div>
+      <div id="js-error-content"></div>
+      <div style="margin-top:12px;"><button id="js-error-close" style="padding:8px 12px;border-radius:6px;border:none;background:#fff;color:#000;">Close</button></div>
+    </div>
+    <script>
+      (function(){
+        function showError(msg){
+          try{
+            var overlay = document.getElementById('js-error-overlay');
+            var content = document.getElementById('js-error-content');
+            if(overlay && content){ content.textContent = msg; overlay.style.display = 'block'; }
+            else alert(msg);
+          }catch(e){ console.error('Error overlay failed', e); }
+        }
+        window.addEventListener('error', function(e){ var s = (e && e.message) ? e.message + '\n' + (e.filename||'') + ':' + (e.lineno||'') : String(e); showError('Error: '+s); });
+        window.addEventListener('unhandledrejection', function(ev){ showError('UnhandledPromiseRejection:\n' + (ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason))); });
+        document.addEventListener('click', function(ev){ if(ev.target && ev.target.id === 'js-error-close'){ var o=document.getElementById('js-error-overlay'); if(o) o.style.display='none'; } });
+      })();
+    </script>
+
+    <!-- Ensure API base is available for api.js and modules -->
+    <script>
+      try {
+        if (typeof window !== 'undefined') {
+          (function(){
+            try {
+              var origin = window.location.origin.replace(/\/+$/, '');
+              var parts = window.location.pathname.split('/').filter(Boolean);
+              var projectRoot = '';
+
+              var host = (window.location.hostname || '').toLowerCase();
+              if (parts.length) {
+                var first = String(parts[0]).toLowerCase();
+                // If hostname indicates a devtunnel or similar hosted environment, don't use the first path segment as project root
+                if (first !== 'public' && host.indexOf('devtunnels.ms') === -1) {
+                  projectRoot = '/' + parts[0];
+                }
+              }
+
+              // Always (re)assign API_BASE so stale values or external overrides are corrected
+              window.API_BASE = origin + projectRoot + '/server-php/index.php/api';
+            } catch (inner) {
+              console.error('Failed to compute API_BASE dynamically', inner);
+            }
+          })();
+        }
+      } catch (e) { console.error('Failed to set API_BASE', e); }
+    </script>
+
+    <!-- D3 (required by dashboard visualizations) -->
+    <script src="vendor/d3/d3.v7.min.js"></script>
+    <script src="../socket-server/node_modules/socket.io/client-dist/socket.io.min.js"></script>
+
+    <!-- React and Babel (no build tools required) -->
+    <script src="vendor/react/react.development.js"></script>
+    <script src="vendor/react/react-dom.development.js"></script>
+    <script src="vendor/html5-qrcode/html5-qrcode.min.js"></script>
+    <!-- QR code generator (used by QrModal) -->
+    <!-- Intentionally omitted: we fall back to server-side QR when no client lib is available. -->
+    <!-- Spreadsheet parsing (XLSX/CSV import) -->
+    <script src="vendor/xlsx/xlsx.full.min.js"></script>
+    <!-- 3D viewer (model-viewer web component) -->
+    <script type="module" src="vendor/model-viewer/model-viewer.min.js"></script>
+    <!-- Note: a server-side QR proxy is available at /server-php/api/qrcode?data=... to avoid CORS issues -->
+    <script src="vendor/babel/babel.min.js"></script>
+    <script src="vendor/sweetalert2/sweetalert2.min.js"></script>
+
+    <!-- In-browser module loader + JSX transpilation (no bundler) -->
+    <script>
+      (async function(){
+        // Map of absolute URL -> blob URL
+        const blobCache = new Map();
+
+        // Map for generated virtual modules (like 'react' and 'react-dom')
+        const virtualCache = new Map();
+
+        function resolveUrl(specifier, baseUrl) {
+          try {
+            return new URL(specifier, baseUrl).href;
+          } catch (e) {
+            return specifier; // leave as-is for bare imports
+          }
+        }
+
+        // Create a virtual module that exposes UMD globals as ES module
+        function createVirtualModule(name) {
+          if (virtualCache.has(name)) return virtualCache.get(name);
+          let code = '';
+          if (name === 'react') {
+            code = `const R = window.React; export default R; export const {useState, useEffect, useRef, useContext, createContext, useReducer, useMemo, useCallback, Fragment, memo, useLayoutEffect} = R;`;
+          } else if (name === 'react-dom') {
+            code = `const RD = window.ReactDOM; export default RD;`;
+          } else if (name === 'html5-qrcode') {
+            code = `export default window.Html5Qrcode;`;
+          } else if (name === 'qrcode') {
+            code = `export default window.QRCode;`;
+          } else {
+            // fallback: expose global with same name (window[name])
+            code = `export default window['${name}'];`;
+          }
+          const blob = new Blob([code], { type: 'text/javascript' });
+          const url = URL.createObjectURL(blob);
+          virtualCache.set(name, url);
+          return url;
+        }
+
+        // Fetch, transform (JSX -> JS) and create blob URL for a module and its dependencies
+        async function processModule(url) {
+          if (!url) throw new Error('Invalid module URL: ' + url);
+          if (blobCache.has(url)) return blobCache.get(url);
+
+          // handle bare imports like 'react'
+          if (!/^https?:\/\//i.test(url) && !url.startsWith('/') && !url.startsWith('./') && !url.startsWith('../')) {
+            // treat as virtual
+            const v = createVirtualModule(url);
+            blobCache.set(url, v);
+            return v;
+          }
+
+          const resp = await fetch(url, { cache: 'no-store' });
+          if (!resp.ok) throw new Error('Failed to fetch ' + url + ' : ' + resp.statusText);
+          let code = await resp.text();
+
+          // find import/export specifiers to resolve dependencies
+          // match import ... from '...'; import '...'; export ... from '...'
+          // Match only real module import/export statements at line start.
+          // This avoids false positives like "users/import" inside string literals.
+          const importRegex = /^\s*import\s+(?:[^'";]+?\s+from\s+)?['"]([^'"]+)['"];?|^\s*export\s+[^;]*?from\s+['"]([^'"]+)['"]/gm;
+          let m;
+          const replacements = [];
+          while ((m = importRegex.exec(code)) !== null) {
+            const spec = m[1] || m[2];
+            if (!spec) continue;
+            // handle CSS imports by creating a virtual module that injects a <link> to the CSS
+            if (spec.endsWith('.css')) {
+              const cssAbs = resolveUrl(spec, url);
+              const cssModuleCode = `const href = ${JSON.stringify(cssAbs)}; (function(){ if(!document.querySelector('link[data-injected-module-css="'+href+'"]')){ var l=document.createElement('link'); l.rel='stylesheet'; l.href=href; l.setAttribute('data-injected-module-css', href); document.head.appendChild(l);} })(); export default href;`;
+              const cssBlob = new Blob([cssModuleCode], { type: 'text/javascript' });
+              const cssBlobUrl = URL.createObjectURL(cssBlob);
+              // treat this dependency as processed and use its blob URL
+              replacements.push({ start: m.index, spec, blob: cssBlobUrl });
+              continue;
+            }
+            let depUrl;
+            if (spec === 'react' || spec === 'react-dom' || spec === 'html5-qrcode' || spec === 'qrcode') {
+              depUrl = createVirtualModule(spec);
+            } else {
+              depUrl = resolveUrl(spec, url);
+              depUrl = await processModule(depUrl);
+            }
+            // record replacement: replace the original import specifier string with the blob URL
+            replacements.push({ start: m.index, spec, blob: depUrl });
+          }
+
+          // Replace import specifiers occurrences (simple replace of "spec" to "blobURL")
+          // Safer to replace all exact occurrences of '"spec"' and '\'spec\'' with the blob URL
+          replacements.forEach(r => {
+            // build a RegExp that matches the original quoted import specifier and replace it with the blob URL
+            const escapedSpec = r.spec.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+            const re1 = new RegExp('(["\'])' + escapedSpec + '\\1', 'g');
+            code = code.replace(re1, `"${r.blob}"`);
+          });
+
+          // transpile JSX (preserve import/export) with Babel standalone
+          try {
+            const transformed = Babel.transform(code, { presets: ['react'], sourceType: 'module' }).code;
+            const blob = new Blob([transformed], { type: 'text/javascript' });
+            const blobUrl = URL.createObjectURL(blob);
+            blobCache.set(url, blobUrl);
+            return blobUrl;
+          } catch (err) {
+            console.error('Babel transform failed for', url, err);
+            throw err;
+          }
+        }
+
+        // Start from the src entry relative to this HTML file
+        const entry = new URL('../src/index.jsx', window.location.href).href;
+        try {
+          const entryBlob = await processModule(entry);
+          await import(entryBlob);
+        } catch (err) {
+          console.error('Module loader error', err);
+          // show on overlay
+          const overlay = document.getElementById('js-error-overlay');
+          const content = document.getElementById('js-error-content');
+          if (overlay && content) { content.textContent = String(err); overlay.style.display = 'block'; }
+        }
+      })();
+    </script>
+
+  </body>
+</html>

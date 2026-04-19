@@ -1,0 +1,6 @@
+{
+  "require": {
+    "firebase/php-jwt": "^6.10",
+    "endroid/qr-code": "^6.0"
+  }
+}

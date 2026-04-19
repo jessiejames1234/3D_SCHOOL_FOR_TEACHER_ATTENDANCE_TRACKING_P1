@@ -1,0 +1,27 @@
+System Security Checklist
+
+1. Use a strong JWT secret from environment variables (never hardcode secrets).
+2. Rotate JWT and mail credentials regularly.
+3. Keep CORS restricted to trusted origins only.
+4. Force HTTPS in production for all API and frontend traffic.
+5. Hash passwords securely (bcrypt/`password_hash`) and never store plain passwords.
+6. Enforce strong password rules (length, letter, number, special character).
+7. Keep forgot-password OTP short-lived (2-minute expiry).
+8. Add resend cooldown and OTP attempt limits to prevent brute force.
+9. Lock accounts temporarily after repeated failed login attempts.
+10. Use prepared statements for all database queries to prevent SQL injection.
+11. Validate and sanitize all user input on the server side.
+12. Enforce role-based access control for every protected endpoint.
+13. Verify JWT on all protected routes and reject invalid/expired tokens.
+14. Avoid exposing detailed backend errors to end users in production.
+15. Add API rate limiting per IP/user for login, OTP, and sensitive endpoints.
+16. Log security events (failed login, reset attempts, permission errors).
+17. Monitor logs and set alerts for suspicious patterns.
+18. Use least-privilege database accounts (no root in production).
+19. Keep PHP, npm packages, and server dependencies updated and patched.
+20. Set secure HTTP headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options).
+21. Protect against CSRF for state-changing requests.
+22. Secure file/folder permissions on server config and logs.
+23. Disable debug modes and remove test credentials before deployment.
+24. Backup database regularly and test restore procedures.
+25. Perform regular vulnerability scans and penetration testing.

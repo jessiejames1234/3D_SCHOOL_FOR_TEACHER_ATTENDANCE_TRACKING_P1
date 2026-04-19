@@ -1,0 +1,52 @@
+Codebase check for items 1-27
+Reviewed on 2026-04-19 by inspecting the current frontend, backend, and database files.
+Legend: Implemented = clear code evidence found, Partial = exists but incomplete/uneven, Not Implemented = I could not confirm full support.
+
+A. ENHANCED USER MANAGEMENT MODULE
+1. Implemented - User roles are integrated across modules through route guards, navbar filtering, and backend role handling (`src/App.jsx`, `src/components/Navbar.jsx`, `src/utils/moduleAccess.js`, `server-php/api/main.php`).
+2. Implemented - Dynamic per-user module permissions are now enforced consistently in backend route handling through shared permission helpers plus the existing frontend guards/settings flow (`server-php/helpers/functions.php`, `server-php/index.php`, `src/pages/Settings/Index.jsx`, `src/utils/moduleAccess.js`).
+3. Implemented - User profile viewing now includes a full self-service update flow for avatar, first name, last name, email, and contact number (`src/components/Navbar.jsx`, `server-php/api/user_profile.php`).
+4. Implemented - Account activation/deactivation/archive flows exist in user management and are enforced during login (`src/pages/User/Index.jsx`, `server-php/api/main.php`, `server-php/api/login.php`).
+5. Implemented - Session expiry now includes inactivity timeout, stored activity tracking, cross-tab sync, and client-side token-expiry checks in addition to JWT expiration (`server-php/api/login.php`, `src/context/AuthContext.jsx`, `src/services/api.js`).
+
+B. EXPANDED CORE FUNCTIONAL MODULE
+6. Implemented - Major modules are present: users, attendance, rooms, buildings, schedules, departments, programs, sections, subjects, leaves, substitutions, reports, logs, settings, dashboards, and 3D building views (`src/App.jsx`, `server-php/index.php`).
+7. Implemented - Complete cross-module workflows are present, including attendance, leave filing, substitute handling, request-edit approval, reporting, and user administration (`src/pages/Attendance/Index.jsx`, `src/pages/Attendance_History/index.jsx`, `src/pages/Teaching_Schedule/index.jsx`, `server-php/api/request-edit.php`, `server-php/api/substitute.php`, `server-php/api/leaves.php`).
+8. Implemented - Complex business logic exists beyond CRUD, such as schedule conflict checks, geolocation/altitude/QR attendance rules, overlap validation, approval flows, and scoped role logic (`server-php/api/main.php`, `src/pages/Attendance/Index.jsx`, `server-php/api/leaves.php`).
+9. Implemented - The system uses database transactions in multi-step operations and rolls back on failure (`server-php/api/substitute.php`, `server-php/api/request-edit.php`, `server-php/api/academic.php`).
+10. Implemented - Core data flow between modules now has a consistent live-update path using Socket.IO on both client and server, and JWT payloads now include `dept_id` for department-room broadcasts (`public/index.html`, `src/utils/liveUpdates.js`, `src/pages/Dashboard/Index.jsx`, `src/pages/My_Dashboard/Index.jsx`, `src/pages/Department/Index.jsx`, `socket-server/server.js`, `server-php/api/login.php`).
+11. Implemented - Edge cases and alternative flows are handled in several areas, including duplicate checks, overlap checks, conflict validation, inactive-account blocking, approval guards, and polling fallback (`server-php/api/main.php`, `server-php/api/leaves.php`, `server-php/api/login.php`, `src/pages/Dashboard/Index.jsx`).
+12. Implemented - Redundant backup/legacy code artifacts were removed from the repo, including old navbar, attendance, teaching-schedule, class-schedule, and PHP API backup files.
+
+C. ADVANCED DATABASE IMPLEMENTATION
+13. Implemented - The database design covers the system's core requirements, including users, roles, departments, programs, sections, subjects, schedules, rooms, floors, attendance, leaves, substitutions, penalties, notifications, and login locks (`server-php/bk_teacher_gps1 (2).sql`).
+14. Implemented - Table relationships are defined with foreign keys and multi-entity links across the schema (`server-php/bk_teacher_gps1 (2).sql`).
+15. Implemented - Transactions and data consistency handling are present in real multi-step backend flows (`server-php/api/substitute.php`, `server-php/api/request-edit.php`, `server-php/api/academic.php`).
+16. Implemented - Validation is enforced at backend level and supported by database structure such as foreign keys, required fields, and typed columns (`server-php/api/login.php`, `server-php/api/main.php`, `server-php/api/leaves.php`, `server-php/bk_teacher_gps1 (2).sql`).
+17. Implemented - The database-backed real-time path is now complete end-to-end with worker/socket triggers feeding Socket.IO clients through a matching live-update transport (`server-php/api/worker-bootstrap.php`, `server-php/scripts/cron_worker_lib.php`, `socket-server/server.js`, `src/utils/liveUpdates.js`, `src/pages/Dashboard/Index.jsx`).
+
+D. SYSTEM ARCHITECTURE & MODULE INTEGRATION
+18. Implemented - The architecture reflects the actual implementation: React frontend, PHP API layer, MySQL schema, helpers/config, and a separate socket server.
+19. Implemented - Frontend, backend, and database are connected throughout the system via API calls, auth state, and DB-backed workflows (`src/services/api.js`, `server-php/index.php`, `server-php/config/database.php`).
+20. Implemented - APIs/controllers are actively handling requests, validation, auth, and structured responses across the system (`server-php/api/*.php`).
+21. Implemented - Modular structure and separation of concerns are visible in `src/pages`, `src/components`, `src/context`, `src/services`, `server-php/api`, `server-php/helpers`, and `server-php/config`.
+22. Implemented - Navigation is structured and logical through routed pages plus permission-aware navbar/menu filtering (`src/App.jsx`, `src/components/Navbar.jsx`).
+
+E. INTERFACE FUNCTIONALITY & USER INTERACTION
+23. Implemented - Major forms are functional and backend-connected, including the profile-management form for avatar and editable profile fields alongside login, user CRUD, departments, schedules, leaves, request edits, and substitutions (`src/pages/Login/Index.jsx`, `src/pages/User/Index.jsx`, `src/pages/Department/Index.jsx`, `src/pages/Teaching_Schedule/index.jsx`, `src/components/Navbar.jsx`, `server-php/api/user_profile.php`).
+24. Implemented - The interface uses dynamic API-driven content rather than static-only pages (`src/pages/*`, `src/services/api.js`).
+25. Implemented - The system provides user feedback for actions through success/error messages and dialogs in multiple workflows (`src/pages/Login/Index.jsx`, `src/pages/User/Index.jsx`, `src/pages/Attendance_History/index.jsx`, `src/pages/Teaching_Schedule/index.jsx`).
+26. Implemented - Error handling is integrated within workflows through validation messages, guarded responses, try/catch handling, and UI error states (`src/services/api.js`, `server-php/api/*.php`, multiple page components).
+27. Implemented - The interface supports real system operations, not just demo screens, because it performs actual attendance logging, approvals, CRUD operations, reporting, leave processing, and substitutions against the backend/database.
+
+Conservative summary
+Implemented: 27
+Partial: 0
+Not Implemented: 0
+
+Recent revisions that closed the previous gaps
+- Item 2: backend API access now runs through shared module-permission enforcement.
+- Items 3 and 23: the profile modal now saves avatar plus editable account fields.
+- Item 5: inactivity/session tracking is now handled in the client auth layer.
+- Items 10 and 17: live updates now use Socket.IO consistently and include `dept_id` in JWT payloads.
+- Item 12: legacy backup files were removed from the repo.
