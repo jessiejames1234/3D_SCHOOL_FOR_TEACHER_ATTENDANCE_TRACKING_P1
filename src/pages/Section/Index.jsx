@@ -24,9 +24,9 @@ function SectionIndex() {
   const isProgramHead = Number(user?.role_id) === 3;
   const isSecretary = Number(user?.role_id) === 4;
   
-  // Program heads can edit assigned rows, but only admin can add new records.
-  const canEdit = isAdmin || isProgramHead;
-  const canAdd = isAdmin;
+  // Only admin and dean can manage sections.
+  const canEdit = isAdmin || isDean;
+  const canAdd = isAdmin || isDean;
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
@@ -93,25 +93,27 @@ function SectionIndex() {
     let list = programs;
     if (isProgramHead) {
       list = list.filter(p => Number(p.head_id) === Number(user?.user_id));
+    } else if (isDean) {
+      list = list.filter(p => Number(p.dept_id) === Number(user?.dept_id));
     }
     return list;
-  }, [programs, isProgramHead, user]);
+  }, [programs, isProgramHead, isDean, user]);
 
 
-  const checkProgramHeadPermission = (rowProgramHeadId) => {
+  const checkManagePermission = (row) => {
     if (isAdmin) return true;
-    if (isProgramHead && Number(rowProgramHeadId) !== Number(user?.user_id)) {
-      try { if (window.Swal) window.Swal.fire('Unauthorized', 'You can only modify sections assigned to your specific program.', 'error'); else alert('Unauthorized'); } catch(e){}
+    if (isDean && Number(row?.dept_id) !== Number(user?.dept_id)) {
+      try { if (window.Swal) window.Swal.fire('Unauthorized', 'You can only modify sections inside your assigned department.', 'error'); else alert('Unauthorized'); } catch(e){}
       return false;
     }
-    return true;
+    return isDean;
   };
 
 
   const openModal = (sec=null) => { 
     setError(''); 
     if (sec) { 
-      if (!checkProgramHeadPermission(sec.head_id)) return;
+      if (!checkManagePermission(sec)) return;
       setEditing(sec); 
       setForm({ section_name: sec.section_name||'', program_id: sec.program_id||'', year_id: sec.year_id||'' }); 
     } else { 
@@ -149,7 +151,7 @@ function SectionIndex() {
         );
       } else {
         if (!canAdd) {
-          const msg = 'Only admin can add sections.';
+          const msg = 'Only admin and dean can add sections.';
           try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Unauthorized', text: msg }); else alert(msg); } catch(e){}
           setLoading(false);
           return;
@@ -170,7 +172,7 @@ function SectionIndex() {
 
   const handleToggle = async (sec) => {
     if (!sec || !sec.section_id) return;
-    if (!checkProgramHeadPermission(sec.head_id)) return;
+    if (!checkManagePermission(sec)) return;
 
     const newStatus = String(sec.status) === 'active' ? 'inactive' : 'active';
     try {
@@ -185,7 +187,7 @@ function SectionIndex() {
 
   const handleArchive = async (sec) => {
     if (!sec || !sec.section_id) return;
-    if (!checkProgramHeadPermission(sec.head_id)) return;
+    if (!checkManagePermission(sec)) return;
 
     try {
       const res = window.Swal ? await window.Swal.fire({ title: 'Archive section?', text: 'This will remove the section from the active list.', icon: 'warning', showCancelButton: true }) : { isConfirmed: confirm('Archive section?') };
@@ -269,6 +271,11 @@ function SectionIndex() {
               <option value="">Select program</option>
               {addEditPrograms.map(p => React.createElement('option', { key: p.program_id, value: p.program_id }, p.program_name))}
             </select>
+            {isDean && (
+              <div className="mt-1 text-xs text-gray-500">
+                Programs are limited to your assigned department.
+              </div>
+            )}
           </div>
           
           <div>

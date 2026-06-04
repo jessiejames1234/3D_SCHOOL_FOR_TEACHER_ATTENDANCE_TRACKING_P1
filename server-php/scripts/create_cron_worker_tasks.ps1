@@ -2,10 +2,10 @@
 Creates Windows Scheduled Tasks for cron/worker replacement of MySQL EVENTS.
 
 Tasks created:
-1) 3D1.2_AcademicAttendanceWorker
+1) <project-folder>_AcademicAttendanceWorker
    - Starts at boot
    - Runs continuously every 5 seconds (inside PHP worker loop)
-2) 3D1.2_DailyAcademicUpdate
+2) <project-folder>_DailyAcademicUpdate
    - Runs daily at 00:05 as safety fallback
 
 Run in elevated PowerShell:
@@ -24,11 +24,18 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$serverPhpDir = Split-Path -Parent $scriptDir
+$projectRoot = Split-Path -Parent $serverPhpDir
+$projectTag = Split-Path -Leaf $projectRoot
+if ([string]::IsNullOrWhiteSpace($projectTag)) {
+    $projectTag = "3D1.3"
+}
+
 $workerScript = Join-Path $scriptDir "academic-attendance-worker.php"
 $dailyScript = Join-Path $scriptDir "daily-academic-update.php"
 
-$workerTask = "3D1.2_AcademicAttendanceWorker"
-$dailyTask = "3D1.2_DailyAcademicUpdate"
+$workerTask = "${projectTag}_AcademicAttendanceWorker"
+$dailyTask = "${projectTag}_DailyAcademicUpdate"
 $legacyTask = "3DSchool_GenerateAttendance"
 
 Write-Host "PHP executable: $PhpExe"
@@ -55,13 +62,19 @@ $workerCmd = "cmd /c `"$PhpExe`" `"$workerScript`" --interval=5"
 $dailyCmd = "cmd /c `"$PhpExe`" `"$dailyScript`""
 
 Write-Host ""
-Write-Host "Removing legacy task (if present): $legacyTask"
-cmd /c "schtasks /Query /TN `"$legacyTask`" >nul 2>&1"
-if ($LASTEXITCODE -eq 0) {
-    schtasks /Delete /TN $legacyTask /F | Out-Null
-    Write-Host "Removed legacy task: $legacyTask"
-} else {
-    Write-Host "Legacy task not found. Skipping."
+$legacyTasks = @($legacyTask)
+if ($workerTask -ne "3D1.2_AcademicAttendanceWorker") { $legacyTasks += "3D1.2_AcademicAttendanceWorker" }
+if ($dailyTask -ne "3D1.2_DailyAcademicUpdate") { $legacyTasks += "3D1.2_DailyAcademicUpdate" }
+
+foreach ($task in $legacyTasks | Select-Object -Unique) {
+    Write-Host "Removing legacy task (if present): $task"
+    cmd /c "schtasks /Query /TN `"$task`" >nul 2>&1"
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /Delete /TN $task /F | Out-Null
+        Write-Host "Removed legacy task: $task"
+    } else {
+        Write-Host "Legacy task not found. Skipping."
+    }
 }
 
 Write-Host ""

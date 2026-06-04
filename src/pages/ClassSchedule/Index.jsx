@@ -95,8 +95,9 @@ function ClassScheduleIndex(){
   const isDean = Number(user?.role_id) === 2;
   const isProgramHead = Number(user?.role_id) === 3;
   const isSecretary = Number(user?.role_id) === 4;
-  const canEdit = isAdmin || isProgramHead;
-  const canUseBulkScheduleTools = canEdit && !isProgramHead;
+  const canManageSchedules = isAdmin || isDean || isProgramHead;
+  const canEdit = canManageSchedules;
+  const canUseBulkScheduleTools = isAdmin || isDean;
   const bulkToolsDisabledMessage = 'Batch add and spreadsheet import are temporarily disabled for Program Head accounts.';
 
   const ensureBulkToolsAllowed = useCallback((showNotice = false) => {
@@ -143,7 +144,18 @@ function ClassScheduleIndex(){
     return '';
   }, [isProgramHead, user, programHeadProgram]);
 
-  const effectiveHeaderDept = isProgramHead ? String(programHeadDeptId || '') : String(headerDept || '');
+  const deanDeptId = useMemo(() => {
+    if (!isDean) return '';
+    return user?.dept_id ? String(user.dept_id) : '';
+  }, [isDean, user]);
+
+  const fixedScheduleDeptId = useMemo(() => {
+    if (isProgramHead) return String(programHeadDeptId || '');
+    if (isDean) return String(deanDeptId || '');
+    return '';
+  }, [isProgramHead, programHeadDeptId, isDean, deanDeptId]);
+
+  const effectiveHeaderDept = (isProgramHead || isDean) ? String(fixedScheduleDeptId || '') : String(headerDept || '');
   const effectiveHeaderProgram = isProgramHead ? String(programHeadProgramId || '') : String(headerProgram || '');
 
   // helper: format 24h time to 12h AM/PM
@@ -288,6 +300,11 @@ function ClassScheduleIndex(){
     if (programHeadProgramId) setHeaderProgram(String(programHeadProgramId));
   }, [isProgramHead, programHeadDeptId, programHeadProgramId]);
 
+  useEffect(() => {
+    if (!isDean || !deanDeptId) return;
+    setHeaderDept(String(deanDeptId));
+  }, [isDean, deanDeptId]);
+
   // Compute available teachers early so batchTeachers can use it
   const availableTeachers = useMemo(() => {
     let list = teachers;
@@ -346,6 +363,19 @@ function ClassScheduleIndex(){
     if (!effectiveHeaderDept) return activePrograms;
     return activePrograms.filter(p => String(p.dept_id) === String(effectiveHeaderDept));
   }, [activePrograms, isProgramHead, effectiveHeaderDept, effectiveHeaderProgram]);
+
+  useEffect(() => {
+    if (!isDean || isProgramHead) return;
+    if (!headerProgram) {
+      const firstProgramId = filteredPrograms[0]?.program_id ? String(filteredPrograms[0].program_id) : '';
+      if (firstProgramId) setHeaderProgram(firstProgramId);
+      return;
+    }
+    const valid = filteredPrograms.some(p => String(p.program_id) === String(headerProgram));
+    if (!valid) {
+      setHeaderProgram(filteredPrograms[0]?.program_id ? String(filteredPrograms[0].program_id) : '');
+    }
+  }, [isDean, isProgramHead, filteredPrograms, headerProgram]);
 
   const filteredSubjects = useMemo(() => {
     if (isProgramHead && !effectiveHeaderProgram) return [];
@@ -992,7 +1022,6 @@ function ClassScheduleIndex(){
     };
 
     // Extract extra details for deeper conflict validation
-    const selectedTeacherId = payload.user_id || null;
     const selectedSectionId = payload.section_id || null;
     const selectedSubjectId = payload.subject_id || null;
 
@@ -1050,15 +1079,6 @@ function ClassScheduleIndex(){
 
       // Time Overlap Check
       if (overlap(sStart, sEnd, schStart, schEnd)) {
-        const isSameTeacher = selectedTeacherId && Number(sch.teacher_id ?? sch.user_id) === selectedTeacherId;
-        const isSameSubjectExactSlot = Number(sch.subject_id || 0) === Number(payload.subject_id)
-          && String(sch.start_time).slice(0,5) === String(payload.start_time).slice(0,5)
-          && String(sch.end_time).slice(0,5) === String(payload.end_time).slice(0,5);
-        if (isSameSubjectExactSlot && !isSameTeacher) {
-          swalFire({ icon:'error', title:'Subject-Time Conflict', text:'Same subject and exact time can only be assigned to the same teacher.' });
-          setLoading(false); return;
-        }
-        
         // 1. Room Conflict: block for any overlap on the same room
         if (Number(sch.room_id) === payload.room_id) {
           swalFire({ icon:'error', title:'Room Conflict', text:`Room ${sch.room_name} already has a class during this time.` });
@@ -1483,18 +1503,26 @@ function ClassScheduleIndex(){
       });
       return;
     }
-    const scopedDeptId = isProgramHead ? (programHeadDeptId || '') : '';
+    const scopedDeptId = isProgramHead ? (programHeadDeptId || '') : (isDean ? (deanDeptId || '') : '');
     const scopedProgramId = isProgramHead ? (programHeadProgramId || '') : '';
 
     // If headers are empty, set sensible defaults from loaded lists - do not overwrite if user already set filters
     setHeaderDept(h => {
-      if (isProgramHead) return scopedDeptId || h || '';
+      if (isProgramHead || isDean) return scopedDeptId || h || '';
       return h || (activeDepartments[0]?.dept_id ?? '');
     });
 
     // Choose a default program within the chosen/default department without relying on filteredPrograms
     setHeaderProgram(h => {
       if (isProgramHead) return scopedProgramId || h || '';
+      if (isDean) {
+        if (h) {
+          const valid = activePrograms.some(pp => String(pp.program_id) === String(h) && String(pp.dept_id) === String(scopedDeptId || ''));
+          if (valid) return h;
+        }
+        const p = activePrograms.find(pp => String(pp.dept_id) === String(scopedDeptId || ''));
+        if (p) return p.program_id;
+      }
       if (h) return h;
       const depId = headerDept || (activeDepartments[0]?.dept_id ?? null);
       if (depId) {
@@ -1564,7 +1592,6 @@ function ClassScheduleIndex(){
       const subjectId = Number(row.subject_id || 0);
       const sectionId = Number(row.section_id || 0);
       const teacherId = Number((row.teacher_id ?? row.user_id) || 0);
-      const sameTeacher = teacherId > 0 && teacherId === Number(candidate.user_id);
       const rowSemesterId = Number(row.semester_id || activeSemesterId || 0);
       if (Number(activeSemesterId) && rowSemesterId && rowSemesterId !== Number(activeSemesterId)) continue;
 
@@ -1575,18 +1602,12 @@ function ClassScheduleIndex(){
         && rowSemesterId === Number(activeSemesterId || rowSemesterId)
         && String(row.start_time).slice(0,5) === String(candidate.start_time).slice(0,5)
         && String(row.end_time).slice(0,5) === String(candidate.end_time).slice(0,5);
-      const sameSubjectSameSlot = subjectId === Number(candidate.subject_id)
-        && String(row.start_time).slice(0,5) === String(candidate.start_time).slice(0,5)
-        && String(row.end_time).slice(0,5) === String(candidate.end_time).slice(0,5);
       const sameSectionSameSubject = sectionId === Number(candidate.section_id)
         && subjectId === Number(candidate.subject_id);
 
       if (isExact) return 'Duplicate schedule already exists.';
       if (sameSectionSameSubject) {
         return 'Duplicate not allowed: this section already has this subject on the selected day.';
-      }
-      if (sameSubjectSameSlot && !sameTeacher) {
-        return 'Subject-time conflict: same subject and exact time can only be assigned to the same teacher.';
       }
       if (!overlap(cStart, cEnd, start, end)) continue;
       if (roomId === Number(candidate.room_id)) return 'Room conflict: room already has a class during this time.';
@@ -1686,8 +1707,28 @@ function ClassScheduleIndex(){
       }
     }
 
+    if (isDean) {
+      const scopedDeptId = String(deanDeptId || '');
+      if (!scopedDeptId) {
+        issues.push('Your account has no assigned department.');
+        return issues;
+      }
+      const rowDeptId = rowProgramId ? String(programDeptIdByProgramId.get(String(rowProgramId)) || '') : '';
+      if (!rowDeptId) {
+        issues.push('Selected subject or section has no department assignment.');
+      } else if (rowDeptId !== scopedDeptId) {
+        issues.push('Subject/section is outside your assigned department.');
+      }
+      if (teacher) {
+        const teacherDeptId = teacher?.dept_id ? String(teacher.dept_id) : '';
+        if (teacherDeptId && teacherDeptId !== scopedDeptId) {
+          issues.push('Selected instructor belongs to a different department.');
+        }
+      }
+    }
+
     return issues;
-  }, [isProgramHead, programHeadProgramId, subjects, sections, teachers, resolveTeacherProgramId]);
+  }, [isProgramHead, programHeadProgramId, isDean, deanDeptId, programDeptIdByProgramId, subjects, sections, teachers, resolveTeacherProgramId]);
 
   const handleBatchAdd = () => {
     if (!ensureBulkToolsAllowed(true)) return;
@@ -2089,6 +2130,15 @@ function ClassScheduleIndex(){
             <div className="mt-1 text-xs text-slate-500">Refine schedules by schedule day, faculty, and location.</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {canManageSchedules && (
+              <button
+                type="button"
+                onClick={() => openModal(null)}
+                className={`${quickActionButtonClass} bg-emerald-600 text-white hover:bg-emerald-700`}
+              >
+                Add Schedule
+              </button>
+            )}
             <button
               type="button"
               className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-600 transition hover:bg-slate-100"
@@ -2281,8 +2331,8 @@ function ClassScheduleIndex(){
               <select
                 value={modalDept}
                 onChange={handleModalDeptChange}
-                disabled={isProgramHead}
-                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${isProgramHead ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
+                disabled={isProgramHead || isDean}
+                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${(isProgramHead || isDean) ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
               >
                 <option value="">All Departments</option>
                 {departments.map(d => <option key={d.dept_id} value={d.dept_id}>{d.dept_name}</option>)}
@@ -2304,6 +2354,11 @@ function ClassScheduleIndex(){
           {isProgramHead && (
             <div className="text-xs text-gray-500 -mt-2">
               Department and program are fixed to your assigned scope.
+            </div>
+          )}
+          {isDean && !isProgramHead && (
+            <div className="text-xs text-gray-500 -mt-2">
+              Department is fixed to your assigned scope.
             </div>
           )}
 
@@ -2666,8 +2721,8 @@ function ClassScheduleIndex(){
             </div>
             <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
               <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-3">Header Filters</div>
-              <div className={`grid grid-cols-1 ${isProgramHead ? 'md:grid-cols-2' : 'md:grid-cols-4'} gap-4`}>
-              {!isProgramHead && (
+              <div className={`grid grid-cols-1 ${isProgramHead ? 'md:grid-cols-2' : (isDean ? 'md:grid-cols-3' : 'md:grid-cols-4')} gap-4`}>
+              {!isProgramHead && !isDean && (
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Department</label>
                   <select value={headerDept} onChange={e=>setHeaderDept(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2">
@@ -2703,6 +2758,11 @@ function ClassScheduleIndex(){
             {isProgramHead && (
               <div className="mt-2 text-xs text-gray-600">
                 Department and program are fixed to your account assignment.
+              </div>
+            )}
+            {isDean && (
+              <div className="mt-2 text-xs text-gray-600">
+                Department is fixed to your account assignment.
               </div>
             )}
             {hasSchedulingDependencyBlockers && (

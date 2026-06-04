@@ -52,6 +52,31 @@ const formatTime12 = (value) => {
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
 
+const timeKey = (value) => String(value || '').slice(0, 5);
+
+const subjectKey = (record) => {
+  if (!record) return '';
+  if (record.subject_id !== undefined && record.subject_id !== null && String(record.subject_id) !== '') {
+    return `id:${record.subject_id}`;
+  }
+  return `text:${String(record.subject_code || record.subject_name || '').trim().toLowerCase()}`;
+};
+
+const isSameScheduleGroup = (a, b) => {
+  if (!a || !b) return false;
+  return String(a.date || '') === String(b.date || '')
+    && timeKey(a.start_time) === timeKey(b.start_time)
+    && timeKey(a.end_time) === timeKey(b.end_time)
+    && subjectKey(a) === subjectKey(b);
+};
+
+const isRecordActiveNow = (record, now = new Date()) => {
+  if (!record?.date || !record?.start_time || !record?.end_time) return false;
+  const start = new Date(`${record.date}T${record.start_time}`);
+  const end = new Date(`${record.date}T${record.end_time}`);
+  return now >= start && now <= end;
+};
+
 const getFlagLabel = (flagId) => {
   switch (flagId) {
     case 1: return 'NA';
@@ -125,6 +150,16 @@ export default function AttendanceIndex() {
       }) || null;
 
       if (parsed.schedule_id && active && (String(parsed.schedule_id) !== String(active.schedule_id))) {
+        const parsedRecord = todays.find(r => String(r.schedule_id) === String(parsed.schedule_id));
+        if (parsedRecord && isSameScheduleGroup(parsedRecord, active)) {
+          // Keep one QR scan alive when the teacher has multiple sections in the same subject/time slot.
+        } else {
+          localStorage.removeItem(LOCAL_STORAGE_KEY);
+          return;
+        }
+      }
+
+      if (parsed.group_key && active && parsed.group_key !== `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}`) {
         localStorage.removeItem(LOCAL_STORAGE_KEY);
         return;
       }
@@ -163,6 +198,7 @@ export default function AttendanceIndex() {
         token: scannedQrToken,
         floor_id: scannedFloor ? scannedFloor.floor_id : null,
         schedule_id: active ? active.schedule_id : null,
+        group_key: active ? `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}` : null,
         ts: Date.now()
       };
       localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
@@ -353,21 +389,66 @@ export default function AttendanceIndex() {
     return best ? best.floor : null;
   }, [floors]);
 
-  const findActiveSchedule = React.useCallback(() => {
+  const getActiveSchedules = React.useCallback(() => {
     const now = new Date();
     const todayStr = formatDateYMD(now);
     const todays = records.filter(r => r.date === todayStr);
-    return todays.find(r => {
-      if (!r.start_time || !r.end_time) return false;
-      const start = new Date(`${r.date}T${r.start_time}`);
-      const end = new Date(`${r.date}T${r.end_time}`);
-      return now >= start && now <= end;
-    });
+    return todays.filter(r => isRecordActiveNow(r, now));
   }, [records]);
+
+  const pickScheduleByLocation = React.useCallback((items) => {
+    if (!Array.isArray(items) || !items.length) return null;
+
+    const roomFor = (rec) => rooms.find(r => Number(r.room_id) === Number(rec.room_id)) || null;
+
+    if (coords) {
+      let best = null;
+      for (const rec of items) {
+        const room = roomFor(rec);
+        if (!room || room.latitude == null || room.longitude == null) continue;
+        if (scannedFloor && Number(room.floor_id) !== Number(scannedFloor.floor_id)) continue;
+        if (!isInsideBox(coords, room)) continue;
+        const dist = getDistanceMeters(coords.latitude, coords.longitude, Number(room.latitude), Number(room.longitude));
+        if (!best || dist < best.dist) best = { rec, dist };
+      }
+      if (best) return best.rec;
+    }
+
+    if (scannedFloor) {
+      const onScannedFloor = items.find(rec => {
+        const room = roomFor(rec);
+        return room && Number(room.floor_id) === Number(scannedFloor.floor_id);
+      });
+      if (onScannedFloor) return onScannedFloor;
+    }
+
+    if (coords) {
+      let best = null;
+      for (const rec of items) {
+        const room = roomFor(rec);
+        if (!room || room.latitude == null || room.longitude == null) continue;
+        if (!isInsideBox(coords, room)) continue;
+        const dist = getDistanceMeters(coords.latitude, coords.longitude, Number(room.latitude), Number(room.longitude));
+        if (!best || dist < best.dist) best = { rec, dist };
+      }
+      if (best) return best.rec;
+    }
+
+    return items[0];
+  }, [coords, rooms, scannedFloor]);
+
+  const findActiveSchedule = React.useCallback(() => {
+    return pickScheduleByLocation(getActiveSchedules());
+  }, [getActiveSchedules, pickScheduleByLocation]);
+
+  const findMatchingScheduleGroup = React.useCallback((base) => {
+    if (!base) return [];
+    return getActiveSchedules().filter(r => isSameScheduleGroup(r, base));
+  }, [getActiveSchedules]);
 
   const currentRoomObj = React.useMemo(() => {
     const active = findActiveSchedule();
-    return active ? rooms.find(r => r.room_id === active.room_id) || null : null;
+    return active ? rooms.find(r => Number(r.room_id) === Number(active.room_id)) || null : null;
   }, [records, rooms, findActiveSchedule]);
 
   const scheduledBuildingObj = React.useMemo(() => {
@@ -533,16 +614,17 @@ export default function AttendanceIndex() {
     return () => { mounted = false; };
   }, []);
 
-  const computeActionState = React.useCallback((rec) => {
+  const computeActionState = React.useCallback((rec, group = null) => {
     if (!rec) return { allowed: false, action: null, allowAt: null, predictedFlag: null };
     const now = new Date();
     const classStart = new Date(`${rec.date}T${rec.start_time}`);
     const classEnd = new Date(`${rec.date}T${rec.end_time}`);
+    const groupRecords = Array.isArray(group) && group.length ? group : [rec];
 
     let action = null;
-    if (!rec.time_in) action = 'check-in';
-    else if (!rec.time_check) action = 'mid-check';
-    else if (!rec.time_out) action = 'check-out';
+    if (groupRecords.some(item => !item.time_in)) action = 'check-in';
+    else if (groupRecords.some(item => !item.time_check)) action = 'mid-check';
+    else if (groupRecords.some(item => !item.time_out)) action = 'check-out';
     else return { allowed: false, action: null, allowAt: null, predictedFlag: null };
 
     if (action === 'check-in') {
@@ -613,12 +695,13 @@ export default function AttendanceIndex() {
 
   React.useEffect(() => {
     const active = findActiveSchedule();
-    const st = computeActionState(active);
+    const group = active ? findMatchingScheduleGroup(active) : [];
+    const st = computeActionState(active, group);
     setActionAllowed(st.allowed);
     setAllowAt(st.allowAt);
     setCurrentAction(st.action);
     computeNextSchedule();
-  }, [records, findActiveSchedule, computeActionState, computeNextSchedule]);
+  }, [records, findActiveSchedule, findMatchingScheduleGroup, computeActionState, computeNextSchedule]);
 
   const filteredRecords = React.useMemo(() => {
     if (!Array.isArray(records)) return [];
@@ -857,8 +940,12 @@ export default function AttendanceIndex() {
       return;
     }
 
+    const activeGroup = findMatchingScheduleGroup(rec);
+    const actionState = computeActionState(rec, activeGroup);
+    const actionToRun = actionState.action || currentAction || 'check-in';
+
     if (!scannedQrToken) {
-      if (!actionAllowed) return alert('Action not allowed at this time.');
+      if (!actionState.allowed) return alert('Action not allowed at this time.');
       if (!coords) return alert('Waiting for GPS coordinates.');
       if (!currentRoomObj) {
         console.warn('Room lookup failed for schedule:', rec);
@@ -919,32 +1006,39 @@ export default function AttendanceIndex() {
     };
 
     try {
-      const endpoint = currentAction ? `attendance/${currentAction}` : 'attendance/check-in';
+      const endpoint = actionToRun ? `attendance/${actionToRun}` : 'attendance/check-in';
       const data = await apiPost(endpoint, payload);
 
-      if (data && data.attendance) {
-        const att = data.attendance;
+      const updatedRecords = Array.isArray(data?.records)
+        ? data.records
+        : [data?.attendance || data?.record].filter(Boolean);
+
+      if (updatedRecords.length) {
         setRecords(prev => {
           try {
-            const idx = prev.findIndex(r => (r.attendance_id && att.attendance_id && r.attendance_id === att.attendance_id) || (r.schedule_id === att.schedule_id && r.date === att.date));
-            if (idx >= 0) {
-              const copy = prev.slice();
-              copy[idx] = { ...copy[idx], ...att };
-              return copy;
+            let copy = prev.slice();
+            for (const att of updatedRecords) {
+              const idx = copy.findIndex(r => (r.attendance_id && att.attendance_id && r.attendance_id === att.attendance_id) || (r.schedule_id === att.schedule_id && r.date === att.date));
+              if (idx >= 0) {
+                copy[idx] = { ...copy[idx], ...att };
+              } else {
+                copy = [att, ...copy];
+              }
             }
-            return [att, ...prev];
+            return copy;
           } catch (e) { return prev; }
         });
-          
-        if (data.attendance.floor_id) {
-          const serverFloor = floors.find(f => f.floor_id === Number(data.attendance.floor_id));
+
+        const primaryAttendance = updatedRecords[0];
+        if (primaryAttendance?.floor_id) {
+          const serverFloor = floors.find(f => f.floor_id === Number(primaryAttendance.floor_id));
           if (serverFloor) setDetectedFloor(serverFloor);
         }
         setWrongFloorInfo(null);
         if (data && data.used_db_floor) {
           setUsingDbFloor(true);
-          if (data.attendance && data.attendance.floor_id) {
-            const serverFloor = floors.find(f => f.floor_id === Number(data.attendance.floor_id));
+          if (primaryAttendance?.floor_id) {
+            const serverFloor = floors.find(f => f.floor_id === Number(primaryAttendance.floor_id));
             if (serverFloor) setDetectedFloor(serverFloor);
           }
           try { alert('Using floor altitude (QR)'); } catch(e){}
@@ -953,7 +1047,8 @@ export default function AttendanceIndex() {
         await loadMyAttendance();
       }
 
-      alert(`Success: ${data.message || 'OK'}`);
+      const groupCount = Number(data?.group_count || updatedRecords.length || 1);
+      alert(`Success: ${data.message || 'OK'}${groupCount > 1 ? ` (${groupCount} schedules updated)` : ''}`);
       setIsCameraVisible(false);
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
@@ -968,7 +1063,7 @@ export default function AttendanceIndex() {
       alert(`Error: ${body && body.error ? body.error : msg}`);
       if (scannedQrToken) setIsCameraVisible(false);
     }
-  }, [findActiveSchedule, actionAllowed, coords, currentRoomObj, isOutOfRange, userId, currentAction, floors, loadMyAttendance]);
+  }, [findActiveSchedule, findMatchingScheduleGroup, computeActionState, coords, currentRoomObj, isOutOfRange, userId, currentAction, floors, loadMyAttendance]);
 
   React.useEffect(() => {
     handleCheckNowRef.current = handleCheckNow;
@@ -1109,14 +1204,20 @@ export default function AttendanceIndex() {
               if (!stopped) {
                 const matchedFloor = floors.find(f => f.qr_token === decodedText);
                 const active = findActiveSchedule ? findActiveSchedule() : null;
-                let scheduledFloorId = null;
-                try { if (active && active.room_id) { const rr = rooms.find(r => Number(r.room_id) === Number(active.room_id)); if (rr) scheduledFloorId = rr.floor_id; } } catch(e) {}
+                const activeGroup = active ? findMatchingScheduleGroup(active) : [];
+                const scheduledFloorIds = new Set();
+                try {
+                  for (const rec of activeGroup.length ? activeGroup : (active ? [active] : [])) {
+                    const rr = rooms.find(r => Number(r.room_id) === Number(rec.room_id));
+                    if (rr?.floor_id !== undefined && rr.floor_id !== null) scheduledFloorIds.add(Number(rr.floor_id));
+                  }
+                } catch(e) {}
 
                 if (!matchedFloor) {
                   (async () => {
                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'Scanned QR is not recognized', showConfirmButton:false, timer:3000 }); } catch (e) { alert('Scanned QR is not recognized'); }
                   })();
-                } else if (scheduledFloorId != null && Number(matchedFloor.floor_id) !== Number(scheduledFloorId)) {
+                } else if (scheduledFloorIds.size && !scheduledFloorIds.has(Number(matchedFloor.floor_id))) {
                   (async () => {
                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'Scanned floor does not match your active class', showConfirmButton:false, timer:3500 }); } catch (e) { alert('Scanned floor does not match your active class'); }
                   })();
@@ -1177,7 +1278,7 @@ export default function AttendanceIndex() {
         } catch (e) {}
       })();
     };
-  }, [isCameraVisible, floors, rooms, findActiveSchedule]);
+  }, [isCameraVisible, floors, rooms, findActiveSchedule, findMatchingScheduleGroup]);
 
   React.useEffect(() => {
     try {
@@ -1328,7 +1429,7 @@ export default function AttendanceIndex() {
 
             <div className="records-list">
               {filteredRecords.length > 0 ? filteredRecords.map(item => (
-                <div key={item.attendance_id || `${item.schedule_id}-${item.date}`} className="record-card">
+                <div key={item.attendance_id || `${item.schedule_id}-${item.date}`} className={`record-card ${isRecordActiveNow(item) ? 'record-card-active' : ''}`}>
                   <div className="record-header">{item.date} ({item.day_of_week || ''})</div>
                   <div><span className="record-label">Class:</span> {item.subject_code || ''} - {item.section_name || ''}</div>
                   <div><span className="record-label">Time:</span> {formatTime12(item.start_time)} - {formatTime12(item.end_time)}</div>

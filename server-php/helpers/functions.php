@@ -147,7 +147,7 @@ function app_permission_matrix() {
         'class_schedules' => ['admin', 'dean', 'program_head', 'secretary'],
         '3d_building' => ['admin', 'dean', 'program_head', 'secretary'],
         'attendance_edits' => ['dean'],
-        'schedule_edits' => ['secretary'],
+        'schedule_edits' => ['dean', 'program_head', 'secretary'],
         'academic_admin' => ['admin'],
         'academic_manage' => ['admin', 'dean', 'program_head', 'secretary'],
         'academic_program' => ['admin', 'dean'],

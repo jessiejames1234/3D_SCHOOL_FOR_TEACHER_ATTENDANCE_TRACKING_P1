@@ -24,6 +24,7 @@ if (empty($authHeader) && !empty($queryToken)) { $authHeader = 'Bearer ' . $quer
 
 $authUserId = null; // Default to null (system action) if not logged in
 $authRole = null;
+$authDeptId = null;
 
 if (!empty($authHeader)) {
     if (preg_match('/Bearer\s+(\S+)/i', $authHeader, $m)) {
@@ -41,6 +42,63 @@ if (!empty($authHeader)) {
         }
     }
 }
+
+if ($authUserId) {
+    $authDeptStmt = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
+    if ($authDeptStmt) {
+        $authDeptStmt->bind_param('i', $authUserId);
+        $authDeptStmt->execute();
+        $authDeptRow = $authDeptStmt->get_result()->fetch_assoc();
+        if ($authDeptRow && array_key_exists('dept_id', $authDeptRow) && $authDeptRow['dept_id'] !== null) {
+            $authDeptId = (int)$authDeptRow['dept_id'];
+        }
+    }
+}
+
+$getProgramScopeRow = function(int $programId) use ($mysqli) {
+    $stmt = $mysqli->prepare("SELECT program_id, dept_id, head_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
+    if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+    $stmt->bind_param('i', $programId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    if (!$row) return null;
+    return [
+        'program_id' => isset($row['program_id']) ? (int)$row['program_id'] : null,
+        'dept_id' => isset($row['dept_id']) && $row['dept_id'] !== null ? (int)$row['dept_id'] : null,
+        'head_id' => isset($row['head_id']) && $row['head_id'] !== null ? (int)$row['head_id'] : null,
+    ];
+};
+
+$requireAcademicManageAccess = function(string $resourceLabel) use ($authRole) {
+    if (in_array((int)$authRole, [1, 2], true)) return;
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can manage {$resourceLabel}."], 403);
+};
+
+$requireAcademicCreateAccess = function(string $resourceLabel) use ($authRole) {
+    if (in_array((int)$authRole, [1, 2], true)) return;
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can create {$resourceLabel}."], 403);
+};
+
+$assertProgramScopeAccess = function(int $programId, string $resourceLabel) use ($authRole, $authDeptId, $getProgramScopeRow) {
+    $program = $getProgramScopeRow($programId);
+    if (!$program) {
+        json_response(['error' => 'invalid_program_id', 'message' => 'Selected program does not exist'], 400);
+    }
+
+    if ((int)$authRole === 1) return $program;
+
+    if ((int)$authRole === 2) {
+        if ($authDeptId === null) {
+            json_response(['error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+        }
+        if ((int)($program['dept_id'] ?? 0) !== (int)$authDeptId) {
+            json_response(['error' => 'forbidden', 'message' => "Dean can only manage {$resourceLabel} within programs in their assigned department."], 403);
+        }
+        return $program;
+    }
+
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can manage {$resourceLabel}."], 403);
+};
 // =================================================================================
 
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
@@ -383,20 +441,33 @@ switch ($endpoint) {
     case 'sections':
         if ($request_method === 'GET') {
             // UPDATED: Added p.dept_id and p.head_id for RBAC checks
-            $result = $mysqli->query("SELECT sec.section_id, sec.program_id, sec.year_id, sec.section_name, sec.status, p.program_name, p.dept_id, p.head_id, y.level FROM tbl_sections sec JOIN tbl_programs p ON sec.program_id = p.program_id LEFT JOIN tbl_year_level y ON sec.year_id = y.year_id ORDER BY p.program_name, sec.section_name");
+            $baseSql = "SELECT sec.section_id, sec.program_id, sec.year_id, sec.section_name, sec.status, p.program_name, p.dept_id, p.head_id, y.level FROM tbl_sections sec JOIN tbl_programs p ON sec.program_id = p.program_id LEFT JOIN tbl_year_level y ON sec.year_id = y.year_id";
+            if ((int)$authRole === 3) {
+                $sql = $baseSql . " WHERE p.head_id = " . intval($authUserId) . " ORDER BY p.program_name, sec.section_name";
+            } elseif (in_array((int)$authRole, [2, 4], true)) {
+                if ($authDeptId === null) json_response([]);
+                $sql = $baseSql . " WHERE p.dept_id = " . intval($authDeptId) . " ORDER BY p.program_name, sec.section_name";
+            } elseif ((int)$authRole === 1 || $authRole === null) {
+                $sql = $baseSql . " ORDER BY p.program_name, sec.section_name";
+            } else {
+                json_response([]);
+            }
+            $result = $mysqli->query($sql);
             if (!$result) json_response(['error' => 'query_failed', 'message' => $mysqli->error], 500);
             json_response($result->fetch_all(MYSQLI_ASSOC));
 
         } elseif (($request_method === 'PUT' || $request_method === 'POST') && is_numeric($param1)) {
+            $requireAcademicManageAccess('sections');
             $sectionId = (int)$param1;
 
             if ($param2 === 'toggle') {
-                $q = $mysqli->prepare("SELECT status, section_name FROM tbl_sections WHERE section_id = ? LIMIT 1");
+                $q = $mysqli->prepare("SELECT status, section_name, program_id FROM tbl_sections WHERE section_id = ? LIMIT 1");
                 if (!$q) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $q->bind_param("i", $sectionId);
                 $q->execute();
                 $row = $q->get_result()->fetch_assoc();
                 if (!$row) json_response(['error' => 'not_found', 'message' => 'Section not found'], 404);
+                $assertProgramScopeAccess((int)$row['program_id'], 'sections');
                 
                 $secName = $row['section_name']; 
                 $new = ($row['status'] === 'active') ? 'inactive' : 'active';
@@ -418,6 +489,7 @@ switch ($endpoint) {
             $chk->execute();
             $existing = $chk->get_result()->fetch_assoc();
             if (!$existing) json_response(['error' => 'not_found', 'message' => 'Section not found'], 404);
+            $assertProgramScopeAccess((int)$existing['program_id'], 'sections');
             $oldName = $existing['section_name'];
 
             $fields = [];
@@ -435,13 +507,7 @@ switch ($endpoint) {
             $candidateProgram = isset($input['program_id']) ? (int)$input['program_id'] : (int)$existing['program_id'];
             $candidateYear = isset($input['year_id']) ? (int)$input['year_id'] : (int)$existing['year_id'];
 
-            if (isset($input['program_id'])) {
-                $pchk = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
-                if (!$pchk) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-                $pchk->bind_param("i", $candidateProgram);
-                $pchk->execute();
-                if (!$pchk->get_result()->fetch_assoc()) json_response(['error' => 'invalid_program_id', 'message' => 'Selected program does not exist'], 400);
-            }
+            $assertProgramScopeAccess($candidateProgram, 'sections');
             if (isset($input['year_id'])) {
                 $ychk = $mysqli->prepare("SELECT year_id FROM tbl_year_level WHERE year_id = ? LIMIT 1");
                 if (!$ychk) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
@@ -472,6 +538,7 @@ switch ($endpoint) {
             json_response(['section_id' => $sectionId] + $input);
 
         } elseif ($request_method === 'POST') {
+            $requireAcademicCreateAccess('sections');
             if (!isset($input['program_id']) || $input['program_id'] === '' || !is_numeric($input['program_id'])) json_response(['error' => 'missing_program_id', 'message' => 'program_id is required and must reference an existing program'], 400);
             if (!isset($input['year_id']) || $input['year_id'] === '' || !is_numeric($input['year_id'])) json_response(['error' => 'missing_year_id', 'message' => 'year_id is required and must reference an existing year level'], 400);
             if (!isset($input['section_name']) || trim((string)$input['section_name']) === '') json_response(['error' => 'missing_section_name', 'message' => 'section_name is required'], 400);
@@ -480,11 +547,7 @@ switch ($endpoint) {
             $yearId = (int)$input['year_id'];
             $name = trim((string)$input['section_name']);
 
-            $pstmt = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
-            if (!$pstmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-            $pstmt->bind_param("i", $programId);
-            $pstmt->execute();
-            if (!$pstmt->get_result()->fetch_assoc()) json_response(['error' => 'invalid_program_id', 'message' => 'Selected program does not exist'], 400);
+            $assertProgramScopeAccess($programId, 'sections');
 
             $ystmt = $mysqli->prepare("SELECT year_id FROM tbl_year_level WHERE year_id = ? LIMIT 1");
             if (!$ystmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
@@ -1442,20 +1505,33 @@ switch ($endpoint) {
 
     case 'subjects':
         if ($request_method === 'GET') {
-            $result = $mysqli->query("SELECT s.subject_id, s.subject_code, s.subject_name, s.program_id, p.program_name, s.status, p.head_id, p.dept_id FROM tbl_subject s LEFT JOIN tbl_programs p ON s.program_id = p.program_id ORDER BY p.program_name, s.subject_code");
+            $baseSql = "SELECT s.subject_id, s.subject_code, s.subject_name, s.program_id, p.program_name, s.status, p.head_id, p.dept_id FROM tbl_subject s LEFT JOIN tbl_programs p ON s.program_id = p.program_id";
+            if ((int)$authRole === 3) {
+                $sql = $baseSql . " WHERE p.head_id = " . intval($authUserId) . " ORDER BY p.program_name, s.subject_code";
+            } elseif (in_array((int)$authRole, [2, 4], true)) {
+                if ($authDeptId === null) json_response([]);
+                $sql = $baseSql . " WHERE p.dept_id = " . intval($authDeptId) . " ORDER BY p.program_name, s.subject_code";
+            } elseif ((int)$authRole === 1 || $authRole === null) {
+                $sql = $baseSql . " ORDER BY p.program_name, s.subject_code";
+            } else {
+                json_response([]);
+            }
+            $result = $mysqli->query($sql);
             if (!$result) json_response(['error' => 'query_failed', 'message' => $mysqli->error], 500);
             json_response($result->fetch_all(MYSQLI_ASSOC));
 
         } elseif (($request_method === 'PUT' || $request_method === 'POST') && is_numeric($param1)) {
+            $requireAcademicManageAccess('subjects');
             $subjectId = (int)$param1;
 
             if ($param2 === 'toggle') {
-                $q = $mysqli->prepare("SELECT status, subject_code FROM tbl_subject WHERE subject_id = ? LIMIT 1");
+                $q = $mysqli->prepare("SELECT status, subject_code, program_id FROM tbl_subject WHERE subject_id = ? LIMIT 1");
                 if (!$q) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $q->bind_param("i", $subjectId);
                 $q->execute();
                 $row = $q->get_result()->fetch_assoc();
                 if (!$row) json_response(['error' => 'not_found', 'message' => 'Subject not found'], 404);
+                $assertProgramScopeAccess((int)$row['program_id'], 'subjects');
                 
                 $subjCode = $row['subject_code']; 
                 $new = ($row['status'] === 'active') ? 'inactive' : 'active';
@@ -1477,6 +1553,7 @@ switch ($endpoint) {
             $chk->execute();
             $existing = $chk->get_result()->fetch_assoc();
             if (!$existing) json_response(['error' => 'not_found', 'message' => 'Subject not found'], 404);
+            $assertProgramScopeAccess((int)$existing['program_id'], 'subjects');
             $oldCode = $existing['subject_code'];
 
             $fields = [];
@@ -1496,13 +1573,7 @@ switch ($endpoint) {
             if ($candidateCode === '') json_response(['error' => 'validation', 'message' => 'subject_code is required'], 400);
             if ($candidateName === '') json_response(['error' => 'validation', 'message' => 'subject_name is required'], 400);
 
-            if (isset($input['program_id'])) {
-                $pchk = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
-                if (!$pchk) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-                $pchk->bind_param("i", $candidateProgram);
-                $pchk->execute();
-                if (!$pchk->get_result()->fetch_assoc()) json_response(['error' => 'invalid_program_id', 'message' => 'Selected program does not exist'], 400);
-            }
+            $assertProgramScopeAccess($candidateProgram, 'subjects');
 
             $dup = $mysqli->prepare("SELECT subject_id FROM tbl_subject WHERE (LOWER(subject_code) = LOWER(?) OR LOWER(subject_name) = LOWER(?)) AND program_id = ? AND subject_id <> ? LIMIT 1");
             if (!$dup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
@@ -1524,6 +1595,7 @@ switch ($endpoint) {
             json_response(['subject_id' => $subjectId] + $input);
 
         } elseif ($request_method === 'POST') {
+            $requireAcademicCreateAccess('subjects');
             if (!isset($input['program_id']) || $input['program_id'] === '' || !is_numeric($input['program_id'])) json_response(['error' => 'missing_program_id', 'message' => 'program_id is required and must reference an existing program'], 400);
             if (!isset($input['subject_code']) || trim((string)$input['subject_code']) === '') json_response(['error' => 'missing_subject_code', 'message' => 'subject_code is required'], 400);
             if (!isset($input['subject_name']) || trim((string)$input['subject_name']) === '') json_response(['error' => 'missing_subject_name', 'message' => 'subject_name is required'], 400);
@@ -1532,11 +1604,7 @@ switch ($endpoint) {
             $code = trim((string)$input['subject_code']);
             $name = trim((string)$input['subject_name']);
 
-            $pstmt = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
-            if (!$pstmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-            $pstmt->bind_param("i", $programId);
-            $pstmt->execute();
-            if (!$pstmt->get_result()->fetch_assoc()) json_response(['error' => 'invalid_program_id', 'message' => 'Selected program does not exist'], 400);
+            $assertProgramScopeAccess($programId, 'subjects');
 
             $dup = $mysqli->prepare("SELECT subject_id FROM tbl_subject WHERE (LOWER(subject_code) = LOWER(?) OR LOWER(subject_name) = LOWER(?)) AND program_id = ? LIMIT 1");
             if (!$dup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);

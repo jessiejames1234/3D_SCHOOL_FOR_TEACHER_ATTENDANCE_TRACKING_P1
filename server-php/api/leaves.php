@@ -97,6 +97,7 @@ switch ($request_method) {
         break;
 
     case 'POST':
+        if (!$authUserId) json_response(['error'=>'unauthorized','message'=>'Authentication required'], 401);
         $teacher_id = $input['teacher_id'] ?? null;
         $leave_type_id = $input['leave_type_id'] ?? 1;
         $date_from = $input['date_from'] ?? null;
@@ -106,14 +107,14 @@ switch ($request_method) {
         if (!$teacher_id || !$date_from || !$date_to){ json_response(['error'=>'missing_fields'], 400); }
 
         if ($authRole) {
-            if (in_array($authRole, [2, 3, 5], true)) { 
-                json_response(['error'=>'forbidden','message'=>'Your role is restricted to view only.'], 403);
-            } elseif ($authRole === 4) { 
+            if ($authRole !== 2) {
+                json_response(['error'=>'forbidden','message'=>'Only dean can file leave records.'], 403);
+            } elseif ($authRole === 2) { 
                 $tstmt = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
                 $tstmt->bind_param('i', $teacher_id); $tstmt->execute();
                 $trow = $tstmt->get_result()->fetch_assoc();
                 $authDept = resolve_auth_dept($mysqli, $authUserId);
-                if (!$trow || $authDept !== (int)$trow['dept_id']) json_response(['error'=>'forbidden_dept', 'message'=>'You can only file leaves for teachers inside your department.'],403);
+                if ($authDept === null || !$trow || $authDept !== (int)$trow['dept_id']) json_response(['error'=>'forbidden_dept', 'message'=>'Dean can only file leaves for users inside your department.'],403);
             }
         }
 
@@ -170,6 +171,7 @@ switch ($request_method) {
         break;
 
     case 'PUT':
+        if (!$authUserId) json_response(['error'=>'unauthorized','message'=>'Authentication required'], 401);
         if (!is_numeric($param1)) json_response(['error'=>'missing_id'],400);
         $id = (int)$param1;
 
@@ -186,12 +188,12 @@ switch ($request_method) {
 
         if (!$row) json_response(['error'=>'not_found'],404);
 
-        if ($authRole && $authRole !== 1) { 
+        if ($authRole) { 
             $authDept = resolve_auth_dept($mysqli, $authUserId);
-            if (in_array($authRole, [2, 3, 5], true)) {
-                 json_response(['error'=>'forbidden', 'message'=>'Your role is restricted to view only. You cannot edit records.'],403);
-            } elseif ($authRole === 4) {
-                 if ($authDept === null || (int)$row['dept_id'] !== $authDept) json_response(['error'=>'forbidden', 'message'=>'Cannot edit records outside your specific department.'],403);
+            if ($authRole !== 2) {
+                 json_response(['error'=>'forbidden', 'message'=>'Only dean can edit leave records.'],403);
+            } elseif ($authRole === 2) {
+                 if ($authDept === null || (int)$row['dept_id'] !== $authDept) json_response(['error'=>'forbidden', 'message'=>'Dean cannot edit records outside your specific department.'],403);
             }
         }
 

@@ -188,6 +188,13 @@ if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutio
 }
 
 elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substitutions'], true)) {
+    if ((int)$authUserRole !== 2) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Only dean can add substitutions.'], 403);
+    }
+    if ((int)$authUserRole === 2 && $authUserDept === null) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+    }
+
     // Accept both the batch payload used by the Substitutions page and
     // the legacy single-entry payload used by leave approval flows.
     $sub_id = isset($input['substitute_id']) ? (int)$input['substitute_id'] : null;
@@ -206,10 +213,34 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
         json_response(['ok'=>false, 'error'=>'missing_fields', 'message'=>'Substitute ID and at least one schedule are required'], 400);
     }
 
+    $subDeptStmt = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
+    if (!$subDeptStmt) json_response(['ok' => false, 'error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+    $subDeptStmt->bind_param('i', $sub_id);
+    $subDeptStmt->execute();
+    $subDeptRow = $subDeptStmt->get_result()->fetch_assoc();
+    if (!$subDeptRow) {
+        json_response(['ok' => false, 'error' => 'not_found', 'message' => 'Selected substitute user was not found.'], 404);
+    }
+    $subDeptId = isset($subDeptRow['dept_id']) && $subDeptRow['dept_id'] !== null ? (int)$subDeptRow['dept_id'] : null;
+    if ((int)$authUserRole === 2 && ($subDeptId === null || $subDeptId !== (int)$authUserDept)) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Dean can only assign substitutes within their own department.'], 403);
+    }
+
     // Start Transaction for safe bulk insert
     $mysqli->begin_transaction();
 
     try {
+        $deptScopeStmt = $mysqli->prepare("
+            SELECT orig_teacher.dept_id
+            FROM tbl_class_schedules cs
+            {$subJoinOffering}
+            LEFT JOIN tbl_users orig_teacher ON {$subTeacherExpr} = orig_teacher.user_id
+            WHERE cs.schedule_id = ?
+            LIMIT 1
+        ");
+        if (!$deptScopeStmt) {
+            throw new Exception('Failed to validate schedule scope: ' . $mysqli->error);
+        }
         $checkStmt = $mysqli->prepare("SELECT substitution_id FROM tbl_substitutions WHERE schedule_id = ? AND date = ?");
         $insertStmt = $mysqli->prepare("INSERT INTO tbl_substitutions (schedule_id, substitute_user_id, date) VALUES (?, ?, ?)");
 
@@ -219,6 +250,16 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
         foreach ($substitutions as $sub) {
             $schedule_id = (int)$sub['schedule_id'];
             $date = $sub['date'];
+
+            if ((int)$authUserRole === 2) {
+                $deptScopeStmt->bind_param('i', $schedule_id);
+                $deptScopeStmt->execute();
+                $deptScopeRow = $deptScopeStmt->get_result()->fetch_assoc();
+                $scheduleDeptId = isset($deptScopeRow['dept_id']) && $deptScopeRow['dept_id'] !== null ? (int)$deptScopeRow['dept_id'] : null;
+                if ($scheduleDeptId === null || $scheduleDeptId !== (int)$authUserDept) {
+                    throw new Exception('Dean can only manage substitutions for schedules inside their department.');
+                }
+            }
 
             // 1. Check for duplicate
             $checkStmt->bind_param('is', $schedule_id, $date);
@@ -332,6 +373,7 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
         $conflictQ->close();
         $copyAttStmt->close();
         if ($markOrigStmt) $markOrigStmt->close();
+        $deptScopeStmt->close();
 
         $checkStmt->close();
         $insertStmt->close();

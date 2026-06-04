@@ -89,20 +89,16 @@ export default function LoginPage() {
     
     // Validate identifier (email or school ID)
     const identifier = (form.email || '').trim();
-    const isEmail = identifier.includes('@');
-    if (!isEmail) {
-      const idPattern = /^\d{2}-\d{4}-\d{5}$/; // e.g. 02-2324-12345
-      if (!idPattern.test(identifier)) {
-        try {
-          await Swal.fire({
-            icon: 'error',
-            title: 'Invalid School ID',
-              text: 'School ID must be in the format 02-2324-12345.',
-            confirmButtonColor: '#d33'
-          });
-        } catch (e) {}
-        return;
-      }
+    if (!identifier) {
+      try {
+        await Swal.fire({
+          icon: 'error',
+          title: 'Missing Login ID',
+          text: 'Enter your email or school ID number.',
+          confirmButtonColor: '#d33'
+        });
+      } catch (e) {}
+      return;
     }
 
     // Validate Captcha
@@ -143,7 +139,7 @@ export default function LoginPage() {
 
         // Invalid credentials with remaining attempts info
         if (res.status === 401 && data && typeof data.remaining_attempts === 'number') {
-          await Swal.fire({ icon: 'warning', title: 'Login Failed', text: `Invalid email or password. ${data.remaining_attempts} attempt(s) left.` });
+          await Swal.fire({ icon: 'warning', title: 'Login Failed', text: `Invalid email / ID number or password. ${data.remaining_attempts} attempt(s) left.` });
           throw new Error('invalid_credentials');
         }
 
@@ -162,8 +158,7 @@ export default function LoginPage() {
         Toast.fire({ icon: 'success', title: 'Signed in successfully' });
       } catch (e) { }
       
-      const landingHash = Number(data?.user?.role_id) === 5 ? '#/attendance' : '#/dashboard';
-      window.location.hash = landingHash;
+      window.location.hash = '#/home';
     } catch (err) {
       try {
         const message = String(err?.message || '').trim();

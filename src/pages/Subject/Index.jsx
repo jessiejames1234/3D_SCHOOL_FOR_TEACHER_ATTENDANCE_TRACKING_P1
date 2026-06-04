@@ -22,9 +22,9 @@ function SubjectIndex() {
   const isProgramHead = Number(user?.role_id) === 3;
   const isSecretary = Number(user?.role_id) === 4;
   
-  // Program heads can edit assigned rows, but only admin can add new records.
-  const canEdit = isAdmin || isProgramHead;
-  const canAdd = isAdmin;
+  // Only admin and dean can manage subjects.
+  const canEdit = isAdmin || isDean;
+  const canAdd = isAdmin || isDean;
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
@@ -89,24 +89,26 @@ function SubjectIndex() {
     let list = programs;
     if (isProgramHead) {
       list = list.filter(p => Number(p.head_id) === Number(user?.user_id));
+    } else if (isDean) {
+      list = list.filter(p => Number(p.dept_id) === Number(user?.dept_id));
     }
     return list;
-  }, [programs, isProgramHead, user]);
+  }, [programs, isProgramHead, isDean, user]);
 
 
-  const checkProgramHeadPermission = (rowProgramHeadId) => {
+  const checkManagePermission = (row) => {
     if (isAdmin) return true;
-    if (isProgramHead && Number(rowProgramHeadId) !== Number(user?.user_id)) {
-      try { if (window.Swal) window.Swal.fire('Unauthorized', 'You can only modify subjects assigned to your specific program.', 'error'); else alert('Unauthorized'); } catch(e){}
+    if (isDean && Number(row?.dept_id) !== Number(user?.dept_id)) {
+      try { if (window.Swal) window.Swal.fire('Unauthorized', 'You can only modify subjects inside your assigned department.', 'error'); else alert('Unauthorized'); } catch(e){}
       return false;
     }
-    return true;
+    return isDean;
   };
 
   const openModal = (it=null) => {
     setError('');
     if (it) {
-      if (!checkProgramHeadPermission(it.head_id)) return;
+      if (!checkManagePermission(it)) return;
       setEditing(it);
       setForm({ program_id: it.program_id || '', subject_code: it.subject_code || '', subject_name: it.subject_name || '' });
     } else {
@@ -146,7 +148,7 @@ function SubjectIndex() {
         );
       } else {
         if (!canAdd) {
-          const msg = 'Only admin can add subjects.';
+          const msg = 'Only admin and dean can add subjects.';
           try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Unauthorized', text: msg }); else alert(msg); } catch(e){}
           setLoading(false);
           return;
@@ -167,7 +169,7 @@ function SubjectIndex() {
 
   const handleToggle = async (row) => {
     if (!row || !row.subject_id) return;
-    if (!checkProgramHeadPermission(row.head_id)) return;
+    if (!checkManagePermission(row)) return;
 
     const newStatus = String(row.status) === 'active' ? 'inactive' : 'active';
     try {
@@ -182,7 +184,7 @@ function SubjectIndex() {
 
   const handleArchive = async (row) => {
     if (!row || !row.subject_id) return;
-    if (!checkProgramHeadPermission(row.head_id)) return;
+    if (!checkManagePermission(row)) return;
 
     try{
       const res = window.Swal ? await window.Swal.fire({ title: 'Archive subject?', text: 'This will remove the subject from the active list.', icon: 'warning', showCancelButton: true }) : { isConfirmed: confirm('Archive subject?') };
@@ -259,6 +261,11 @@ function SubjectIndex() {
               <option value="">{addEditPrograms.length ? 'Select program...' : 'No programs available'}</option>
               {addEditPrograms.map(p => <option key={p.program_id} value={p.program_id}>{p.program_name}</option>)}
             </select>
+            {isDean && (
+              <div className="mt-1 text-xs text-gray-500">
+                Programs are limited to your assigned department.
+              </div>
+            )}
           </div>
 
           <div>

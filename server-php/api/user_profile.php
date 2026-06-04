@@ -102,7 +102,7 @@ if ($request_method === 'GET') {
     $user_id = (int)$_POST['user_id'];
     if ($user_id <= 0) json_response(['ok' => false, 'error' => 'invalid_user_id'], 400);
 
-    $canUpdate = ($authUserId > 0 && $authUserId === $user_id) || $authRoleId === 1;
+    $canUpdate = $authRoleId === 1;
     if (!$canUpdate) {
         json_response(['ok' => false, 'error' => 'forbidden'], 403);
     }

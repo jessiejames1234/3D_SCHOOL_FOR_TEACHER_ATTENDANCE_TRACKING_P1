@@ -1,6 +1,9 @@
+import React from 'react';
+import { apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
 import QrModal from "../../components/QrModal.jsx";
+import { useLiveGeolocation } from '../../utils/useLiveGeolocation.js';
 
 function FloorIndex(){
   const [floors, setFloors] = React.useState([]);
@@ -14,9 +17,6 @@ function FloorIndex(){
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
   const [lastAltitude, setLastAltitude] = React.useState(null);
-  const [liveAltActive, setLiveAltActive] = React.useState(false);
-  const watchIdRef = React.useRef(null);
-  const livePollRef = React.useRef(null);
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) {
@@ -77,7 +77,11 @@ function FloorIndex(){
     }
     setShowModal(true);
   };
-  const closeModal = ()=> setShowModal(false);
+  const closeModal = ()=> {
+    stopLiveAltitude();
+    setLastAltitude(0);
+    setShowModal(false);
+  };
   const handleChange = (e)=> setForm(p=>({...p, [e.target.name]: e.target.value}));
 
   const updateLiveAltitude = (coords = {}) => {
@@ -85,104 +89,42 @@ function FloorIndex(){
     setLastAltitude(alt);
   };
 
-  const clearGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    if (window.__geoWatchId != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(window.__geoWatchId); } catch (e) { /* ignore */ }
+  const {
+    active: liveAltActive,
+    start: startLiveAltitude,
+    stop: stopLiveAltitude
+  } = useLiveGeolocation({
+    onPosition: updateLiveAltitude,
+    onError: (message, err) => {
+      if (err) console.error('geolocation error', err);
+      setError(message || 'Failed to watch position');
     }
-    if (window.__geoPollId != null) {
-      try { clearInterval(window.__geoPollId); } catch (e) { /* ignore */ }
-    }
-    window.__geoWatchId = null;
-    window.__geoPollId = null;
-  }, []);
-
-  const stopLiveAltitude = React.useCallback(() => {
-    if (watchIdRef.current != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(watchIdRef.current); } catch (e) { /* ignore */ }
-    }
-    if (livePollRef.current != null) {
-      try { clearInterval(livePollRef.current); } catch (e) { /* ignore */ }
-    }
-    watchIdRef.current = null;
-    livePollRef.current = null;
-    setLiveAltActive(false);
-    if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveAltitude) {
-      clearGlobalGeo();
-      window.__activeGeoStop = null;
-    }
-  }, [clearGlobalGeo]);
-
-  const claimGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    const existing = window.__activeGeoStop;
-    if (existing && existing !== stopLiveAltitude) {
-      try { existing(); } catch (e) { /* ignore */ }
-    }
-    clearGlobalGeo();
-    window.__activeGeoStop = stopLiveAltitude;
-  }, [stopLiveAltitude, clearGlobalGeo]);
+  });
 
   const captureAltitude = () => {
     setError('');
-    if (!('geolocation' in navigator)) { setError('Geolocation not supported in this browser'); return; }
     if (liveAltActive) {
       stopLiveAltitude();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveAltitude) {
-        window.__activeGeoStop = null;
-      }
+      setLastAltitude(0);
       return;
     }
-    claimGlobalGeo();
     setShowModal(true);
-    navigator.geolocation.getCurrentPosition((pos) => {
-      updateLiveAltitude(pos.coords || {});
-    }, () => {
-      // ignore immediate errors
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 4000 });
-
-    const id = navigator.geolocation.watchPosition((pos) => {
-      updateLiveAltitude(pos.coords || {});
-    }, (err) => {
-      console.error('watchPosition error', err);
-      setError(err?.message || 'Failed to watch position');
-      if (err && err.code === 1) {
-        setLiveAltActive(false);
-      }
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 6000 });
-    watchIdRef.current = id;
-    if (typeof window !== 'undefined') window.__geoWatchId = id;
-
-    if (livePollRef.current == null) {
-      livePollRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition((pos) => {
-          updateLiveAltitude(pos.coords || {});
-        }, () => {
-          // ignore polling errors
-        }, { enableHighAccuracy: true, maximumAge: 0, timeout: 2000 });
-      }, 800);
-      if (typeof window !== 'undefined') window.__geoPollId = livePollRef.current;
-    }
-    setLiveAltActive(true);
+    setLastAltitude(null);
+    startLiveAltitude();
   };
 
   const applyLiveAltitude = () => {
     setError('');
+    if (!liveAltActive) {
+      setError('Start Live first.');
+      return;
+    }
     if (lastAltitude == null) {
       setError('No live altitude available. Start Live first.');
       return;
     }
     setForm(prev => ({ ...prev, baseline_altitude: Number(lastAltitude).toFixed(1) }));
   };
-
-  React.useEffect(() => {
-    return () => {
-      stopLiveAltitude();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveAltitude) {
-        window.__activeGeoStop = null;
-      }
-    };
-  }, [stopLiveAltitude]);
 
   const validateForm = () => {
     const name = (form.floor_name||'').trim();

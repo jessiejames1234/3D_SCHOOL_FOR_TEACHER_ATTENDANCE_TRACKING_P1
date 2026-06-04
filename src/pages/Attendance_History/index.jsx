@@ -3,9 +3,75 @@ import Modal from '../../components/Modal.jsx';
 import { apiGet, apiPost } from '../../services/api.js';
 import { AuthContext } from '../../context/AuthContext.jsx';
 
+const getUserIdValue = (userLike) => {
+  const id = userLike?.user_id ?? userLike?.id ?? userLike?.userId ?? 0;
+  const n = Number(id);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+const getStoredUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null');
+  } catch (e) {
+    return null;
+  }
+};
+
+const toDateKeyFromDate = (dateObj) => {
+  if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) return '';
+  const y = dateObj.getFullYear();
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const d = String(dateObj.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+
+const normalizeDateKey = (value) => {
+  if (value === undefined || value === null || value === '') return '';
+  if (value instanceof Date) return toDateKeyFromDate(value);
+  const raw = String(value).trim();
+  const direct = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (direct) return `${direct[1]}-${direct[2]}-${direct[3]}`;
+  const parsed = new Date(raw.replace(' ', 'T'));
+  return toDateKeyFromDate(parsed);
+};
+
+const getPayloadList = (payload) => {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.records)) return payload.records;
+  if (Array.isArray(payload?.items)) return payload.items;
+  return null;
+};
+
+const getAttendanceDateKey = (record) => normalizeDateKey(
+  record?.date || record?.attendance_date || record?.checked_in_at || record?.time_in
+);
+
+const normalizeAttendanceRecord = (record) => {
+  const date = getAttendanceDateKey(record);
+  return {
+    ...record,
+    date,
+    user_id: getUserIdValue(record),
+    time_in: record?.time_in ?? record?.checked_in_at ?? null,
+    time_check: record?.time_check ?? record?.checked_mid_at ?? null,
+    time_out: record?.time_out ?? record?.checked_out_at ?? null,
+    subject_code: record?.subject_code || record?.subject || record?.subject_name || 'Class',
+    subject_name: record?.subject_name || record?.subject_code || 'Scheduled class'
+  };
+};
+
+const dateMatches = (value, dateKey) => normalizeDateKey(value) === dateKey;
+
 export default function AttendanceHistory() {
   const { user } = React.useContext(AuthContext);
-  const canRequestEdit = [2, 3, 4, 5].includes(Number(user?.role_id));
+  const storedUser = React.useMemo(() => getStoredUser(), [user]);
+  const effectiveUser = React.useMemo(() => (
+    getUserIdValue(user) ? user : storedUser
+  ), [user, storedUser]);
+  const myUserId = getUserIdValue(effectiveUser);
+  const effectiveRoleId = Number(effectiveUser?.role_id || 0);
+  const canRequestEdit = [2, 3, 4, 5].includes(Number(effectiveUser?.role_id));
   const [records, setRecords] = React.useState([]);
   const [penalties, setPenalties] = React.useState([]);
   const [substitutions, setSubstitutions] = React.useState([]);
@@ -22,6 +88,7 @@ export default function AttendanceHistory() {
   const [attendanceEditSubmitting, setAttendanceEditSubmitting] = React.useState(false);
   const [attendanceEditError, setAttendanceEditError] = React.useState('');
   const [pendingAttendanceEditIds, setPendingAttendanceEditIds] = React.useState([]);
+  const autoFocusedMonthRef = React.useRef(false);
   
   // Live Clock State
   const [currentTime, setCurrentTime] = React.useState(new Date());
@@ -84,28 +151,39 @@ export default function AttendanceHistory() {
     if (!silent) setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (user && user.user_id) params.set('teacher_id', user.user_id);
-      
-      const [attData, penData, subData] = await Promise.all([
-          apiGet(`attendance${params.toString() ? '?' + params.toString() : ''}`),
-          apiGet('penalties'),
-          apiGet('substitute')
+      if (myUserId) params.set('teacher_id', myUserId);
+
+      const readOptionalList = async (path, label, shouldFetch = true) => {
+        if (!shouldFetch) return [];
+        try {
+          const payload = await apiGet(path);
+          return getPayloadList(payload) || [];
+        } catch (err) {
+          if (err?.status !== 403) {
+            console.warn(`Could not fetch ${label}:`, err);
+          }
+          return [];
+        }
+      };
+
+      const attData = await apiGet(`attendance${params.toString() ? '?' + params.toString() : ''}`);
+      const attRows = getPayloadList(attData);
+      if (attRows) setRecords(attRows.map(normalizeAttendanceRecord).filter((r) => r.date));
+      else if (!silent) setRecords([]);
+
+      const canFetchSubstitutions = [2, 4].includes(effectiveRoleId);
+      const canFetchLeaves = [1, 2, 3, 4].includes(effectiveRoleId);
+      const [penRows, subRows, leaveRows] = await Promise.all([
+        readOptionalList('penalties', 'penalties'),
+        readOptionalList('substitute', 'substitutions', canFetchSubstitutions),
+        readOptionalList('leaves', 'leaves', canFetchLeaves)
       ]);
 
-      let leaveData = [];
-      try {
-          leaveData = await apiGet('leaves');
-      } catch (err1) {
-          try { leaveData = await apiGet('leaves'); } 
-          catch (err2) { console.error("Could not fetch leaves"); }
-      }
-
-      setRecords(Array.isArray(attData) ? attData : []);
-      setPenalties(Array.isArray(penData) ? penData : []);
-      setSubstitutions(Array.isArray(subData) ? subData : []);
-      setLeaves(Array.isArray(leaveData) ? leaveData : []);
+      setPenalties(penRows);
+      setSubstitutions(subRows);
+      setLeaves(leaveRows);
     } catch (e) {
-      console.error("Error fetching dashboard data:", e);
+      console.error("Error fetching attendance history:", e);
     }
     if (!silent) setLoading(false);
   };
@@ -139,11 +217,26 @@ export default function AttendanceHistory() {
 
     return () => clearInterval(intervalId); // Cleanup on unmount
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  }, [myUserId, effectiveRoleId]);
 
   React.useEffect(() => {
     fetchPendingAttendanceRequests();
   }, [fetchPendingAttendanceRequests]);
+
+  React.useEffect(() => {
+    if (autoFocusedMonthRef.current || records.length === 0) return;
+    autoFocusedMonthRef.current = true;
+
+    const currentMonthKey = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`;
+    const recordDateKeys = records.map(getAttendanceDateKey).filter(Boolean).sort();
+    if (recordDateKeys.some((dateKey) => dateKey.startsWith(currentMonthKey))) return;
+
+    const latestKey = recordDateKeys[recordDateKeys.length - 1];
+    if (!latestKey) return;
+    const [year, month] = latestKey.split('-').map(Number);
+    if (year && month) setCurrentDate(new Date(year, month - 1, 1));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [records]);
 
   // LIVE CLOCK INTERVAL
   React.useEffect(() => {
@@ -155,25 +248,22 @@ export default function AttendanceHistory() {
 
   // --- DATE & DATA HELPERS ---
   const toYMD = (dateObj) => {
-      const y = dateObj.getFullYear();
-      const m = String(dateObj.getMonth() + 1).padStart(2, '0');
-      const d = String(dateObj.getDate()).padStart(2, '0');
-      return `${y}-${m}-${d}`;
+      return toDateKeyFromDate(dateObj);
   };
 
-  const isSameMonth = (d1, d2) => d1.getFullYear() === d2.getFullYear() && d1.getMonth() === d2.getMonth();
+  const isSameMonthKey = (dateKey, d2) => {
+      if (!dateKey) return false;
+      return dateKey.substring(0, 7) === `${d2.getFullYear()}-${String(d2.getMonth() + 1).padStart(2, '0')}`;
+  };
 
   const isDateInLeaveRange = (targetDateStr, leaveFromStr, leaveToStr) => {
       if (!leaveFromStr || !leaveToStr) return false;
-      const fromDateOnly = leaveFromStr.split(' ')[0];
-      const toDateOnly = leaveToStr.split(' ')[0];
-      const target = new Date(targetDateStr).setHours(0,0,0,0);
-      const from = new Date(fromDateOnly).setHours(0,0,0,0);
-      const to = new Date(toDateOnly).setHours(0,0,0,0);
-      return target >= from && target <= to;
+      const fromDateOnly = normalizeDateKey(leaveFromStr);
+      const toDateOnly = normalizeDateKey(leaveToStr);
+      if (!fromDateOnly || !toDateOnly) return false;
+      return targetDateStr >= fromDateOnly && targetDateStr <= toDateOnly;
   };
 
-  const myUserId = user ? Number(user.user_id) : 0;
   const myPenalties = penalties.filter(p => Number(p.user_id) === myUserId);
   const mySubs = substitutions.filter(s => Number(s.teacher_id) === myUserId || Number(s.substitute_id) === myUserId);
   const myLeaves = leaves.filter(l => {
@@ -184,13 +274,13 @@ export default function AttendanceHistory() {
 
   const currentMonthStr = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`;
   
-  const visibleRecords = records.filter(r => isSameMonth(new Date(r.date), currentDate));
-  const visiblePenalties = myPenalties.filter(p => p.date && p.date.startsWith(currentMonthStr));
-  const visibleSubs = mySubs.filter(s => s.date && s.date.startsWith(currentMonthStr));
+  const visibleRecords = records.filter(r => isSameMonthKey(getAttendanceDateKey(r), currentDate));
+  const visiblePenalties = myPenalties.filter(p => normalizeDateKey(p.date).startsWith(currentMonthStr));
+  const visibleSubs = mySubs.filter(s => normalizeDateKey(s.date).startsWith(currentMonthStr));
   
   const visibleLeaves = myLeaves.filter(l => {
-      const startMonth = l.date_from ? String(l.date_from).substring(0, 7) : '';
-      const endMonth = l.date_to ? String(l.date_to).substring(0, 7) : '';
+      const startMonth = normalizeDateKey(l.date_from).substring(0, 7);
+      const endMonth = normalizeDateKey(l.date_to).substring(0, 7);
       return startMonth === currentMonthStr || endMonth === currentMonthStr;
   });
 
@@ -220,9 +310,9 @@ export default function AttendanceHistory() {
     const clickedDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), day);
     const dStr = toYMD(clickedDate);
     
-    const dayRecords = records.filter(r => r.date === dStr || r.date?.startsWith(dStr));
-    const dayPenalties = myPenalties.filter(p => p.date === dStr || p.date?.startsWith(dStr));
-    const daySubs = mySubs.filter(s => s.date === dStr || s.date?.startsWith(dStr));
+    const dayRecords = records.filter(r => getAttendanceDateKey(r) === dStr);
+    const dayPenalties = myPenalties.filter(p => dateMatches(p.date, dStr));
+    const daySubs = mySubs.filter(s => dateMatches(s.date, dStr));
     const dayLeaves = myLeaves.filter(l => isDateInLeaveRange(dStr, l.date_from, l.date_to));
     
     if (dayRecords.length > 0 || dayPenalties.length > 0 || daySubs.length > 0 || dayLeaves.length > 0) {
@@ -300,9 +390,9 @@ export default function AttendanceHistory() {
   React.useEffect(() => {
     if (showModal && selectedDayRecords?.date) {
         const dStr = toYMD(selectedDayRecords.date);
-        const dayRecords = records.filter(r => r.date === dStr || r.date?.startsWith(dStr));
-        const dayPenalties = myPenalties.filter(p => p.date === dStr || p.date?.startsWith(dStr));
-        const daySubs = mySubs.filter(s => s.date === dStr || s.date?.startsWith(dStr));
+        const dayRecords = records.filter(r => getAttendanceDateKey(r) === dStr);
+        const dayPenalties = myPenalties.filter(p => dateMatches(p.date, dStr));
+        const daySubs = mySubs.filter(s => dateMatches(s.date, dStr));
         const dayLeaves = myLeaves.filter(l => isDateInLeaveRange(dStr, l.date_from, l.date_to));
         
         dayRecords.sort((a, b) => (a.time_in || '').localeCompare(b.time_in || ''));
@@ -392,9 +482,9 @@ export default function AttendanceHistory() {
       const isToday = toYMD(new Date()) === toYMD(currentDayDate);
       const dStr = toYMD(currentDayDate);
       
-      const dayRecords = records.filter(r => r.date === dStr || r.date?.startsWith(dStr));
-      const dayPenalties = myPenalties.filter(p => p.date === dStr || p.date?.startsWith(dStr));
-      const daySubs = mySubs.filter(s => s.date === dStr || s.date?.startsWith(dStr));
+      const dayRecords = records.filter(r => getAttendanceDateKey(r) === dStr);
+      const dayPenalties = myPenalties.filter(p => dateMatches(p.date, dStr));
+      const daySubs = mySubs.filter(s => dateMatches(s.date, dStr));
       const dayLeaves = myLeaves.filter(l => isDateInLeaveRange(dStr, l.date_from, l.date_to));
       
       const hasContent = dayRecords.length > 0 || dayPenalties.length > 0 || daySubs.length > 0 || dayLeaves.length > 0;

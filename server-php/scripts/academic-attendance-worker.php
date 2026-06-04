@@ -53,6 +53,18 @@ if (!function_exists('aw_ensure_single_instance')) {
     }
 }
 
+if (!function_exists('aw_connection_alive')) {
+    function aw_connection_alive(mysqli $mysqli): bool
+    {
+        try {
+            return (bool)$mysqli->ping();
+        } catch (Throwable $e) {
+            cw_log('[Worker] ping failed: ' . $e->getMessage());
+            return false;
+        }
+    }
+}
+
 $intervalSeconds = 5;
 $academicSyncIntervalSeconds = 300;
 $runOnce = false;
@@ -86,9 +98,10 @@ cw_log('[Worker] start interval=' . $intervalSeconds . 's run_once=' . ($runOnce
 $nextAcademicSyncAt = 0;
 while (true) {
     try {
-        if (!@$mysqli->ping()) {
+        if (!aw_connection_alive($mysqli)) {
             cw_log('[Worker] database connection lost; reconnecting.');
             $mysqli = aw_connect_db();
+            cw_log('[Worker] database reconnect successful.');
         }
 
         $now = time();

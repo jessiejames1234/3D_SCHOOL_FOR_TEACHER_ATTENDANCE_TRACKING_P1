@@ -48,7 +48,7 @@ const getNextDateForDay = (dayName) => {
 export default function SubstituteIndex() {
   const { user } = React.useContext(AuthContext); 
   const isDean = Number(user?.role_id) === 2;
-  const canAddSubstitution = !isDean;
+  const canAddSubstitution = isDean;
   const [rows, setRows] = React.useState([]);
   
   // Data for Dropdowns
@@ -214,7 +214,7 @@ export default function SubstituteIndex() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!canAddSubstitution) {
-      return swalFire('Not allowed', 'Deans cannot add substitutions.', 'warning');
+      return swalFire('Not allowed', 'Only dean can add substitutions.', 'warning');
     }
     if (form.selectedSchedules.length === 0 || !form.substitute_id) {
         return swalFire('Missing Details', 'Please select a substitute and at least one class schedule.', 'warning');

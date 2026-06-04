@@ -3,6 +3,21 @@ import { apiGet } from '../../services/api.js';
 import './Index.css';
 
 function ThreeDBuildingIndex() {
+  const defaultAvatarSrc = (() => {
+    try {
+      if (typeof window === 'undefined') return '/src/assets/unknown.jpg';
+      const parts = window.location.pathname.split('/').filter(Boolean);
+      let projectRoot = '';
+      if (parts.length) {
+        const first = String(parts[0]).toLowerCase();
+        if (first !== 'public') projectRoot = '/' + parts[0];
+      }
+      return `${projectRoot}/src/assets/unknown.jpg`;
+    } catch (e) {
+      return '/src/assets/unknown.jpg';
+    }
+  })();
+
   const resolveUrl = (path) => {
     try { return new URL(path, window.location.href).href; }
     catch (e) { return path; }
@@ -17,8 +32,8 @@ function ThreeDBuildingIndex() {
   };
 
   const serverRoot = resolveServerRoot();
-  const defaultModel = new URL('./3dbuilding/MW1_4.glb', `${serverRoot}/`).href;
-  const fallbackModel = 'http://localhost/3D_SCHOOL_FOR_TEACHER_ATTENDANCE_TRACKING_P1/server-php/3dbuilding/MW1_4.glb';
+  const defaultModel = new URL('./3dbuilding/MWv1.1.glb', `${serverRoot}/`).href;
+  const fallbackModel = 'http://localhost/3D_SCHOOL_FOR_TEACHER_ATTENDANCE_TRACKING_P1/server-php/3dbuilding/MWv1.1.glb';
 
   const [modelSrc, setModelSrc] = useState(defaultModel);
   const [status, setStatus] = useState('loading');
@@ -29,8 +44,8 @@ function ThreeDBuildingIndex() {
   const [catalog, setCatalog] = useState({ schools: [], buildings: [], floors: [], rooms: [] });
 
   const [searchTeacher, setSearchTeacher] = useState('');
-  const [pendingFilters, setPendingFilters] = useState({ campus: 'Carmen', building: '', floor: '', room: '' });
-  const [appliedFilters, setAppliedFilters] = useState({ campus: 'Carmen', building: '', floor: '', room: '' });
+  const [pendingFilters, setPendingFilters] = useState({ campus: '', building: '', floor: '', room: '' });
+  const [appliedFilters, setAppliedFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [logsPage, setLogsPage] = useState(1);
   const [roomModal, setRoomModal] = useState(null);
   const [focusedRoom, setFocusedRoom] = useState('');
@@ -39,6 +54,8 @@ function ThreeDBuildingIndex() {
   const [sceneBusyLabel, setSceneBusyLabel] = useState('Loading 3D model...');
   const [isUploadBusy, setIsUploadBusy] = useState(false);
   const [pendingUpload, setPendingUpload] = useState(null);
+  const [moveModeEnabled, setMoveModeEnabled] = useState(false);
+  const [activeUploadTransform, setActiveUploadTransform] = useState(null);
 
   const viewerWrapRef = useRef(null);
   const mountRef = useRef(null);
@@ -66,9 +83,20 @@ function ThreeDBuildingIndex() {
   const pendingUploadActiveRef = useRef(false);
   const uploadAnchorRefs = useRef({});
   const uploadAnchorPositionsRef = useRef([
-    { id: 'upload-anchor-left', x: -25, y: 8, z: 0 },
-    { id: 'upload-anchor-right', x: 25, y: 8, z: 0 }
+    { id: 'upload-anchor-left', x: -25, y: 0, z: 0 },
+    { id: 'upload-anchor-right', x: 25, y: 0, z: 0 }
   ]);
+  const moveModeRef = useRef(false);
+  const selectedUploadAnchorIdRef = useRef('upload-anchor-left');
+  const raycasterRef = useRef(null);
+  const dragStateRef = useRef({
+    active: false,
+    pointerId: null,
+    object: null,
+    plane: null,
+    offsetX: 0,
+    offsetZ: 0
+  });
 
   const uniqueValues = (list) => Array.from(new Set((list || []).filter(Boolean)));
   const nameEq = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
@@ -136,6 +164,20 @@ function ThreeDBuildingIndex() {
       updateUploadAnchorButtons();
     });
   }, [isFullscreen]);
+
+  useEffect(() => {
+    moveModeRef.current = moveModeEnabled;
+    if (!moveModeEnabled) stopDraggingMoveTarget();
+    updateViewerCursor();
+  }, [moveModeEnabled]);
+
+  useEffect(() => {
+    if (!activeUploadTransform && moveModeEnabled) {
+      setMoveModeEnabled(false);
+      return;
+    }
+    updateViewerCursor();
+  }, [activeUploadTransform, moveModeEnabled]);
 
   useEffect(() => {
     const handleWindowFocus = () => {
@@ -232,12 +274,16 @@ function ThreeDBuildingIndex() {
     btn.style.left = `${x}px`;
     btn.style.top = `${y}px`;
   };
+  const extractTimeText = (value) => {
+    const txt = String(value || '').trim();
+    if (!txt) return '';
+    const match = txt.match(/(?:T|\s|^)(\d{1,2}:\d{2}(?::\d{2})?)/);
+    return match ? match[1] : txt;
+  };
   const toMinutes = (t) => {
-    const txt = String(t || '').trim();
+    const txt = extractTimeText(t);
     if (!txt) return null;
-    const raw = txt.includes('T') ? txt.split('T')[1] : txt;
-    const timePart = raw.split(' ')[0];
-    const parts = timePart.split(':');
+    const parts = txt.split(':');
     if (parts.length < 2) return null;
     const h = Number(parts[0]);
     const m = Number(parts[1]);
@@ -245,13 +291,13 @@ function ThreeDBuildingIndex() {
     return (h * 60) + m;
   };
   const formatClock = (timeText) => {
-    const txt = String(timeText || '').trim();
+    const txt = extractTimeText(timeText);
     if (!txt) return '--:--';
-    const p = txt.includes('T') ? txt.split('T')[1] : txt;
-    const parts = p.split(':');
+    const parts = txt.split(':');
     if (parts.length < 2) return txt;
     let h = Number(parts[0]);
     const m = parts[1];
+    if (!Number.isFinite(h)) return txt;
     const ampm = h >= 12 ? 'PM' : 'AM';
     h = h % 12;
     if (h === 0) h = 12;
@@ -259,10 +305,50 @@ function ThreeDBuildingIndex() {
   };
   const toDateTime = (dateText, timeText) => {
     const d = String(dateText || '').trim();
-    const t = String(timeText || '').trim();
+    const rawTime = String(timeText || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}[ T]/.test(rawTime)) {
+      const direct = new Date(rawTime.replace(' ', 'T'));
+      if (!Number.isNaN(direct.getTime())) return direct;
+    }
+    const t = extractTimeText(rawTime);
     if (!d || !t) return null;
     const dt = new Date(`${d}T${t}`);
     return Number.isNaN(dt.getTime()) ? null : dt;
+  };
+  const timeTextFromDate = (dateValue) => {
+    if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return '';
+    return [
+      String(dateValue.getHours()).padStart(2, '0'),
+      String(dateValue.getMinutes()).padStart(2, '0'),
+      String(dateValue.getSeconds()).padStart(2, '0')
+    ].join(':');
+  };
+  const getMidpointTime = (record) => {
+    const start = toDateTime(record?.date, record?.start_time);
+    const end = toDateTime(record?.date, record?.end_time);
+    if (!start || !end) return record?.start_time || '';
+    return timeTextFromDate(new Date(start.getTime() + ((end.getTime() - start.getTime()) / 2)));
+  };
+  const normalizeDateKey = (value) => {
+    const raw = String(value || '').trim();
+    const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return match ? `${match[1]}-${match[2]}-${match[3]}` : '';
+  };
+  const dayNameForDate = (dateValue) => {
+    const key = normalizeDateKey(dateValue);
+    if (!key) return '';
+    const d = new Date(`${key}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+  };
+  const isDateWithinScheduleRange = (dateValue, startValue, endValue) => {
+    const dateKey = normalizeDateKey(dateValue);
+    const startKey = normalizeDateKey(startValue);
+    const endKey = normalizeDateKey(endValue);
+    if (!dateKey) return false;
+    if (startKey && dateKey < startKey) return false;
+    if (endKey && dateKey > endKey) return false;
+    return true;
   };
   const deriveBuildingFromRoom = (roomName) => {
     const match = String(roomName || '').trim().match(/^([A-Za-z]+)[-\s]/);
@@ -280,17 +366,100 @@ function ThreeDBuildingIndex() {
     const b = buildingName || deriveBuildingFromRoom(room);
     return b ? `${b}-${ord}-FLOOR` : `${ord}-FLOOR`;
   };
-  const initials = (name) => {
-    const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
-    if (!parts.length) return '?';
-    if (parts.length === 1) return parts[0].slice(0, 1).toUpperCase();
-    return `${parts[0].slice(0, 1)}${parts[1].slice(0, 1)}`.toUpperCase();
-  };
   const supportedUploadExts = ['.glb', '.gltf', '.obj', '.fbx', '.stl'];
+  const moveNudgeStep = 0.5;
   const uploadAnchorDefs = [
-    { id: 'upload-anchor-left', label: 'Upload anchor 1' },
-    { id: 'upload-anchor-right', label: 'Upload anchor 2' }
+    { id: 'upload-anchor-left', label: 'Add building on the left' },
+    { id: 'upload-anchor-right', label: 'Add building on the right' }
   ];
+  const getMoveTargetObject = () => pendingUploadObjectRef.current || uploadedObjectsRef.current[0] || null;
+  const syncActiveUploadTransform = (object = getMoveTargetObject()) => {
+    if (!object) {
+      setActiveUploadTransform(null);
+      return;
+    }
+
+    const next = {
+      name: object.name || 'uploaded model',
+      x: Number(object.position.x.toFixed(2)),
+      y: Number(object.position.y.toFixed(2)),
+      z: Number(object.position.z.toFixed(2))
+    };
+
+    setActiveUploadTransform((prev) => {
+      if (
+        prev
+        && prev.name === next.name
+        && prev.x === next.x
+        && prev.y === next.y
+        && prev.z === next.z
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  };
+  const updateViewerCursor = () => {
+    const canvas = rendererRef.current?.domElement;
+    if (!canvas) return;
+    if (dragStateRef.current.active) {
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+    if (moveModeRef.current && getMoveTargetObject()) {
+      canvas.style.cursor = 'grab';
+      return;
+    }
+    canvas.style.cursor = '';
+  };
+  const stopDraggingMoveTarget = () => {
+    const canvas = rendererRef.current?.domElement;
+    const dragState = dragStateRef.current;
+    if (canvas && dragState.pointerId != null && typeof canvas.releasePointerCapture === 'function') {
+      try { canvas.releasePointerCapture(dragState.pointerId); } catch (e) { /* ignore */ }
+    }
+    dragStateRef.current = {
+      active: false,
+      pointerId: null,
+      object: null,
+      plane: null,
+      offsetX: 0,
+      offsetZ: 0
+    };
+    if (controlsRef.current) controlsRef.current.enabled = true;
+    updateViewerCursor();
+  };
+  const applyUploadAnchorPlacement = (object) => {
+    if (!object || !window.THREE) return;
+    const anchor = uploadAnchorPositionsRef.current.find((item) => item.id === selectedUploadAnchorIdRef.current)
+      || uploadAnchorPositionsRef.current[0]
+      || null;
+    if (!anchor) return;
+    object.position.add(new window.THREE.Vector3(anchor.x, 0, anchor.z));
+  };
+  const storeInitialUploadPosition = (object) => {
+    if (!object || !window.THREE) return;
+    object.userData.initialViewerPosition = object.position.clone();
+  };
+  const resetMoveTargetPosition = () => {
+    const object = getMoveTargetObject();
+    const initialPosition = object?.userData?.initialViewerPosition || null;
+    if (!object || !initialPosition) return;
+    object.position.copy(initialPosition);
+    if (controlsRef.current) controlsRef.current.update();
+    syncActiveUploadTransform(object);
+    setMessage(`Reset "${object.name || 'uploaded model'}" to its initial viewer position.`);
+  };
+  const nudgeMoveTarget = (dx = 0, dy = 0, dz = 0) => {
+    const object = getMoveTargetObject();
+    if (!object) return;
+    stopDraggingMoveTarget();
+    object.position.x += dx;
+    object.position.y += dy;
+    object.position.z += dz;
+    if (controlsRef.current) controlsRef.current.update();
+    syncActiveUploadTransform(object);
+  };
 
   const disposeMaterial = (material) => {
     if (!material) return;
@@ -324,9 +493,11 @@ function ThreeDBuildingIndex() {
     disposeObject(object);
   };
 
-  const clearUploadedObjects = () => {
+  const clearUploadedObjects = ({ suppressTransformSync = false } = {}) => {
+    stopDraggingMoveTarget();
     uploadedObjectsRef.current.forEach((object) => removeSceneObject(object));
     uploadedObjectsRef.current = [];
+    if (!suppressTransformSync) syncActiveUploadTransform(null);
   };
 
   const setPendingUploadState = (nextUpload) => {
@@ -340,7 +511,8 @@ function ThreeDBuildingIndex() {
     });
   };
 
-  const clearPendingUploadPreview = ({ restoreCommitted = false, suppressState = false } = {}) => {
+  const clearPendingUploadPreview = ({ restoreCommitted = false, suppressState = false, suppressTransformSync = false } = {}) => {
+    stopDraggingMoveTarget();
     if (pendingUploadObjectRef.current) {
       removeSceneObject(pendingUploadObjectRef.current);
       pendingUploadObjectRef.current = null;
@@ -351,6 +523,7 @@ function ThreeDBuildingIndex() {
     } else {
       setPendingUploadState(null);
     }
+    if (!suppressTransformSync) syncActiveUploadTransform();
   };
 
   const applyMeshDefaults = (object) => {
@@ -378,6 +551,12 @@ function ThreeDBuildingIndex() {
     if (box.isEmpty()) return;
     const center = box.getCenter(new window.THREE.Vector3());
     object.position.sub(center);
+  };
+  const placeObjectOnGround = (object, groundY = 0) => {
+    if (!object || !window.THREE) return;
+    const box = new window.THREE.Box3().setFromObject(object);
+    if (box.isEmpty()) return;
+    object.position.y += groundY - box.min.y;
   };
 
   const frameObjectInCamera = (object) => {
@@ -421,8 +600,8 @@ function ThreeDBuildingIndex() {
   const updateUploadAnchorLayout = (rootObject = modelRef.current) => {
     if (!window.THREE || !rootObject) {
       uploadAnchorPositionsRef.current = [
-        { id: 'upload-anchor-left', x: -25, y: 8, z: 0 },
-        { id: 'upload-anchor-right', x: 25, y: 8, z: 0 }
+        { id: 'upload-anchor-left', x: -25, y: 0, z: 0 },
+        { id: 'upload-anchor-right', x: 25, y: 0, z: 0 }
       ];
       return;
     }
@@ -432,11 +611,12 @@ function ThreeDBuildingIndex() {
 
     const center = box.getCenter(new window.THREE.Vector3());
     const size = box.getSize(new window.THREE.Vector3());
-    const anchorY = center.y + Math.max(size.y * 0.2, 8);
+    const sidePadding = Math.max(size.x * 0.08, 4);
+    const anchorY = box.min.y + Math.max(size.y * 0.04, 0.25);
 
     uploadAnchorPositionsRef.current = [
-      { id: 'upload-anchor-left', x: center.x - 25, y: anchorY, z: center.z },
-      { id: 'upload-anchor-right', x: center.x + 25, y: anchorY, z: center.z }
+      { id: 'upload-anchor-left', x: box.min.x - sidePadding, y: anchorY, z: center.z },
+      { id: 'upload-anchor-right', x: box.max.x + sidePadding, y: anchorY, z: center.z }
     ];
   };
 
@@ -494,29 +674,127 @@ function ThreeDBuildingIndex() {
     const roomName = raw?.room_name || raw?.room || raw?.Room || '';
     const teacherName = `${raw?.first_name || ''} ${raw?.last_name || ''}`.trim() || raw?.teacher_name || 'Teacher';
     const buildingName = raw?.building_name || deriveBuildingFromRoom(roomName);
-    const floorName = raw?.floor_name || deriveFloorFromRoom(roomName, buildingName);
+    const floorName = raw?.floor_name || raw?.attendance_floor_name || deriveFloorFromRoom(roomName, buildingName);
     return {
+      attendance_id: raw?.attendance_id || '',
+      schedule_id: raw?.schedule_id || '',
+      user_id: raw?.user_id || raw?.teacher_id || '',
+      avatar: raw?.avatar || raw?.image || raw?.teacher_avatar || '',
       date: raw?.date || '',
       room_name: roomName,
       teacher_name: teacherName,
-      campus_name: raw?.campus_name || raw?.school_name || 'Carmen',
+      campus_name: raw?.campus_name || raw?.school_name || '',
       building_name: buildingName,
       floor_name: floorName,
       start_time: raw?.start_time || '',
       end_time: raw?.end_time || '',
       time_in: raw?.time_in || '',
       time_check: raw?.time_check || '',
-      time_out: raw?.time_out || ''
+      time_out: raw?.time_out || '',
+      flag_in_id: raw?.flag_in_id ?? null,
+      flag_in_name: raw?.flag_in_name || '',
+      flag_check_id: raw?.flag_check_id ?? null,
+      flag_check_name: raw?.flag_check_name || '',
+      flag_out_id: raw?.flag_out_id ?? null,
+      flag_out_name: raw?.flag_out_name || '',
+      is_schedule_only: !!raw?._schedule_only
     };
   };
 
+  const statusFromFlag = (flagIdValue, flagNameValue) => {
+    const flagId = Number(flagIdValue || 0);
+    const flagName = String(flagNameValue || '').trim().toLowerCase();
+    if (flagId === 5 || flagName === 'late') return 'LATE';
+    if (flagId === 3 || flagName === 'absent') return 'ABSENT';
+    if (flagId === 2 || flagName === 'present' || flagId === 4 || flagName === 'substituted') return 'PRESENT';
+    return '';
+  };
+
   const computeAttendanceStatus = (record) => {
+    const flagStatus = statusFromFlag(record?.flag_in_id, record?.flag_in_name);
+    if (flagStatus) return flagStatus;
+
     const hasIn = !!String(record?.time_in || '').trim();
     if (!hasIn) return 'ABSENT';
     const inMins = toMinutes(record?.time_in);
     const startMins = toMinutes(record?.start_time);
     if (inMins !== null && startMins !== null && inMins > (startMins + 5)) return 'LATE';
     return 'PRESENT';
+  };
+
+  const computeCheckpointStatus = (record, checkpoint) => {
+    const config = {
+      in: {
+        timeKey: 'time_in',
+        flagIdKey: 'flag_in_id',
+        flagNameKey: 'flag_in_name',
+        compareTimeKey: 'start_time'
+      },
+      mid: {
+        timeKey: 'time_check',
+        flagIdKey: 'flag_check_id',
+        flagNameKey: 'flag_check_name'
+      },
+      out: {
+        timeKey: 'time_out',
+        flagIdKey: 'flag_out_id',
+        flagNameKey: 'flag_out_name'
+      }
+    }[checkpoint];
+    if (!config) return 'ABSENT';
+
+    const flagStatus = statusFromFlag(record?.[config.flagIdKey], record?.[config.flagNameKey]);
+    if (flagStatus) return flagStatus;
+
+    const timeValue = String(record?.[config.timeKey] || '').trim();
+    if (!timeValue) return 'ABSENT';
+    if (checkpoint === 'in') {
+      const inMins = toMinutes(timeValue);
+      const startMins = toMinutes(record?.[config.compareTimeKey]);
+      if (inMins !== null && startMins !== null && inMins > (startMins + 5)) return 'LATE';
+    }
+    return 'PRESENT';
+  };
+
+  const normalizeScheduleForDate = (schedule, dateKey) => normalizeRecord({
+    ...schedule,
+    date: dateKey,
+    user_id: schedule?.teacher_id || schedule?.user_id || '',
+    _schedule_only: true
+  });
+
+  const buildScheduleRecordsForDate = (schedules, dateKey) => {
+    const dayName = dayNameForDate(dateKey);
+    if (!dayName || !Array.isArray(schedules)) return [];
+    return schedules
+      .filter((schedule) => String(schedule?.day_of_week || '').trim().toLowerCase() === dayName)
+      .filter((schedule) => isDateWithinScheduleRange(dateKey, schedule?.semester_start, schedule?.semester_end))
+      .map((schedule) => normalizeScheduleForDate(schedule, dateKey));
+  };
+
+  const attendanceRecordKey = (record, fallbackDate = selectedScheduleDate) => [
+    String(record?.schedule_id || ''),
+    String(record?.user_id || record?.teacher_id || ''),
+    normalizeDateKey(record?.date) || fallbackDate
+  ].join('|');
+
+  const mergeSchedulesWithAttendance = (scheduleRecords, attendanceRows, dateKey) => {
+    const merged = new Map();
+    scheduleRecords.forEach((record) => {
+      merged.set(attendanceRecordKey(record, dateKey), record);
+    });
+    attendanceRows.forEach((record) => {
+      const key = attendanceRecordKey(record, dateKey);
+      const scheduleRecord = merged.get(key);
+      merged.set(key, scheduleRecord ? {
+        ...scheduleRecord,
+        ...record,
+        campus_name: scheduleRecord.campus_name || record.campus_name,
+        building_name: scheduleRecord.building_name || record.building_name,
+        floor_name: scheduleRecord.floor_name || record.floor_name
+      } : record);
+    });
+    return Array.from(merged.values());
   };
 
   const buildMarkerFromRecord = (record, now) => {
@@ -565,7 +843,7 @@ function ThreeDBuildingIndex() {
 
   const attendanceCampusOptions = useMemo(() => {
     const vals = uniqueValues(attendanceRecords.map(r => r.campus_name));
-    return vals.length ? vals : ['Carmen'];
+    return vals;
   }, [attendanceRecords]);
   const attendanceBuildingOptions = useMemo(() => {
     return uniqueValues(
@@ -668,13 +946,13 @@ function ThreeDBuildingIndex() {
 
   useEffect(() => {
     setPendingFilters(prev => ({
-      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : (campusOptions[0] || ''),
+      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
       building: prev.building && buildingOptions.includes(prev.building) ? prev.building : '',
       floor: prev.floor && floorOptions.includes(prev.floor) ? prev.floor : '',
       room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
     }));
     setAppliedFilters(prev => ({
-      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : (campusOptions[0] || ''),
+      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
       building: prev.building && buildingOptions.includes(prev.building) ? prev.building : '',
       floor: prev.floor && floorOptions.includes(prev.floor) ? prev.floor : '',
       room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
@@ -718,22 +996,29 @@ function ThreeDBuildingIndex() {
   }, [searchedRecords]);
 
   const recentLogs = useMemo(() => {
-    const items = searchedRecords.map((rec, idx) => {
-      const statusTag = computeAttendanceStatus(rec);
-      const hasOut = !!String(rec.time_out || '').trim();
-      const eventType = hasOut ? 'OUT' : 'IN';
-      const eventTime = rec.time_out || rec.time_check || rec.time_in || rec.start_time || '';
+    const checkpoints = [
+      { key: 'in', label: 'CHECK IN', timeKey: 'time_in', fallback: (rec) => rec.start_time || '' },
+      { key: 'mid', label: 'CHECK MID', timeKey: 'time_check', fallback: (rec) => getMidpointTime(rec) },
+      { key: 'out', label: 'CHECK OUT', timeKey: 'time_out', fallback: (rec) => rec.end_time || '' }
+    ];
+    const items = searchedRecords.flatMap((rec, idx) => checkpoints.map((checkpoint) => {
+      const eventTime = rec[checkpoint.timeKey] || checkpoint.fallback(rec) || rec.start_time || '';
       const sortDate = toDateTime(rec.date, eventTime) || toDateTime(rec.date, rec.start_time) || new Date(0);
       return {
-        id: `${rec.teacher_name}-${rec.room_name}-${idx}`,
+        id: `${rec.attendance_id || rec.schedule_id || idx}-${rec.teacher_name}-${rec.room_name}-${checkpoint.key}`,
         teacherName: rec.teacher_name || 'Teacher',
         roomName: rec.room_name || '-',
-        type: eventType,
-        status: statusTag,
+        campusName: rec.campus_name || '',
+        buildingName: rec.building_name || '',
+        floorName: rec.floor_name || '',
+        avatar: rec.avatar || '',
+        type: checkpoint.label,
+        status: computeCheckpointStatus(rec, checkpoint.key),
         eventTime,
-        sortDate
+        sortDate,
+        record: rec
       };
-    });
+    }));
     items.sort((a, b) => b.sortDate.getTime() - a.sortDate.getTime());
     return items;
   }, [searchedRecords]);
@@ -751,7 +1036,7 @@ function ThreeDBuildingIndex() {
 
   useEffect(() => {
     setLogsPage(1);
-  }, [searchTeacher, appliedFilters]);
+  }, [searchTeacher, appliedFilters, selectedScheduleDate]);
 
   useEffect(() => {
     const timer = setInterval(() => setNowTime(new Date()), 1000);
@@ -788,41 +1073,31 @@ function ThreeDBuildingIndex() {
   useEffect(() => {
     const fetchTeacherLocation = async () => {
       try {
-        let token = '';
-        try { token = localStorage.getItem('token') || ''; } catch (e) {}
-        if (!token) {
-          setMessage('Authentication required. Please log in again.');
-          setAttendanceRecords([]);
-          return;
-        }
-
         const queryDate = selectedScheduleDate || toLocalYmd();
-        const apiUrl = `${serverRoot}/index.php/api/attendance?date=${queryDate}`;
-        const headers = { Authorization: `Bearer ${token}` };
-
-        const resp = await fetch(apiUrl, { headers });
-        if (!resp.ok) {
-          if (resp.status === 401 || resp.status === 403) {
-            setMessage('Unable to load schedules. Please sign in again.');
-            setAttendanceRecords([]);
-            return;
-          }
-          throw new Error('Failed to fetch attendance');
-        }
-
-        const records = await resp.json();
-        const normalized = Array.isArray(records) ? records.map(normalizeRecord) : [];
-        setAttendanceRecords(normalized);
+        const [records, schedules] = await Promise.all([
+          apiGet(`attendance?date=${encodeURIComponent(queryDate)}`),
+          apiGet('class-schedules').catch((err) => {
+            console.warn('Schedule fetch failed for 3D viewer:', err);
+            return [];
+          })
+        ]);
+        const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
+        const scheduleRecords = buildScheduleRecordsForDate(Array.isArray(schedules) ? schedules : [], queryDate);
+        setAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, queryDate));
         setMessage('');
       } catch (err) {
         console.error('Attendance fetch failed:', err);
+        if (err?.status === 401 || err?.status === 403) {
+          setMessage('Unable to load schedules. Please sign in again.');
+          setAttendanceRecords([]);
+        }
       }
     };
 
     fetchTeacherLocation();
     const interval = setInterval(fetchTeacherLocation, 5000);
     return () => clearInterval(interval);
-  }, [serverRoot, selectedScheduleDate]);
+  }, [selectedScheduleDate]);
 
   useEffect(() => {
     const now = nowTime;
@@ -866,6 +1141,7 @@ function ThreeDBuildingIndex() {
     renderer.setPixelRatio(window.devicePixelRatio || 1);
     renderer.shadowMap.enabled = true;
     renderer.outputEncoding = window.THREE.sRGBEncoding;
+    raycasterRef.current = new window.THREE.Raycaster();
 
     mountRef.current.innerHTML = '';
     mountRef.current.appendChild(renderer.domElement);
@@ -880,6 +1156,82 @@ function ThreeDBuildingIndex() {
     const dirLight = new window.THREE.DirectionalLight(0xffffff, 1.15);
     dirLight.position.set(50, 100, 50);
     scene.add(dirLight);
+
+    const getPointerNdc = (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      return new window.THREE.Vector2(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1
+      );
+    };
+
+    const handleViewerPointerDown = (event) => {
+      if (event.button !== 0 || !moveModeRef.current) return;
+      if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
+
+      const moveTarget = getMoveTargetObject();
+      if (!moveTarget) return;
+
+      const pointer = getPointerNdc(event);
+      if (!pointer) return;
+
+      raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+      const hits = raycasterRef.current.intersectObject(moveTarget, true);
+      if (!hits.length) return;
+
+      const moveTargetCenter = new window.THREE.Box3()
+        .setFromObject(moveTarget)
+        .getCenter(new window.THREE.Vector3());
+      const plane = new window.THREE.Plane(new window.THREE.Vector3(0, 1, 0), -moveTargetCenter.y);
+      const planePoint = raycasterRef.current.ray.intersectPlane(plane, new window.THREE.Vector3());
+      if (!planePoint) return;
+
+      dragStateRef.current = {
+        active: true,
+        pointerId: event.pointerId ?? null,
+        object: moveTarget,
+        plane,
+        offsetX: planePoint.x - moveTarget.position.x,
+        offsetZ: planePoint.z - moveTarget.position.z
+      };
+
+      if (controlsRef.current) controlsRef.current.enabled = false;
+      if (typeof renderer.domElement.setPointerCapture === 'function' && event.pointerId != null) {
+        try { renderer.domElement.setPointerCapture(event.pointerId); } catch (e) { /* ignore */ }
+      }
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      event.stopPropagation();
+      event.preventDefault();
+      updateViewerCursor();
+    };
+
+    const handleViewerPointerMove = (event) => {
+      const dragState = dragStateRef.current;
+      if (!dragState.active || !dragState.object || !dragState.plane) return;
+      if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
+
+      const pointer = getPointerNdc(event);
+      if (!pointer) return;
+
+      raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+      const planePoint = raycasterRef.current.ray.intersectPlane(dragState.plane, new window.THREE.Vector3());
+      if (!planePoint) return;
+
+      dragState.object.position.set(
+        planePoint.x - dragState.offsetX,
+        dragState.object.position.y,
+        planePoint.z - dragState.offsetZ
+      );
+      syncActiveUploadTransform(dragState.object);
+      event.preventDefault();
+    };
+
+    const handleViewerPointerUp = () => {
+      if (!dragStateRef.current.active) return;
+      stopDraggingMoveTarget();
+      syncActiveUploadTransform();
+    };
 
     const animate = () => {
       requestRef.current = requestAnimationFrame(animate);
@@ -898,6 +1250,10 @@ function ThreeDBuildingIndex() {
       : null;
 
     window.addEventListener('resize', handleResize);
+    window.addEventListener('pointermove', handleViewerPointerMove);
+    window.addEventListener('pointerup', handleViewerPointerUp);
+    window.addEventListener('pointercancel', handleViewerPointerUp);
+    renderer.domElement.addEventListener('pointerdown', handleViewerPointerDown, true);
     resizeObserver?.observe(mountRef.current);
     if (viewerWrapRef.current && viewerWrapRef.current !== mountRef.current) {
       resizeObserver?.observe(viewerWrapRef.current);
@@ -906,10 +1262,15 @@ function ThreeDBuildingIndex() {
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('pointermove', handleViewerPointerMove);
+      window.removeEventListener('pointerup', handleViewerPointerUp);
+      window.removeEventListener('pointercancel', handleViewerPointerUp);
+      renderer.domElement.removeEventListener('pointerdown', handleViewerPointerDown, true);
       resizeObserver?.disconnect();
       cancelAnimationFrame(requestRef.current);
-      clearPendingUploadPreview({ suppressState: true });
-      clearUploadedObjects();
+      stopDraggingMoveTarget();
+      clearPendingUploadPreview({ suppressState: true, suppressTransformSync: true });
+      clearUploadedObjects({ suppressTransformSync: true });
       removeSceneObject(modelRef.current);
       modelRef.current = null;
       if (pinRef.current) { removeSceneObject(pinRef.current); pinRef.current = null; }
@@ -920,6 +1281,7 @@ function ThreeDBuildingIndex() {
       if (controlsRef.current?.dispose) controlsRef.current.dispose();
       if (rendererRef.current) rendererRef.current.dispose();
       rendererRef.current = null;
+      raycasterRef.current = null;
       sceneRef.current = null;
       cameraRef.current = null;
       controlsRef.current = null;
@@ -1128,8 +1490,9 @@ function ThreeDBuildingIndex() {
     }
   };
 
-  const triggerUploadDialog = () => {
+  const triggerUploadDialog = (anchorId = selectedUploadAnchorIdRef.current) => {
     if (!fileInputRef.current || isUploadBusy || pendingUploadActiveRef.current) return;
+    selectedUploadAnchorIdRef.current = anchorId;
     setMessage('');
     filePickerActiveRef.current = true;
     fileInputRef.current.click();
@@ -1215,6 +1578,9 @@ function ThreeDBuildingIndex() {
       object.name = object.name || file.name;
       applyMeshDefaults(object);
       centerObjectAtOrigin(object);
+      placeObjectOnGround(object);
+      applyUploadAnchorPlacement(object);
+      storeInitialUploadPosition(object);
       if (!sceneRef.current) {
         removeSceneObject(object);
         return;
@@ -1224,6 +1590,7 @@ function ThreeDBuildingIndex() {
       sceneRef.current.add(object);
       pendingUploadObjectRef.current = object;
       setPendingUploadState({ name: file.name });
+      syncActiveUploadTransform(object);
       setMessage(`Preview ready for "${file.name}". Accept or cancel the upload changes.`);
       controlsRef.current?.update();
       requestAnimationFrame(() => {
@@ -1250,6 +1617,7 @@ function ThreeDBuildingIndex() {
     uploadedObjectsRef.current = [pendingObject];
     pendingUploadObjectRef.current = null;
     setPendingUploadState(null);
+    syncActiveUploadTransform(pendingObject);
     setMessage(`Accepted "${pendingObject.name || 'uploaded model'}".`);
     requestAnimationFrame(() => {
       syncViewerSize();
@@ -1312,10 +1680,59 @@ function ThreeDBuildingIndex() {
     };
   };
 
+  const getLogRoomMeta = (log) => {
+    const roomName = String(log?.roomName || log?.record?.room_name || '').trim();
+    const catalogMeta = getRoomMeta(roomName);
+    return {
+      roomName,
+      buildingName: log?.buildingName || log?.record?.building_name || catalogMeta.buildingName,
+      floorName: log?.floorName || log?.record?.floor_name || catalogMeta.floorName
+    };
+  };
+
   const handleViewRoom = (roomName) => {
     if (roomName) setFocusedRoom(roomName);
     focusRoomCamera(roomName);
     setRoomModal(getRoomMeta(roomName));
+  };
+
+  const handleRecentLogClick = async (log) => {
+    const roomName = String(log?.roomName || '').trim();
+    if (!roomName || roomName === '-') {
+      await showSwal({
+        title: 'Room Not Found',
+        text: 'This log has no room assigned.',
+        icon: 'warning'
+      });
+      return;
+    }
+
+    const meta = getLogRoomMeta(log);
+    setRoomModal(null);
+    setFocusedRoom(roomName);
+    setViewButtonVisible(false);
+    setPendingFilters((prev) => ({
+      ...prev,
+      campus: log.campusName || prev.campus || '',
+      building: log.buildingName || prev.building || '',
+      floor: log.floorName || prev.floor || '',
+      room: roomName
+    }));
+
+    const ok = focusRoomCamera(roomName, () => {
+      setViewButtonVisible(true);
+      setRoomModal(meta);
+    });
+
+    if (!ok) {
+      setFocusedRoom('');
+      setViewButtonVisible(false);
+      await showSwal({
+        title: 'Room Not Found',
+        text: `Room "${roomName}" was not found in the 3D model.`,
+        icon: 'warning'
+      });
+    }
   };
 
   const applyFilterView = async () => {
@@ -1362,7 +1779,12 @@ function ThreeDBuildingIndex() {
     });
   }, [attendanceRecords, roomModal?.roomName, selectedScheduleDate]);
 
-  const dateTimeStamp = `${nowTime
+  const selectedLogDate = (() => {
+    const key = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
+    const d = new Date(`${key}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? nowTime : d;
+  })();
+  const dateTimeStamp = `${selectedLogDate
     .toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' })
     .toUpperCase()
     .replace(', ', ',')} ${nowTime
@@ -1370,6 +1792,7 @@ function ThreeDBuildingIndex() {
     .toUpperCase()
     .replace(' ', '')}`;
   const isSceneBusy = status === 'loading' || isUploadBusy;
+  const hasMovableUpload = !!activeUploadTransform;
 
   return (
     <div className="tdb-page">
@@ -1419,6 +1842,7 @@ function ThreeDBuildingIndex() {
                   }));
                 }}
               >
+                <option value="">All Campus</option>
                 {campusOptions.map((campus) => <option key={campus} value={campus}>{campus}</option>)}
               </select>
             </div>
@@ -1521,9 +1945,9 @@ function ThreeDBuildingIndex() {
                 key={anchor.id}
                 type="button"
                 className="tdb-glass-plus-btn tdb-glass-plus-btn--anchor"
-                onClick={triggerUploadDialog}
+                onClick={() => triggerUploadDialog(anchor.id)}
                 aria-label={anchor.label}
-                title={`${anchor.label} (50m from the other upload anchor)`}
+                title={anchor.label}
                 ref={(node) => setUploadAnchorRef(anchor.id, node)}
                 style={{ display: 'none' }}
               >
@@ -1535,6 +1959,76 @@ function ThreeDBuildingIndex() {
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleResetView}>Reset View</button>
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => applyView('top')}>Top View</button>
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => rotateModel(45)}>Rotate</button>
+              <button
+                type="button"
+                className={`btn btn-sm ${moveModeEnabled ? 'btn-warning' : 'btn-outline-secondary'}`}
+                onClick={() => setMoveModeEnabled((prev) => !prev)}
+                disabled={!hasMovableUpload}
+                title={hasMovableUpload ? 'Drag the uploaded building to reposition it in the viewer' : 'Upload a building first'}
+              >
+                {moveModeEnabled ? 'Stop Move' : 'Move Building'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                onClick={resetMoveTargetPosition}
+                disabled={!hasMovableUpload}
+                title={hasMovableUpload ? 'Reset the uploaded building back to its initial viewer position' : 'Upload a building first'}
+              >
+                Reset Position
+              </button>
+              {activeUploadTransform && (
+                <div className={`tdb-move-chip${moveModeEnabled ? ' tdb-move-chip--active' : ''}`}>
+                  <div className="tdb-move-chip-title">
+                    {moveModeEnabled ? 'Move mode: drag building' : activeUploadTransform.name}
+                  </div>
+                  <div className="tdb-move-chip-coords">
+                    X: {activeUploadTransform.x} | Y: {activeUploadTransform.y} | Z: {activeUploadTransform.z}
+                  </div>
+                  <div className="tdb-nudge-grid" aria-label="Fine move controls">
+                    <span className="tdb-nudge-spacer" aria-hidden="true" />
+                    <button
+                      type="button"
+                      className="tdb-nudge-btn"
+                      onClick={() => nudgeMoveTarget(0, 0, -moveNudgeStep)}
+                      title={`Move forward by ${moveNudgeStep}`}
+                    >
+                      ^
+                    </button>
+                    <span className="tdb-nudge-spacer" aria-hidden="true" />
+                    <button
+                      type="button"
+                      className="tdb-nudge-btn"
+                      onClick={() => nudgeMoveTarget(-moveNudgeStep, 0, 0)}
+                      title={`Move left by ${moveNudgeStep}`}
+                    >
+                      &lt;
+                    </button>
+                    <div className="tdb-nudge-step">step {moveNudgeStep}</div>
+                    <button
+                      type="button"
+                      className="tdb-nudge-btn"
+                      onClick={() => nudgeMoveTarget(moveNudgeStep, 0, 0)}
+                      title={`Move right by ${moveNudgeStep}`}
+                    >
+                      &gt;
+                    </button>
+                    <span className="tdb-nudge-spacer" aria-hidden="true" />
+                    <button
+                      type="button"
+                      className="tdb-nudge-btn"
+                      onClick={() => nudgeMoveTarget(0, 0, moveNudgeStep)}
+                      title={`Move backward by ${moveNudgeStep}`}
+                    >
+                      v
+                    </button>
+                    <span className="tdb-nudge-spacer" aria-hidden="true" />
+                  </div>
+                  {!moveModeEnabled && (
+                    <div className="tdb-move-chip-hint">Toggle move mode or use the arrows to adjust the location on the ground.</div>
+                  )}
+                </div>
+              )}
             </div>
 
             {isSceneBusy && (
@@ -1644,6 +2138,16 @@ function ThreeDBuildingIndex() {
 
         <aside className="tdb-logs-panel">
           <div className="tdb-time-chip">{dateTimeStamp}</div>
+          <div className="tdb-log-date-field">
+            <label htmlFor="tdb-log-date">Logs Date</label>
+            <input
+              id="tdb-log-date"
+              type="date"
+              className="form-control form-control-sm"
+              value={selectedScheduleDate}
+              onChange={(e) => setSelectedScheduleDate(e.target.value || toLocalYmd())}
+            />
+          </div>
           <div className="tdb-logs-title">Recent Logs</div>
 
           <div className="tdb-logs-list">
@@ -1657,8 +2161,23 @@ function ThreeDBuildingIndex() {
                     ? 'tdb-status-late'
                     : 'tdb-status-absent';
                 return (
-                  <div key={log.id} className="tdb-log-item">
-                    <div className="tdb-log-avatar">{initials(log.teacherName)}</div>
+                  <button
+                    key={log.id}
+                    type="button"
+                    className="tdb-log-item tdb-log-item--clickable"
+                    onClick={() => handleRecentLogClick(log)}
+                    aria-label={`View room ${log.roomName}`}
+                    title={`View ${log.roomName}`}
+                  >
+                    <div className="tdb-log-avatar">
+                      <img
+                        src={log.avatar || defaultAvatarSrc}
+                        alt={log.teacherName || 'User'}
+                        onError={(e) => {
+                          if (e.currentTarget.src !== defaultAvatarSrc) e.currentTarget.src = defaultAvatarSrc;
+                        }}
+                      />
+                    </div>
                     <div className="tdb-log-body">
                       <div className="tdb-log-name">{log.teacherName} ({log.roomName})</div>
                       <div className="tdb-log-meta">
@@ -1667,7 +2186,7 @@ function ThreeDBuildingIndex() {
                         <span className="tdb-log-time">{formatClock(log.eventTime)}</span>
                       </div>
                     </div>
-                  </div>
+                  </button>
                 );
               })
             )}

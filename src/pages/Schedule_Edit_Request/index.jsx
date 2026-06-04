@@ -1,9 +1,11 @@
 import React from 'react';
 import Table from '../../components/Table.jsx';
 import Modal from '../../components/Modal.jsx';
+import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet, apiPut } from '../../services/api.js';
 
 export default function ScheduleEditRequestPage() {
+  const { user } = React.useContext(AuthContext) || {};
   const [rows, setRows] = React.useState([]);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
@@ -13,6 +15,7 @@ export default function ScheduleEditRequestPage() {
   const [showViewModal, setShowViewModal] = React.useState(false);
   const [targetRequestId, setTargetRequestId] = React.useState(null);
   const triedAllForTargetRef = React.useRef(false);
+  const canDecide = Number(user?.role_id || 0) === 4;
 
   const notifyDecisionSuccess = async (decision) => {
     const title = decision === 'approved'
@@ -203,7 +206,7 @@ export default function ScheduleEditRequestPage() {
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
         <div>
           <h2 className="text-2xl font-bold text-gray-800">Schedule Edit Requests</h2>
-          <p className="text-sm text-gray-500">Secretary review queue filtered by your department.</p>
+          <p className="text-sm text-gray-500">Department schedule edit request queue.</p>
         </div>
         <button
           type="button"
@@ -259,7 +262,7 @@ export default function ScheduleEditRequestPage() {
             >
               Close
             </button>
-            {String(viewRow.status || '').toLowerCase() === 'pending' ? (
+            {canDecide && String(viewRow.status || '').toLowerCase() === 'pending' ? (
               <>
                 <button
                   type="button"

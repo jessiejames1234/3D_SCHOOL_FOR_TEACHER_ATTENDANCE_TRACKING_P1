@@ -70,7 +70,12 @@ if ($param1 !== 'ping') {
     json_response(['error' => 'Worker bootstrap endpoint not found.'], 404);
 }
 
-$taskName = getenv('ATTENDANCE_WORKER_TASK') ?: '3D1.2_AcademicAttendanceWorker';
+$projectRoot = dirname(__DIR__, 2);
+$projectTag = basename($projectRoot);
+if (!is_string($projectTag) || trim($projectTag) === '') {
+    $projectTag = '3D1.3';
+}
+$taskName = getenv('ATTENDANCE_WORKER_TASK') ?: ($projectTag . '_AcademicAttendanceWorker');
 
 if (PHP_OS_FAMILY !== 'Windows') {
     json_response([

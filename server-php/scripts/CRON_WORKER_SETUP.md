@@ -15,7 +15,7 @@ An API endpoint is available at:
 
 - `GET /server-php/index.php/api/worker-bootstrap/ping`
 
-It checks the Windows task `3D1.2_AcademicAttendanceWorker` and starts it if it is not running.
+It checks the Windows task `<project-folder>_AcademicAttendanceWorker` and starts it if it is not running.
 The frontend calls this endpoint once on app load, so opening the website can self-heal the worker.
 
 ## Linux cron examples
@@ -40,8 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\server-php\scripts\create_cron_worker
 ```
 
 This creates:
-- `3D1.2_AcademicAttendanceWorker` (on startup, 5-second loop)
-- `3D1.2_DailyAcademicUpdate` (daily 00:05 fallback safety run)
+- `<project-folder>_AcademicAttendanceWorker` (on startup, 5-second loop)
+- `<project-folder>_DailyAcademicUpdate` (daily 00:05 fallback safety run)
 
 ## Disable MySQL EVENTS (recommended)
 After scheduler/worker is active, run:

@@ -23,7 +23,7 @@ export default function Navbar() {
   
   // State
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [currentHash, setCurrentHash] = useState(window.location.hash.slice(1) || '/dashboard');
+  const [currentHash, setCurrentHash] = useState(window.location.hash.slice(1) || '/home');
   const [menuOpen, setMenuOpen] = useState(false);
   const [openSubmenus, setOpenSubmenus] = useState({}); // Tracks expanded menus
   const [notificationOpen, setNotificationOpen] = useState(false);
@@ -51,6 +51,9 @@ export default function Navbar() {
   const unreadNotifications = notifLoaded
     ? unreadCount
     : ((profileData && (profileData.unread_notifications || profileData.notifications_count || 0)) || 0);
+  const effectiveProfileRoleId = Number((profileData && profileData.role_id) || (user && user.role_id) || 0);
+  const effectiveProfileRoleName = String((profileData && profileData.role_name) || (user && user.role_name) || '').trim().toLowerCase();
+  const isProfileEditable = effectiveProfileRoleId === 1 || effectiveProfileRoleName === 'admin';
   const notificationUserId = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
   const isOnNotificationRoute = String(currentHash || '').toLowerCase().includes('notification');
   const shouldAnimateNotificationBell = unreadNotifications > 0 && !notificationOpen && !isOnNotificationRoute;
@@ -266,7 +269,7 @@ export default function Navbar() {
   }, [user, login]);
 
   useEffect(() => {
-    const onHash = () => setCurrentHash(window.location.hash.slice(1) || '/dashboard');
+    const onHash = () => setCurrentHash(window.location.hash.slice(1) || '/home');
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
@@ -332,6 +335,7 @@ export default function Navbar() {
   // --- 2. NAVIGATION CONFIGURATION ---
 
   const navItems = [
+    { label: "Home", path: "/home", permission: null },
     { label: "Dashboard", path: "/dashboard", permission: 'dashboard' },
     { label: "Users", path: "/users", permission: 'users' },
 
@@ -375,7 +379,6 @@ export default function Navbar() {
     { label: "Reports", path: "/reports", permission: 'reports' },
     { label: "Audit Trail", path: "/system-logs", permission: 'logs' },
     { label: 'General Settings', path: '/settings/system', permission: 'settings' },
-    { label: 'School Info', path: '/school', permission: 'settings' },
 
   ];
 
@@ -445,6 +448,7 @@ export default function Navbar() {
     return { ...item, children };
   }).filter(item => {
     if (currentRole === 'teacher' && item.path === '/dashboard') return false;
+    if (currentRole === 'admin' && ['/file_leave', '/substitutions'].includes(String(item.path || '').toLowerCase())) return false;
     if (!item.permission && item.children) return item.children.length > 0;
     return canAccess(item.permission);
   });
@@ -460,6 +464,7 @@ export default function Navbar() {
 
   const resolveNavIconKey = (path) => {
     const p = String(path || '').toLowerCase();
+    if (p.startsWith('/home')) return 'home';
     if (p.startsWith('/dashboard')) return 'dashboard';
     if (p.startsWith('/faculty-dashboard')) return 'dashboard';
     if (p.startsWith('/users')) return 'users';
@@ -493,6 +498,13 @@ export default function Navbar() {
         strokeLinejoin="round"
         aria-hidden="true"
       >
+        {iconKey === 'home' && (
+          <>
+            <path d="M3 11 12 3l9 8" />
+            <path d="M5 10v10h14V10" />
+            <path d="M10 20v-6h4v6" />
+          </>
+        )}
         {iconKey === 'dashboard' && (
           <>
             <rect x="3" y="3" width="7" height="7" rx="1" />
@@ -795,6 +807,9 @@ export default function Navbar() {
   };
 
   const handleSaveProfile = async () => {
+    if (!isProfileEditable) {
+      return alert('Profile is view-only. Only Admin can update profile information.');
+    }
     const uid = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
     if (!uid) return alert('No user id');
     const trimmedForm = {
@@ -1196,21 +1211,23 @@ export default function Navbar() {
                     }}
                   />
 
-                  <label className="absolute bottom-0 right-0 transform translate-x-1 translate-y-1 bg-white rounded-full p-1 shadow-sm cursor-pointer">
-                    <input type="file" accept="image/*" className="hidden" onChange={(e) => {
-                      const f = e.target.files && e.target.files[0];
-                      if (f) {
-                        setSelectedAvatarFile(f);
-                        try { setSelectedAvatarPreview(URL.createObjectURL(f)); } catch (err) { setSelectedAvatarPreview(null); }
-                      }
-                    }} />
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M23 4v6h-6" />
-                      <path d="M1 20v-6h6" />
-                      <path d="M3.51 9a9 9 0 0114.13-3.36L21 7" />
-                      <path d="M20.49 15a9 9 0 01-14.13 3.36L3 17" />
-                    </svg>
-                  </label>
+                  {isProfileEditable ? (
+                    <label className="absolute bottom-0 right-0 transform translate-x-1 translate-y-1 bg-white rounded-full p-1 shadow-sm cursor-pointer">
+                      <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                        const f = e.target.files && e.target.files[0];
+                        if (f) {
+                          setSelectedAvatarFile(f);
+                          try { setSelectedAvatarPreview(URL.createObjectURL(f)); } catch (err) { setSelectedAvatarPreview(null); }
+                        }
+                      }} />
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M23 4v6h-6" />
+                        <path d="M1 20v-6h6" />
+                        <path d="M3.51 9a9 9 0 0114.13-3.36L21 7" />
+                        <path d="M20.49 15a9 9 0 01-14.13 3.36L3 17" />
+                      </svg>
+                    </label>
+                  ) : null}
                 </div>
 
                 <div className="flex-1 w-full">
@@ -1246,7 +1263,8 @@ export default function Navbar() {
                         type="text"
                         value={profileForm.first_name}
                         onChange={(e) => setProfileForm((prev) => ({ ...prev, first_name: e.target.value }))}
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100"
+                        disabled={!isProfileEditable}
+                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
                       />
                     </label>
 
@@ -1256,7 +1274,8 @@ export default function Navbar() {
                         type="text"
                         value={profileForm.last_name}
                         onChange={(e) => setProfileForm((prev) => ({ ...prev, last_name: e.target.value }))}
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100"
+                        disabled={!isProfileEditable}
+                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
                       />
                     </label>
 
@@ -1267,7 +1286,8 @@ export default function Navbar() {
                         value={profileForm.contact_no}
                         onChange={(e) => setProfileForm((prev) => ({ ...prev, contact_no: e.target.value }))}
                         placeholder="Optional"
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100"
+                        disabled={!isProfileEditable}
+                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
                       />
                     </label>
 
@@ -1277,22 +1297,27 @@ export default function Navbar() {
                         type="email"
                         value={profileForm.email}
                         onChange={(e) => setProfileForm((prev) => ({ ...prev, email: e.target.value }))}
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100"
+                        disabled={!isProfileEditable}
+                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
                       />
                     </label>
                   </div>
 
                   <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50/60 px-4 py-3 text-xs text-emerald-800">
-                    You can update your avatar, name, email, and contact number here. Department, role, and ID number stay managed by the system.
+                    {isProfileEditable
+                      ? 'Admin can update avatar, name, email, and contact number here. Department, role, and ID number stay managed by the system.'
+                      : 'Profile is view-only for this account. Only Admin can update profile information.'}
                   </div>
 
                   <div className="mt-6 flex justify-end gap-3">
                     <button onClick={() => { resetProfileEditor(); setProfileOpen(false); }} className="px-4 py-2 rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50">Close</button>
-                    <button onClick={handleSaveProfile} disabled={uploading} className={`px-4 py-2 rounded-md text-white font-semibold ${uploading ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}>
-                      {uploading ? (
-                        <svg className="animate-spin h-5 w-5 mx-auto text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
-                      ) : 'Save Changes'}
-                    </button>
+                    {isProfileEditable ? (
+                      <button onClick={handleSaveProfile} disabled={uploading} className={`px-4 py-2 rounded-md text-white font-semibold ${uploading ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}>
+                        {uploading ? (
+                          <svg className="animate-spin h-5 w-5 mx-auto text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+                        ) : 'Save Changes'}
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               </div>

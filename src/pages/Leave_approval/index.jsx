@@ -6,6 +6,7 @@ import { AuthContext } from '../../context/AuthContext.jsx';
 // Leaves File (Secretary) - can create, edit or cancel while pending
 export default function LeavesFiles(){
   const { user } = React.useContext(AuthContext);
+  const canFileFromApprovalPage = Number(user?.role_id) === 2;
   const [showDetailModal, setShowDetailModal] = React.useState(false);
   const [detailItem, setDetailItem] = React.useState(null);
   const [rows, setRows] = React.useState([]);
@@ -69,6 +70,7 @@ export default function LeavesFiles(){
   const handleSubmit = async (e)=>{
     e.preventDefault();
     try{
+      if (!canFileFromApprovalPage) throw new Error('Only dean can file leave records from this page.');
       // teacher_id: if user is secretary and selected teacher exists use it, else if teacher user use current user id
       const payloadTeacher = (Number(user.role_id) === 4) ? (Number(form.teacher_id) || null) : (user.user_id || null);
       if (!payloadTeacher) throw new Error('Teacher is required');
@@ -222,7 +224,9 @@ export default function LeavesFiles(){
             className="px-2 py-1 border rounded-md text-sm"
             style={{ width: 180 }}
           />
-          <button className="px-3 py-2 bg-green-600 text-white rounded-md text-sm" onClick={()=>openModal()}>File Leave</button>
+          {canFileFromApprovalPage && (
+            <button className="px-3 py-2 bg-green-600 text-white rounded-md text-sm" onClick={()=>openModal()}>File Leave</button>
+          )}
         </div>
       </div>
 

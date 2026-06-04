@@ -80,15 +80,15 @@ $permissionMatrix = [
     'class_schedules' => ['admin', 'dean', 'program_head', 'secretary'],
     '3d_building' => ['admin', 'dean', 'program_head', 'secretary'],
     'attendance_edits' => ['dean'],
-    'schedule_edits' => ['secretary'],
+    'schedule_edits' => ['dean', 'program_head', 'secretary'],
     'academic_admin' => ['admin'],
     'academic_manage' => ['admin', 'dean', 'program_head', 'secretary'],
     'academic_program' => ['admin', 'dean'],
     'locations' => ['admin'],
     'reports' => ['admin', 'dean', 'program_head', 'secretary', 'teacher'],
-    'leaves_file' => ['secretary'],
+    'leaves_file' => ['admin', 'dean', 'secretary'],
     'leaves_approvals' => ['admin', 'dean', 'program_head'],
-    'substitutions' => ['secretary', 'dean'],
+    'substitutions' => ['admin', 'dean', 'secretary'],
     'logs' => ['admin', 'dean', 'program_head', 'secretary'],
     'settings' => ['admin', 'dean'],
     'attendance_logs' => ['admin', 'dean', 'program_head'],
@@ -1516,7 +1516,10 @@ switch ($endpoint) {
         $activeSemesterId = $resolve_active_semester_id();
 
         $isAdminRole = ((int)$authRoleId === 1);
+        $isDeanRole = ((int)$authRoleId === 2);
         $isProgramHeadRole = ((int)$authRoleId === 3);
+        $isSecretaryRole = ((int)$authRoleId === 4);
+        $canManageClassSchedules = in_array((int)$authRoleId, [1, 2, 3], true);
         $programHeadProgramIds = [];
         if ($isProgramHeadRole && $authUserId) {
             $phStmt = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE head_id = ?");
@@ -1540,6 +1543,18 @@ switch ($endpoint) {
             }
         };
 
+        $require_schedule_manage_access = function() use ($canManageClassSchedules) {
+            if ($canManageClassSchedules) return;
+            json_response(['error' => 'forbidden', 'message' => 'Only admin, dean, and program head can manage class schedules.'], 403);
+        };
+
+        $require_dean_scope = function() use ($isDeanRole, $authUserDeptId) {
+            if (!$isDeanRole) return;
+            if ($authUserDeptId === null) {
+                json_response(['error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+            }
+        };
+
         $get_program_id_for_subject = function($subjectId) use ($mysqli) {
             if (!$subjectId) return null;
             $stmt = $mysqli->prepare("SELECT program_id FROM tbl_subject WHERE subject_id = ? LIMIT 1");
@@ -1558,6 +1573,16 @@ switch ($endpoint) {
             $stmt->execute();
             $row = $stmt->get_result()->fetch_assoc();
             return ($row && isset($row['program_id'])) ? (int)$row['program_id'] : null;
+        };
+
+        $get_dept_id_for_program = function($programId) use ($mysqli) {
+            if (!$programId) return null;
+            $stmt = $mysqli->prepare("SELECT dept_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
+            if (!$stmt) return null;
+            $stmt->bind_param('i', $programId);
+            $stmt->execute();
+            $row = $stmt->get_result()->fetch_assoc();
+            return ($row && isset($row['dept_id']) && $row['dept_id'] !== null) ? (int)$row['dept_id'] : null;
         };
 
         $usersHasAssignedProgramCol = $column_exists('tbl_users', 'assigned_program_head_id');
@@ -1660,6 +1685,27 @@ switch ($endpoint) {
             }
         };
 
+        $enforce_dean_scope_for_subject_section = function($subjectId, $sectionId) use (
+            $isDeanRole,
+            $authUserDeptId,
+            $require_dean_scope,
+            $get_program_id_for_subject,
+            $get_program_id_for_section,
+            $get_dept_id_for_program
+        ) {
+            if (!$isDeanRole) return;
+            $require_dean_scope();
+
+            $programId = null;
+            if ($subjectId) $programId = $get_program_id_for_subject($subjectId);
+            if (!$programId && $sectionId) $programId = $get_program_id_for_section($sectionId);
+            $deptId = $programId ? $get_dept_id_for_program($programId) : null;
+
+            if ($deptId === null || (int)$deptId !== (int)$authUserDeptId) {
+                json_response(['error' => 'forbidden', 'message' => 'Dean can only manage schedules within their assigned department.'], 403);
+            }
+        };
+
         $get_program_id_for_schedule = function($scheduleId) use ($mysqli, $has_subject_offerings, $cs_has_offering_col) {
             if (!$scheduleId) return null;
             if ($has_subject_offerings && $cs_has_offering_col) {
@@ -1682,7 +1728,12 @@ switch ($endpoint) {
             return ($row && isset($row['program_id'])) ? (int)$row['program_id'] : null;
         };
 
-        $delete_schedule = function($scheduleId) use ($mysqli, $authUserId, $isProgramHeadRole, $programHeadProgramIds, $require_program_head_scope, $get_program_id_for_schedule) {
+        $get_dept_id_for_schedule = function($scheduleId) use ($get_program_id_for_schedule, $get_dept_id_for_program) {
+            $programId = $get_program_id_for_schedule($scheduleId);
+            return $programId ? $get_dept_id_for_program($programId) : null;
+        };
+
+        $delete_schedule = function($scheduleId) use ($mysqli, $authUserId, $isDeanRole, $authUserDeptId, $require_dean_scope, $get_dept_id_for_schedule, $isProgramHeadRole, $programHeadProgramIds, $require_program_head_scope, $get_program_id_for_schedule) {
             $checkExisting = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE schedule_id = ? LIMIT 1");
             if (!$checkExisting) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $checkExisting->bind_param("i", $scheduleId);
@@ -1697,6 +1748,13 @@ switch ($endpoint) {
                 $scheduleProgramId = $get_program_id_for_schedule($scheduleId);
                 if (!$scheduleProgramId || !in_array((int)$scheduleProgramId, $programHeadProgramIds, true)) {
                     json_response(['error' => 'forbidden', 'message' => 'Program head can only delete schedules within their assigned program.'], 403);
+                }
+            }
+            if ($isDeanRole) {
+                $require_dean_scope();
+                $scheduleDeptId = $get_dept_id_for_schedule($scheduleId);
+                if ($scheduleDeptId === null || (int)$scheduleDeptId !== (int)$authUserDeptId) {
+                    json_response(['error' => 'forbidden', 'message' => 'Dean can only delete schedules within their assigned department.'], 403);
                 }
             }
 
@@ -1747,7 +1805,7 @@ switch ($endpoint) {
             json_response(['deleted' => true, 'schedule_id' => $scheduleId]);
         };
 
-        $update_schedule = function($scheduleId) use ($mysqli, $input, $normalize_time_simple, $authUserId, $enforce_program_scope_for_subject_section, $isProgramHeadRole, $programHeadProgramIds, $require_program_head_scope, $get_program_id_for_schedule, $get_program_id_for_subject, $get_program_id_for_section, $get_teacher_program_id, $get_user_role_id) {
+        $update_schedule = function($scheduleId) use ($mysqli, $input, $normalize_time_simple, $authUserId, $isDeanRole, $authUserDeptId, $require_dean_scope, $enforce_dean_scope_for_subject_section, $get_dept_id_for_schedule, $enforce_program_scope_for_subject_section, $isProgramHeadRole, $programHeadProgramIds, $require_program_head_scope, $get_program_id_for_schedule, $get_program_id_for_subject, $get_program_id_for_section, $get_teacher_program_id, $get_user_role_id) {
             $checkExisting = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE schedule_id = ? LIMIT 1");
             if (!$checkExisting) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $checkExisting->bind_param("i", $scheduleId);
@@ -1764,6 +1822,13 @@ switch ($endpoint) {
                     json_response(['error' => 'forbidden', 'message' => 'Program head can only update schedules within their assigned program.'], 403);
                 }
             }
+            if ($isDeanRole) {
+                $require_dean_scope();
+                $scheduleDeptId = $get_dept_id_for_schedule($scheduleId);
+                if ($scheduleDeptId === null || (int)$scheduleDeptId !== (int)$authUserDeptId) {
+                    json_response(['error' => 'forbidden', 'message' => 'Dean can only update schedules within their assigned department.'], 403);
+                }
+            }
 
             $roomId = isset($input['room_id']) ? (int)$input['room_id'] : null;
             $subjectId = isset($input['subject_id']) ? (int)$input['subject_id'] : null;
@@ -1778,6 +1843,7 @@ switch ($endpoint) {
             }
 
             $enforce_program_scope_for_subject_section($subjectId, $sectionId);
+            $enforce_dean_scope_for_subject_section($subjectId, $sectionId);
             $rowProgramId = $get_program_id_for_subject($subjectId);
             if (!$rowProgramId && $sectionId) $rowProgramId = $get_program_id_for_section($sectionId);
             $assigneeRoleId = $get_user_role_id($teacherId);
@@ -1818,15 +1884,6 @@ switch ($endpoint) {
             $dup->execute();
             if ($dup->get_result()->fetch_assoc()) {
                 json_response(['error' => 'duplicate_schedule', 'message' => 'Schedule already exists.'], 409);
-            }
-
-            $subjectTeacherConflict = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND subject_id = ? AND start_time = ? AND end_time = ? AND schedule_id <> ? AND (user_id IS NULL OR user_id <> ?) LIMIT 1");
-            if ($subjectTeacherConflict) {
-                $subjectTeacherConflict->bind_param("isissii", $semesterId, $dayOfWeek, $subjectId, $startTime, $endTime, $scheduleId, $teacherId);
-                $subjectTeacherConflict->execute();
-                if ($subjectTeacherConflict->get_result()->fetch_assoc()) {
-                    json_response(['error' => 'time_conflict', 'message' => 'Subject-time conflict: same subject and exact time can only be assigned to the same teacher'], 409);
-                }
             }
 
             // Check room overlap: same day, same room, overlapping times
@@ -1870,7 +1927,7 @@ switch ($endpoint) {
             json_response(['schedule_id' => $scheduleId, 'room_id' => $roomId, 'subject_id' => $subjectId, 'section_id' => $sectionId, 'user_id' => $teacherId, 'semester_id' => $semesterId, 'day_of_week' => $dayOfWeek, 'start_time' => $startTime, 'end_time' => $endTime]);
         };
 
-        $create_schedule = function() use ($mysqli, $input, $normalize_time_simple, $authUserId, $activeSemesterId, $enforce_program_scope_for_subject_section, $isProgramHeadRole, $programHeadProgramIds, $get_program_id_for_subject, $get_program_id_for_section, $get_teacher_program_id, $get_user_role_id) {
+        $create_schedule = function() use ($mysqli, $input, $normalize_time_simple, $authUserId, $activeSemesterId, $enforce_dean_scope_for_subject_section, $enforce_program_scope_for_subject_section, $isProgramHeadRole, $programHeadProgramIds, $get_program_id_for_subject, $get_program_id_for_section, $get_teacher_program_id, $get_user_role_id) {
             $roomId = isset($input['room_id']) ? (int)$input['room_id'] : null;
             $subjectId = isset($input['subject_id']) ? (int)$input['subject_id'] : null;
             $sectionId = isset($input['section_id']) ? (int)$input['section_id'] : null;
@@ -1891,6 +1948,7 @@ switch ($endpoint) {
             }
 
             $enforce_program_scope_for_subject_section($subjectId, $sectionId);
+            $enforce_dean_scope_for_subject_section($subjectId, $sectionId);
             $rowProgramId = $get_program_id_for_subject($subjectId);
             if (!$rowProgramId && $sectionId) $rowProgramId = $get_program_id_for_section($sectionId);
             $assigneeRoleId = $get_user_role_id($teacherId);
@@ -1922,15 +1980,6 @@ switch ($endpoint) {
             $dup->execute();
             if ($dup->get_result()->fetch_assoc()) {
                 json_response(['error' => 'duplicate_schedule', 'message' => 'Schedule already exists.'], 409);
-            }
-
-            $subjectTeacherConflict = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND subject_id = ? AND start_time = ? AND end_time = ? AND (user_id IS NULL OR user_id <> ?) LIMIT 1");
-            if ($subjectTeacherConflict) {
-                $subjectTeacherConflict->bind_param("isissi", $semesterId, $dayOfWeek, $subjectId, $startTime, $endTime, $teacherId);
-                $subjectTeacherConflict->execute();
-                if ($subjectTeacherConflict->get_result()->fetch_assoc()) {
-                    json_response(['error' => 'time_conflict', 'message' => 'Subject-time conflict: same subject and exact time can only be assigned to the same teacher'], 409);
-                }
             }
 
             $roomOverlap = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND room_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
@@ -1974,6 +2023,11 @@ switch ($endpoint) {
             if ($isProgramHeadRole) {
                 $require_program_head_scope();
                 $programFilterSql = " WHERE p.program_id IN (" . implode(',', array_map('intval', $programHeadProgramIds)) . ")";
+            } elseif (!$isAdminRole && ($isDeanRole || $isSecretaryRole)) {
+                if ($authUserDeptId === null) {
+                    json_response([]);
+                }
+                $programFilterSql = " WHERE p.dept_id = " . intval($authUserDeptId);
             }
             if ($has_subject_offerings) {
                 $result = $mysqli->query("SELECT so.offering_id, so.user_id, s.subject_code, s.subject_name, sec.section_name, p.head_id, p.dept_id AS program_dept_id, u.dept_id AS teacher_dept_id FROM tbl_subject_offerings so JOIN tbl_subject s ON so.subject_id = s.subject_id JOIN tbl_sections sec ON so.section_id = sec.section_id LEFT JOIN tbl_programs p ON s.program_id = p.program_id LEFT JOIN tbl_users u ON so.user_id = u.user_id{$programFilterSql}");
@@ -1988,13 +2042,18 @@ switch ($endpoint) {
             if ($isProgramHeadRole) {
                 $require_program_head_scope();
                 $programFilterSql = " WHERE p.program_id IN (" . implode(',', array_map('intval', $programHeadProgramIds)) . ")";
+            } elseif (!$isAdminRole && ($isDeanRole || $isSecretaryRole)) {
+                if ($authUserDeptId === null) {
+                    json_response([]);
+                }
+                $programFilterSql = " WHERE p.dept_id = " . intval($authUserDeptId);
             }
             if ($has_subject_offerings && $cs_has_offering_col) {
                 $sql = "SELECT cs.schedule_id, cs.room_id, cs.offering_id, cs.subject_id, cs.section_id, cs.semester_id, cs.user_id AS teacher_id, cs.day_of_week, cs.start_time, cs.end_time, r.room_name,
                            COALESCE(s_so.subject_code, s_cs.subject_code) AS subject_code,
                            COALESCE(s_so.subject_name, s_cs.subject_name) AS subject_name,
                            COALESCE(sec_so.section_name, sec_cs.section_name) AS section_name,
-                           CONCAT(u.first_name, ' ', u.last_name) AS teacher_name, u.dept_id AS teacher_dept_id,
+                           CONCAT(u.first_name, ' ', u.last_name) AS teacher_name, NULLIF(CAST(u.image AS CHAR), '') AS avatar, u.dept_id AS teacher_dept_id,
                            p.program_id, p.program_name, p.dept_id, d.dept_name, sc.school_id AS campus_id, sc.school_name AS campus_name, b.building_id, b.building_name, f.floor_id, f.floor_name, sem.start_date AS semester_start, sem.end_date AS semester_end
                         FROM tbl_class_schedules cs
                         JOIN tbl_rooms r ON cs.room_id = r.room_id
@@ -2015,7 +2074,7 @@ switch ($endpoint) {
             } else {
                 $sql = "SELECT cs.schedule_id, cs.room_id, NULL AS offering_id, cs.subject_id, cs.section_id, cs.semester_id, cs.user_id AS teacher_id, cs.day_of_week, cs.start_time, cs.end_time, r.room_name,
                            s.subject_code, s.subject_name, sec.section_name,
-                           CONCAT(u.first_name, ' ', u.last_name) AS teacher_name, u.dept_id AS teacher_dept_id,
+                           CONCAT(u.first_name, ' ', u.last_name) AS teacher_name, NULLIF(CAST(u.image AS CHAR), '') AS avatar, u.dept_id AS teacher_dept_id,
                            p.program_id, p.program_name, p.dept_id, d.dept_name, sc.school_id AS campus_id, sc.school_name AS campus_name, b.building_id, b.building_name, f.floor_id, f.floor_name, sem.start_date AS semester_start, sem.end_date AS semester_end
                         FROM tbl_class_schedules cs
                         JOIN tbl_rooms r ON cs.room_id = r.room_id
@@ -2040,17 +2099,22 @@ switch ($endpoint) {
         }
 
         if ($request_method === 'PUT' && is_numeric($param1)) {
+            $require_schedule_manage_access();
             $update_schedule((int)$param1);
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'update') {
+            $require_schedule_manage_access();
             $update_schedule((int)$param1);
         } elseif ($request_method === 'DELETE' && is_numeric($param1)) {
+            $require_schedule_manage_access();
             $delete_schedule((int)$param1);
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'delete') {
+            $require_schedule_manage_access();
             $delete_schedule((int)$param1);
         }
 
         // Batch import/create: supports ClassSchedule page payload ({ rows: [...] }) and spreadsheet rows.
         if ($request_method === 'POST' && isset($input['rows']) && is_array($input['rows'])) {
+            $require_schedule_manage_access();
             $rows = $input['rows'];
             $errors = [];
             $inserted = 0;
@@ -2199,7 +2263,6 @@ switch ($endpoint) {
             }
             $acceptedRows = [];
 
-            $subjectTeacherConflictStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND subject_id = ? AND start_time = ? AND end_time = ? AND (user_id IS NULL OR user_id <> ?) LIMIT 1");
             $roomOverlapStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND room_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
             $secSubjectDupStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND subject_id = ? LIMIT 1");
 
@@ -2272,6 +2335,15 @@ switch ($endpoint) {
                         continue;
                     }
                 }
+                if ($isDeanRole) {
+                    $require_dean_scope();
+                    $rowDeptId = $rowProgramId ? $get_dept_id_for_program((int)$rowProgramId) : null;
+                    if ($rowDeptId === null || (int)$rowDeptId !== (int)$authUserDeptId) {
+                        $errors[] = ['row' => $rowNumber, 'message' => 'Department mismatch: you can only import schedules for your assigned department.'];
+                        $skipped++;
+                        continue;
+                    }
+                }
 
                 $teacherVal = $get_value($normalized, ['user_id', 'teacher_id', 'teacher', 'teacher_name', 'teacher_email']);
                 $teacher = null;
@@ -2336,17 +2408,6 @@ switch ($endpoint) {
                     if ((int)$accepted['semester_id'] !== $semesterId) continue;
                     if ($accepted['day_of_week'] !== $day) continue;
 
-                    $sameTeacher = ((int)$accepted['teacher_id'] === $teacherId);
-                    $sameSubjectExactSlot = ((int)$accepted['subject_id'] === $subjectIdForCheck)
-                        && $accepted['start_time'] === $startTime
-                        && $accepted['end_time'] === $endTime;
-                    if ($sameSubjectExactSlot && !$sameTeacher) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Subject-time conflict: same subject and exact time can only be assigned to the same teacher'];
-                        $skipped++;
-                        $conflict = true;
-                        break;
-                    }
-
                     $sameSectionAndSubject = ((int)$accepted['section_id'] === $sectionIdForCheck)
                         && ((int)$accepted['subject_id'] === $subjectIdForCheck);
                     if ($sameSectionAndSubject) {
@@ -2362,18 +2423,6 @@ switch ($endpoint) {
                         $skipped++;
                         $conflict = true;
                         break;
-                    }
-                }
-                if ($conflict) continue;
-
-                if ($subjectTeacherConflictStmt) {
-                    $subjectTeacherConflictStmt->bind_param('isissi', $semesterId, $day, $subjectIdForCheck, $startTime, $endTime, $teacherId);
-                    $subjectTeacherConflictStmt->execute();
-                    $stv = $subjectTeacherConflictStmt->get_result();
-                    if ($stv && $stv->fetch_assoc()) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Subject-time conflict: same subject and exact time can only be assigned to the same teacher'];
-                        $skipped++;
-                        $conflict = true;
                     }
                 }
                 if ($conflict) continue;
@@ -2441,6 +2490,7 @@ switch ($endpoint) {
                 'errors' => $errors,
             ]);
         } elseif ($request_method === 'POST') {
+            $require_schedule_manage_access();
             $create_schedule();
         }
         break;

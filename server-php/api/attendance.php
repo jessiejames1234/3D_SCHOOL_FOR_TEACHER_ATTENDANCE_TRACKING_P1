@@ -171,6 +171,10 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         ar.room_id,
         ar.floor_id,
         DATE_FORMAT(ar.date, '%Y-%m-%d') AS date,
+        cs.semester_id,
+        cs.day_of_week,
+        {$subjectExpr} AS subject_id,
+        {$sectionExpr} AS section_id,
         ar.checked_in_at AS time_in,
         ar.altitude_in,
         ar.latitude_in,
@@ -188,10 +192,15 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         ar.flag_out_id,
         u.first_name,
         u.last_name,
+        NULLIF(CAST(u.image AS CHAR), '') AS avatar,
         u.dept_id,
         cs.start_time,
         cs.end_time,
         r.room_name,
+        sc.school_name AS campus_name,
+        sc.school_name AS school_name,
+        b.building_name,
+        COALESCE(f.floor_name, rf.floor_name) AS floor_name,
         s.subject_code,
         s.subject_name,
         sec.section_name,
@@ -205,6 +214,9 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
       JOIN tbl_class_schedules cs   ON ar.schedule_id = cs.schedule_id
       JOIN tbl_rooms r              ON ar.room_id = r.room_id
       LEFT JOIN tbl_floors f        ON ar.floor_id = f.floor_id
+      LEFT JOIN tbl_floors rf       ON r.floor_id = rf.floor_id
+      LEFT JOIN tbl_buildings b     ON r.building_id = b.building_id
+      LEFT JOIN tbl_school sc       ON b.school_id = sc.school_id
       {$joinOffering}
       LEFT JOIN tbl_subject s       ON {$subjectExpr} = s.subject_id
       LEFT JOIN tbl_sections sec    ON {$sectionExpr} = sec.section_id
@@ -743,14 +755,117 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
     if (!$date) json_response(['ok' => false, 'error' => 'missing_fields'], 400);
     if (!is_numeric($latitude) || !is_numeric($longitude)) json_response(['ok' => false, 'error' => 'missing_coordinates'], 400);
 
-    // ... (The rest of your logic stays exactly the same) ...
-    $stmt = $mysqli->prepare("SELECT ar.attendance_id, ar.date, cs.start_time, cs.end_time, r.latitude AS room_lat, r.longitude AS room_lon, r.radius AS room_radius, r.floor_id AS room_floor_id, r.building_id AS room_building_id, f.qr_token AS qr_token, f.status AS floor_status, ar.flag_in_id, ar.flag_check_id, f.baseline_altitude AS room_baseline_altitude FROM tbl_attendance_records ar JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id JOIN tbl_rooms r ON ar.room_id = r.room_id LEFT JOIN tbl_floors f ON r.floor_id = f.floor_id WHERE ar.schedule_id = ? AND ar.user_id = ? AND ar.date = ? LIMIT 1");
-    // ... continue with the rest of your existing code ...
+    $groupSelectSql = "
+        SELECT
+            ar.attendance_id,
+            ar.user_id,
+            ar.schedule_id,
+            ar.room_id,
+            ar.floor_id,
+            ar.date,
+            ar.flag_in_id,
+            ar.flag_check_id,
+            cs.semester_id,
+            cs.subject_id,
+            cs.section_id,
+            cs.day_of_week,
+            cs.start_time,
+            cs.end_time,
+            r.latitude AS room_lat,
+            r.longitude AS room_lon,
+            r.radius AS room_radius,
+            r.floor_id AS room_floor_id,
+            r.building_id AS room_building_id,
+            f.qr_token AS qr_token,
+            f.status AS floor_status,
+            f.baseline_altitude AS room_baseline_altitude
+        FROM tbl_attendance_records ar
+        JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id
+        JOIN tbl_rooms r ON ar.room_id = r.room_id
+        LEFT JOIN tbl_floors f ON r.floor_id = f.floor_id
+    ";
+
+    $stmt = $mysqli->prepare($groupSelectSql . " WHERE ar.schedule_id = ? AND ar.user_id = ? AND ar.date = ? LIMIT 1");
     $stmt->bind_param("iis", $schedule_id, $user_id, $date);
     $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
 
     if (!$row) json_response(['ok' => false, 'error' => 'attendance_record_not_found'], 404);
+
+    $groupRows = [$row];
+    if (isset($row['subject_id']) && $row['subject_id'] !== null && isset($row['semester_id']) && $row['semester_id'] !== null) {
+        $groupStmt = $mysqli->prepare($groupSelectSql . "
+            WHERE ar.user_id = ?
+              AND ar.date = ?
+              AND cs.semester_id = ?
+              AND cs.subject_id = ?
+              AND cs.start_time = ?
+              AND cs.end_time = ?
+        ");
+        if ($groupStmt) {
+            $selectedSemesterId = (int)$row['semester_id'];
+            $selectedSubjectId = (int)$row['subject_id'];
+            $selectedStartTime = $row['start_time'];
+            $selectedEndTime = $row['end_time'];
+            $groupStmt->bind_param(
+                "isiiss",
+                $user_id,
+                $date,
+                $selectedSemesterId,
+                $selectedSubjectId,
+                $selectedStartTime,
+                $selectedEndTime
+            );
+            $groupStmt->execute();
+            $result = $groupStmt->get_result();
+            $fetchedRows = $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
+            if (!empty($fetchedRows)) $groupRows = $fetchedRows;
+        }
+    }
+
+    $validationRow = $row;
+    $matchedQrRow = false;
+    if ($qr_token) {
+        $qrFallback = null;
+        $qrNearest = null;
+        foreach ($groupRows as $candidate) {
+            if (!empty($candidate['qr_token']) && $candidate['qr_token'] === $qr_token && isset($candidate['floor_status']) && $candidate['floor_status'] === 'active') {
+                if ($qrFallback === null) $qrFallback = $candidate;
+                if (isInsideBox($latitude, $longitude, $candidate['room_lat'], $candidate['room_lon'], (float)$candidate['room_radius'])) {
+                    $candidateDistance = getDistanceMeters($latitude, $longitude, $candidate['room_lat'], $candidate['room_lon']);
+                    if ($qrNearest === null || $candidateDistance < $qrNearest['distance']) {
+                        $qrNearest = ['row' => $candidate, 'distance' => $candidateDistance];
+                    }
+                }
+            }
+        }
+        if ($qrNearest !== null) {
+            $validationRow = $qrNearest['row'];
+            $matchedQrRow = true;
+        } elseif ($qrFallback !== null) {
+            $validationRow = $qrFallback;
+            $matchedQrRow = true;
+        }
+    }
+    if (!$matchedQrRow) {
+        $nearest = null;
+        foreach ($groupRows as $candidate) {
+            if (!isInsideBox($latitude, $longitude, $candidate['room_lat'], $candidate['room_lon'], (float)$candidate['room_radius'])) continue;
+            $candidateDistance = getDistanceMeters($latitude, $longitude, $candidate['room_lat'], $candidate['room_lon']);
+            if ($nearest === null || $candidateDistance < $nearest['distance']) {
+                $nearest = ['row' => $candidate, 'distance' => $candidateDistance];
+            }
+        }
+        if ($nearest !== null) $validationRow = $nearest['row'];
+    }
+    $row = $validationRow;
+    $groupAttendanceIds = array_values(array_unique(array_map(function($item) {
+        return (int)$item['attendance_id'];
+    }, $groupRows)));
+    if (empty($groupAttendanceIds)) $groupAttendanceIds = [(int)$row['attendance_id']];
+    $groupPlaceholders = implode(',', array_fill(0, count($groupAttendanceIds), '?'));
+    $groupIdTypes = str_repeat('i', count($groupAttendanceIds));
+    $groupCount = count($groupAttendanceIds);
 
     $classStart = new DateTime(toDateYMD($row['date']) . ' ' . $row['start_time']);
     $classEnd = new DateTime(toDateYMD($row['date']) . ' ' . $row['end_time']);
@@ -901,9 +1016,10 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
     
     // Persist detected floor for this attendance record so client can trust floor altitude until class end
     if ($detectedFloorId !== null) {
-        $update_floor_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET floor_id = ? WHERE attendance_id = ?");
+        $update_floor_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET floor_id = ? WHERE attendance_id IN ({$groupPlaceholders})");
         if ($update_floor_stmt) {
-            $update_floor_stmt->bind_param("ii", $detectedFloorId, $row['attendance_id']);
+            $floorParams = array_merge([$detectedFloorId], $groupAttendanceIds);
+            safe_bind_params($update_floor_stmt, 'i' . $groupIdTypes, $floorParams);
             $update_floor_stmt->execute();
         }
     }
@@ -915,8 +1031,9 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         if ($now < $classStart) json_response(['ok' => false, 'error' => 'too_early', 'allow_at' => $classStart->format(DateTime::ISO8601)]);
         if ($now > $classEnd) json_response(['ok' => false, 'error' => 'class_ended']);
         $flagIn = ($now <= $inPresentWindowEnd) ? 2 : 5;
-        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_in_at = NOW(), altitude_in = ?, latitude_in = ?, longitude_in = ?, flag_in_id = ? WHERE attendance_id = ?");
-        $stmt->bind_param("dddii", $finalAltitude, $latitude, $longitude, $flagIn, $row['attendance_id']);
+        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_in_at = NOW(), altitude_in = ?, latitude_in = ?, longitude_in = ?, flag_in_id = ? WHERE attendance_id IN ({$groupPlaceholders}) AND checked_in_at IS NULL");
+        $params = array_merge([$finalAltitude, $latitude, $longitude, $flagIn], $groupAttendanceIds);
+        safe_bind_params($stmt, "dddi" . $groupIdTypes, $params);
         $stmt->execute();
         $message = $flagIn === 2 ? 'checked_in_present' : 'checked_in_late';
 
@@ -930,15 +1047,16 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         
         // Catch-up for flag_in_id
         $inPresentWindowEnd = (clone $classStart)->modify('+15 minutes');
-        if (($row['flag_in_id'] == 1) && $now > $inPresentWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id = ?");
-            $update_stmt->bind_param("i", $row['attendance_id']);
+        if ($now > $inPresentWindowEnd) {
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id = 1");
+            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
             $update_stmt->execute();
         }
 
         $flagCheck = ($now >= $midStart && $now <= $midEnd) ? 2 : 5;
-        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_mid_at = NOW(), altitude_check = ?, latitude_check = ?, longitude_check = ?, flag_check_id = ? WHERE attendance_id = ?");
-        $stmt->bind_param("dddii", $finalAltitude, $latitude, $longitude, $flagCheck, $row['attendance_id']);
+        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_mid_at = NOW(), altitude_check = ?, latitude_check = ?, longitude_check = ?, flag_check_id = ? WHERE attendance_id IN ({$groupPlaceholders}) AND checked_mid_at IS NULL");
+        $params = array_merge([$finalAltitude, $latitude, $longitude, $flagCheck], $groupAttendanceIds);
+        safe_bind_params($stmt, "dddi" . $groupIdTypes, $params);
         $stmt->execute();
         $message = $flagCheck === 2 ? 'mid_check_present' : 'mid_check_late';
 
@@ -949,9 +1067,9 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
 
         // Catch-up for flag_in_id
         $inPresentWindowEnd = (clone $classStart)->modify('+15 minutes');
-        if (($row['flag_in_id'] == 1) && $now > $inPresentWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id = ?");
-            $update_stmt->bind_param("i", $row['attendance_id']);
+        if ($now > $inPresentWindowEnd) {
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id = 1");
+            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
             $update_stmt->execute();
         }
         
@@ -959,20 +1077,20 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         $duration = $classEnd->getTimestamp() - $classStart->getTimestamp();
         $midPoint = (clone $classStart)->modify('+' . ($duration / 2) . ' seconds');
         $midWindowEnd = (clone $midPoint)->modify('+10 minutes');
-        if (($row['flag_check_id'] == 1) && $now > $midWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_check_id = 5 WHERE attendance_id = ?");
-            $update_stmt->bind_param("i", $row['attendance_id']);
+        if ($now > $midWindowEnd) {
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_check_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_check_id = 1");
+            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
             $update_stmt->execute();
         }
 
-        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_out_at = NOW(), altitude_out = ?, latitude_out = ?, longitude_out = ?, flag_out_id = 2 WHERE attendance_id = ?");
-        // SQL has 4 placeholders: altitude_out, latitude_out, longitude_out, attendance_id
-        $stmt->bind_param("dddi", $finalAltitude, $latitude, $longitude, $row['attendance_id']);
+        $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_out_at = NOW(), altitude_out = ?, latitude_out = ?, longitude_out = ?, flag_out_id = 2 WHERE attendance_id IN ({$groupPlaceholders}) AND checked_out_at IS NULL");
+        $params = array_merge([$finalAltitude, $latitude, $longitude], $groupAttendanceIds);
+        safe_bind_params($stmt, "ddd" . $groupIdTypes, $params);
         $stmt->execute();
         $message = 'checked_out';
     }
 
-    // Return the final updated record with joined fields (same projection as GET /api/attendance)
+    // Return the final updated records with joined fields (same projection as GET /api/attendance)
     $sql = "
       SELECT
         ar.attendance_id,
@@ -981,6 +1099,10 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         ar.room_id,
         ar.floor_id,
         DATE_FORMAT(ar.date, '%Y-%m-%d') AS date,
+        cs.semester_id,
+        cs.subject_id,
+        cs.section_id,
+        cs.day_of_week,
         ar.checked_in_at AS time_in,
         ar.altitude_in,
         ar.latitude_in,
@@ -997,30 +1119,52 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         ar.longitude_out,
         ar.flag_out_id,
         u.first_name, u.last_name,
+        NULLIF(CAST(u.image AS CHAR), '') AS avatar,
         cs.start_time, cs.end_time,
         r.room_name,
-        f.floor_name,
-        ft_in.flag_name AS flag_in,
-        ft_check.flag_name AS flag_check,
-        ft_out.flag_name AS flag_out
+        sc.school_name AS campus_name,
+        sc.school_name AS school_name,
+        b.building_name,
+        COALESCE(f.floor_name, rf.floor_name) AS floor_name,
+        s.subject_code,
+        s.subject_name,
+        sec.section_name,
+        f.floor_name AS attendance_floor_name,
+        ft_in.flag_name AS flag_in_name,
+        ft_check.flag_name AS flag_check_name,
+        ft_out.flag_name AS flag_out_name
       FROM tbl_attendance_records ar
       JOIN tbl_users u              ON ar.user_id = u.user_id
       JOIN tbl_class_schedules cs   ON ar.schedule_id = cs.schedule_id
       JOIN tbl_rooms r              ON ar.room_id = r.room_id
       LEFT JOIN tbl_floors f        ON ar.floor_id = f.floor_id
+      LEFT JOIN tbl_floors rf       ON r.floor_id = rf.floor_id
+      LEFT JOIN tbl_buildings b     ON r.building_id = b.building_id
+      LEFT JOIN tbl_school sc       ON b.school_id = sc.school_id
+      LEFT JOIN tbl_subject s       ON cs.subject_id = s.subject_id
+      LEFT JOIN tbl_sections sec    ON cs.section_id = sec.section_id
       LEFT JOIN tbl_flag_types ft_in   ON ar.flag_in_id = ft_in.flag_id
       LEFT JOIN tbl_flag_types ft_check ON ar.flag_check_id = ft_check.flag_id
       LEFT JOIN tbl_flag_types ft_out  ON ar.flag_out_id = ft_out.flag_id
-      WHERE ar.attendance_id = ?
-      LIMIT 1
+      WHERE ar.attendance_id IN ({$groupPlaceholders})
+      ORDER BY cs.start_time, r.room_name, sec.section_name
     ";
     $stmt = $mysqli->prepare($sql);
     if ($stmt === false) { json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500); }
-    $stmt->bind_param("i", $row['attendance_id']);
+    safe_bind_params($stmt, $groupIdTypes, $groupAttendanceIds);
     if (!$stmt->execute()) { json_response(['error' => 'db_execute_failed', 'details' => $stmt->error], 500); }
      
-    $final = $stmt->get_result()->fetch_assoc();
-    json_response(['ok' => true, 'message' => $message, 'record' => $final]);
+    $finalRows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $final = $finalRows[0] ?? null;
+    json_response([
+        'ok' => true,
+        'message' => $message,
+        'record' => $final,
+        'attendance' => $final,
+        'records' => $finalRows,
+        'group_count' => $groupCount,
+        'grouped' => $groupCount > 1
+    ]);
 
 } else {
     json_response(['error' => 'Endpoint not found in attendance API file.'], 404);

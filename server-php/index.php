@@ -222,6 +222,12 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
         case 'penalty-types':
             return '__authenticated';
 
+        case 'app-settings':
+            if ($requestMethod === 'GET') {
+                return '__authenticated';
+            }
+            return 'settings';
+
         default:
             return '__authenticated';
     }
@@ -306,6 +312,9 @@ switch ($endpoint_root) {
     case 'notification':
     case 'notifications':
         require_once __DIR__ . '/api/notification.php';
+        break;
+    case 'app-settings':
+        require_once __DIR__ . '/api/app-settings.php';
         break;
     case 'worker-bootstrap':
         require_once __DIR__ . '/api/worker-bootstrap.php';

@@ -2,6 +2,7 @@ import React from 'react';
 import { apiGet, apiPost, apiPut } from '../../services/api.js'; // Ensure this matches your project structure
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import { useLiveGeolocation } from '../../utils/useLiveGeolocation.js';
 
 function RoomIndex(){
   const [rooms, setRooms] = React.useState([]);
@@ -13,9 +14,6 @@ function RoomIndex(){
   const [lastCoords, setLastCoords] = React.useState(null);
   const [buildings, setBuildings] = React.useState([]);
   const [allFloors, setAllFloors] = React.useState([]);
-  const [liveGpsActive, setLiveGpsActive] = React.useState(false);
-  const watchIdRef = React.useRef(null);
-  const livePollRef = React.useRef(null);
 
   React.useEffect(()=>{ fetchRooms(); }, []);
 
@@ -92,7 +90,11 @@ function RoomIndex(){
     }
     setShowModal(true);
   };
-  const closeModal = ()=> setShowModal(false);
+  const closeModal = ()=> {
+    stopLiveGps();
+    setLastCoords({ latitude: 0, longitude: 0, altitude: 0 });
+    setShowModal(false);
+  };
   const handleChange = (e) => { const { name, value } = e.target; setForm(prev=> ({ ...prev, [name]: value })); };
 
   const updateLiveCoords = (coords = {}) => {
@@ -102,96 +104,39 @@ function RoomIndex(){
     setLastCoords({ latitude: lat, longitude: lon, altitude: alt });
   };
 
-  const clearGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    if (window.__geoWatchId != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(window.__geoWatchId); } catch (e) { /* ignore */ }
+  const {
+    active: liveGpsActive,
+    start: startLiveGps,
+    stop: stopLiveGps
+  } = useLiveGeolocation({
+    onPosition: updateLiveCoords,
+    onError: (message, err) => {
+      if (err) console.error('geolocation error', err);
+      setError(message || 'Failed to watch position');
     }
-    if (window.__geoPollId != null) {
-      try { clearInterval(window.__geoPollId); } catch (e) { /* ignore */ }
-    }
-    window.__geoWatchId = null;
-    window.__geoPollId = null;
-  }, []);
-
-  const stopLiveGps = React.useCallback(() => {
-    if (watchIdRef.current != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(watchIdRef.current); } catch (e) { /* ignore */ }
-    }
-    if (livePollRef.current != null) {
-      try { clearInterval(livePollRef.current); } catch (e) { /* ignore */ }
-    }
-    watchIdRef.current = null;
-    livePollRef.current = null;
-    setLiveGpsActive(false);
-    if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-      clearGlobalGeo();
-      window.__activeGeoStop = null;
-    }
-  }, [clearGlobalGeo]);
-
-  const claimGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    const existing = window.__activeGeoStop;
-    if (existing && existing !== stopLiveGps) {
-      try { existing(); } catch (e) { /* ignore */ }
-    }
-    clearGlobalGeo();
-    window.__activeGeoStop = stopLiveGps;
-  }, [stopLiveGps, clearGlobalGeo]);
+  });
 
   // Start/stop live GPS watch; auto update latitude/longitude continuously
   const captureGps = () => {
     setError('');
-    if (!('geolocation' in navigator)) { setError('Geolocation not supported in this browser'); return; }
     if (liveGpsActive) {
       stopLiveGps();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-        window.__activeGeoStop = null;
-      }
+      setLastCoords({ latitude: 0, longitude: 0, altitude: 0 });
       return;
     }
-    claimGlobalGeo();
     // open modal immediately so user can see live updates
     setShowModal(true);
-    // get an immediate fix, then keep watching
-    navigator.geolocation.getCurrentPosition((pos) => {
-      updateLiveCoords(pos.coords || {});
-    }, () => {
-      // ignore immediate errors
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 4000 });
-
-    const id = navigator.geolocation.watchPosition((pos) => {
-      const c = pos.coords || {};
-      updateLiveCoords(c);
-    }, (err) => {
-      console.error('watchPosition error', err);
-      setError(err?.message || 'Failed to watch position');
-      if (err && err.code === 1) {
-        // permission denied
-        setLiveGpsActive(false);
-      }
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 6000 });
-    watchIdRef.current = id;
-    if (typeof window !== 'undefined') window.__geoWatchId = id;
-    // start a short polling interval to increase update frequency on devices that don't push frequent watch updates
-    if (livePollRef.current == null) {
-      livePollRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition((pos) => {
-          const c = pos.coords || {};
-          updateLiveCoords(c);
-        }, () => {
-          // ignore errors from frequent polling
-        }, { enableHighAccuracy: true, maximumAge: 0, timeout: 2000 });
-      }, 800);
-      if (typeof window !== 'undefined') window.__geoPollId = livePollRef.current;
-    }
-    setLiveGpsActive(true);
+    setLastCoords(null);
+    startLiveGps();
   };
 
   // Apply latest live coordinates into the modal form
   const applyLiveCoords = () => {
     setError('');
+    if (!liveGpsActive) {
+      setError('Start Live GPS first.');
+      return;
+    }
     if (!lastCoords) {
       setError('No live coordinates available. Start Live GPS first.');
       return;
@@ -208,16 +153,6 @@ function RoomIndex(){
     }));
   };
 
-  // cleanup watcher on unmount: must be inside component body to use hooks correctly
-  React.useEffect(() => {
-    return () => {
-      stopLiveGps();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-        window.__activeGeoStop = null;
-      }
-    };
-  }, [stopLiveGps]);
-
   // ensure SweetAlert2 is loaded on demand
   const ensureSwalLoaded = async () => {
     if (window.Swal) return window.Swal;
@@ -232,7 +167,7 @@ function RoomIndex(){
 
   const handleSubmit = async (ev) => {
     ev.preventDefault();
-    if (!silent) { setLoading(true); setError(''); }
+    setLoading(true); setError('');
     try{
       const payload = {
         building_id: form.building_id ? Number(form.building_id) : null,
@@ -244,7 +179,6 @@ function RoomIndex(){
         altitude: form.altitude !== '' ? (isNaN(Number(form.altitude)) ? null : Number(form.altitude)) : null
       };
 
-      // duplicate name check: same room_name within same building and floor
       if (payload.room_name && Array.isArray(rooms) && rooms.length) {
         const dupName = rooms.find(r => {
           if (!r.room_name) return false;
@@ -315,7 +249,7 @@ function RoomIndex(){
       }
       closeModal();
     }catch(e){ console.error(e); setError(e?.message || 'Failed to save room'); }
-    finally{ if (!silent) setLoading(false); }
+    finally{ setLoading(false); }
   };
 
   const columns = [

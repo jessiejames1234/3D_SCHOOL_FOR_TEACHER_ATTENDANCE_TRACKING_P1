@@ -145,6 +145,9 @@ function request_edit_is_self_scope($scope) {
 function request_edit_apply_scope_filter($scope, $authRole, $authUserId, $authDeptId, $manageRoleId, $requestedByColumn, $teacherDeptColumn, &$sql, &$types, &$params) {
     $authRole = (int)$authRole;
     $authUserId = (int)$authUserId;
+    $manageRoleIds = is_array($manageRoleId)
+        ? array_values(array_filter(array_map('intval', $manageRoleId)))
+        : [(int)$manageRoleId];
     $isSelfScope = request_edit_is_self_scope($scope);
 
     if ($authRole === 1) {
@@ -156,7 +159,7 @@ function request_edit_apply_scope_filter($scope, $authRole, $authUserId, $authDe
         return;
     }
 
-    if ($authRole === (int)$manageRoleId && !$isSelfScope) {
+    if (in_array($authRole, $manageRoleIds, true) && !$isSelfScope) {
         if ($authDeptId === null) {
             json_response([], 200);
         }
@@ -680,7 +683,7 @@ if ($param1 === 'schedule') {
             $authRole,
             $authUserId,
             $authDeptId,
-            4,
+            [2, 3, 4],
             'ser.requested_by',
             't.dept_id',
             $sql,
@@ -792,13 +795,14 @@ if ($param1 === 'schedule') {
             'create_schedule_edit_request',
             "Submitted schedule edit request #{$requestId} for schedule_id={$scheduleId}"
         );
-        if ((int)$authRole === 5 && $authDeptId !== null) {
+        if ($authDeptId !== null) {
             $requesterName = notif_get_user_full_name($mysqli, $authUserId);
             $notifTitle = 'Schedule Edit Request';
             $notifMessage = "{$requesterName} submitted a schedule edit request.";
             $notifLink = '/schedule-edit-requests?request_id=' . $requestId;
-            notif_notify_role_dept($mysqli, 4, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
+            notif_notify_role_dept($mysqli, 2, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
             notif_notify_role_dept($mysqli, 3, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
+            notif_notify_role_dept($mysqli, 4, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
         }
         json_response(['ok' => true, 'request_id' => $requestId], 201);
     }

@@ -1,5 +1,8 @@
+import React from 'react';
+import { apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import { useLiveGeolocation } from '../../utils/useLiveGeolocation.js';
 
 function BuildingIndex(){
   const [buildings, setBuildings] = React.useState([]);
@@ -10,9 +13,6 @@ function BuildingIndex(){
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
   const [lastCoords, setLastCoords] = React.useState(null);
-  const [liveGpsActive, setLiveGpsActive] = React.useState(false);
-  const watchIdRef = React.useRef(null);
-  const livePollRef = React.useRef(null);
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) {
@@ -72,7 +72,11 @@ function BuildingIndex(){
     }
     setShowModal(true);
   };
-  const closeModal = ()=> setShowModal(false);
+  const closeModal = ()=> {
+    stopLiveGps();
+    setLastCoords({ latitude: 0, longitude: 0 });
+    setShowModal(false);
+  };
   const handleChange = (e) => setForm(p=>({...p,[e.target.name]: e.target.value}));
 
   const updateLiveCoords = (coords = {}) => {
@@ -81,89 +85,36 @@ function BuildingIndex(){
     setLastCoords({ latitude: lat, longitude: lon });
   };
 
-  const clearGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    if (window.__geoWatchId != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(window.__geoWatchId); } catch (e) { /* ignore */ }
+  const {
+    active: liveGpsActive,
+    start: startLiveGps,
+    stop: stopLiveGps
+  } = useLiveGeolocation({
+    onPosition: updateLiveCoords,
+    onError: (message, err) => {
+      if (err) console.error('geolocation error', err);
+      setError(message || 'Failed to watch position');
     }
-    if (window.__geoPollId != null) {
-      try { clearInterval(window.__geoPollId); } catch (e) { /* ignore */ }
-    }
-    window.__geoWatchId = null;
-    window.__geoPollId = null;
-  }, []);
-
-  const stopLiveGps = React.useCallback(() => {
-    if (watchIdRef.current != null && 'geolocation' in navigator) {
-      try { navigator.geolocation.clearWatch(watchIdRef.current); } catch (e) { /* ignore */ }
-    }
-    if (livePollRef.current != null) {
-      try { clearInterval(livePollRef.current); } catch (e) { /* ignore */ }
-    }
-    watchIdRef.current = null;
-    livePollRef.current = null;
-    setLiveGpsActive(false);
-    if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-      clearGlobalGeo();
-      window.__activeGeoStop = null;
-    }
-  }, [clearGlobalGeo]);
-
-  const claimGlobalGeo = React.useCallback(() => {
-    if (typeof window === 'undefined') return;
-    const existing = window.__activeGeoStop;
-    if (existing && existing !== stopLiveGps) {
-      try { existing(); } catch (e) { /* ignore */ }
-    }
-    clearGlobalGeo();
-    window.__activeGeoStop = stopLiveGps;
-  }, [stopLiveGps, clearGlobalGeo]);
+  });
 
   const captureGps = () => {
     setError('');
-    if (!('geolocation' in navigator)) { setError('Geolocation not supported in this browser'); return; }
     if (liveGpsActive) {
       stopLiveGps();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-        window.__activeGeoStop = null;
-      }
+      setLastCoords({ latitude: 0, longitude: 0 });
       return;
     }
-    claimGlobalGeo();
     setShowModal(true);
-    navigator.geolocation.getCurrentPosition((pos) => {
-      updateLiveCoords(pos.coords || {});
-    }, () => {
-      // ignore immediate errors
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 4000 });
-
-    const id = navigator.geolocation.watchPosition((pos) => {
-      updateLiveCoords(pos.coords || {});
-    }, (err) => {
-      console.error('watchPosition error', err);
-      setError(err?.message || 'Failed to watch position');
-      if (err && err.code === 1) {
-        setLiveGpsActive(false);
-      }
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 6000 });
-    watchIdRef.current = id;
-    if (typeof window !== 'undefined') window.__geoWatchId = id;
-
-    if (livePollRef.current == null) {
-      livePollRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition((pos) => {
-          updateLiveCoords(pos.coords || {});
-        }, () => {
-          // ignore polling errors
-        }, { enableHighAccuracy: true, maximumAge: 0, timeout: 2000 });
-      }, 800);
-      if (typeof window !== 'undefined') window.__geoPollId = livePollRef.current;
-    }
-    setLiveGpsActive(true);
+    setLastCoords(null);
+    startLiveGps();
   };
 
   const applyLiveCoords = () => {
     setError('');
+    if (!liveGpsActive) {
+      setError('Start Live GPS first.');
+      return;
+    }
     if (!lastCoords) {
       setError('No live coordinates available. Start Live GPS first.');
       return;
@@ -179,15 +130,6 @@ function BuildingIndex(){
       longitude: Number(longitude).toFixed(7)
     }));
   };
-
-  React.useEffect(() => {
-    return () => {
-      stopLiveGps();
-      if (typeof window !== 'undefined' && window.__activeGeoStop === stopLiveGps) {
-        window.__activeGeoStop = null;
-      }
-    };
-  }, [stopLiveGps]);
 
   const validateForm = () => {
     const name = (form.building_name||'').trim();

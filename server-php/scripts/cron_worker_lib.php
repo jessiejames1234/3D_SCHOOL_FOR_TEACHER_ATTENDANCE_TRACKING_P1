@@ -25,7 +25,15 @@ if (!function_exists('cw_log')) {
 if (!function_exists('cw_run_sql')) {
     function cw_run_sql(mysqli $mysqli, string $sql): array
     {
-        $ok = $mysqli->query($sql);
+        try {
+            $ok = $mysqli->query($sql);
+        } catch (Throwable $e) {
+            return [
+                'ok' => false,
+                'affected_rows' => 0,
+                'error' => $e->getMessage(),
+            ];
+        }
         if ($ok === false) {
             return [
                 'ok' => false,

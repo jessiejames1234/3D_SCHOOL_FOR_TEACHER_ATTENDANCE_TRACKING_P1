@@ -6,6 +6,8 @@ import { apiGet, apiPost, apiPut } from '../../services/api.js';
 
 export default function LeavesFiles() {
   const { user } = React.useContext(AuthContext);
+  const currentRoleId = Number(user?.role_id || 0);
+  const canManageLeaves = currentRoleId === 2;
   
   // -- State --
   const [rows, setRows] = React.useState([]);
@@ -180,10 +182,11 @@ export default function LeavesFiles() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
+      if (!canManageLeaves) throw new Error('Only dean can file or edit leave records.');
       const payloadTeacher = Number(form.teacher_id) || null;
       if (!payloadTeacher) throw new Error('Teacher is required');
       
-      if (Number(user.role_id) === 4) {
+      if (currentRoleId === 2) {
         const t = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
         if (!resolvedDeptId) throw new Error('Your department is not set on your account');
         if (!t || String(t.dept_id) !== String(resolvedDeptId)) throw new Error('Selected teacher is not in your department');
@@ -240,13 +243,11 @@ export default function LeavesFiles() {
       ) },
     { key: 'actions', label: 'Actions', actions: (row) => {
         const actions = [];
-        const rid = Number(user?.role_id);
-        const isAdmin = rid === 1;
-        const isSecretary = rid === 4;
+        const isDean = currentRoleId === 2;
 
         actions.push({ label: 'View', onClick: () => openDetail(row) });
 
-        if (isAdmin || isSecretary) {
+        if (isDean) {
           actions.push({ label: 'Edit', onClick: () => openModal(row), variant: 'primary' });
         }
         
@@ -296,7 +297,7 @@ export default function LeavesFiles() {
       {/* Top Header Section */}
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-2xl font-semibold">Leaves (File)</h2>
-        { (Number(user?.role_id) === 1 || Number(user?.role_id) === 4) && (
+        { canManageLeaves && (
           <button 
             className="px-4 py-2 bg-green-600 text-white rounded-md text-base font-medium shadow hover:bg-green-700" 
             onClick={() => openModal()}
@@ -359,7 +360,7 @@ export default function LeavesFiles() {
               {leaveTypes.map((type) => (<option key={type.leave_type_id ?? type.id} value={type.leave_type_id ?? type.id}>{type.name_type ?? type.name}</option>))}
             </select>
           </div>
-          {(Number(user?.role_id) === 4 || Number(user?.role_id) === 1) && (
+          {canManageLeaves && (
             <div>
               <label className="block text-sm font-medium">Teacher</label>
               <input
