@@ -201,6 +201,7 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
     if (!$sub_id && isset($input['substitute_user_id'])) {
         $sub_id = (int)$input['substitute_user_id'];
     }
+    $originalTeacherId = isset($input['original_teacher_id']) ? (int)$input['original_teacher_id'] : null;
     $substitutions = isset($input['substitutions']) && is_array($input['substitutions']) ? $input['substitutions'] : [];
     if (empty($substitutions) && !empty($input['schedule_id']) && !empty($input['date'])) {
         $substitutions = [[
@@ -231,7 +232,7 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
 
     try {
         $deptScopeStmt = $mysqli->prepare("
-            SELECT orig_teacher.dept_id
+            SELECT orig_teacher.user_id AS teacher_id, orig_teacher.dept_id
             FROM tbl_class_schedules cs
             {$subJoinOffering}
             LEFT JOIN tbl_users orig_teacher ON {$subTeacherExpr} = orig_teacher.user_id
@@ -255,6 +256,10 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
                 $deptScopeStmt->bind_param('i', $schedule_id);
                 $deptScopeStmt->execute();
                 $deptScopeRow = $deptScopeStmt->get_result()->fetch_assoc();
+                $scheduleTeacherId = isset($deptScopeRow['teacher_id']) && $deptScopeRow['teacher_id'] !== null ? (int)$deptScopeRow['teacher_id'] : null;
+                if ($originalTeacherId && $scheduleTeacherId !== $originalTeacherId) {
+                    throw new Exception('Selected schedule does not belong to the selected original teacher.');
+                }
                 $scheduleDeptId = isset($deptScopeRow['dept_id']) && $deptScopeRow['dept_id'] !== null ? (int)$deptScopeRow['dept_id'] : null;
                 if ($scheduleDeptId === null || $scheduleDeptId !== (int)$authUserDept) {
                     throw new Exception('Dean can only manage substitutions for schedules inside their department.');

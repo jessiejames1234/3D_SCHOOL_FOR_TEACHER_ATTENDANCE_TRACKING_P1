@@ -4,9 +4,58 @@ import Modal from '../../components/Modal.jsx';
 import { apiGet, apiPost } from '../../services/api.js';
 
 const API_BASE = (typeof window !== 'undefined' && window.API_BASE) ? window.API_BASE : '/server-php/api';
+const ALTITUDE_CALIBRATION_STORAGE_KEY = 'attendance_altitude_calibration_v1';
+const IOS_CALIBRATION_MAX_OFFSET_METERS = 200;
 
 // --- Helpers ---
 const deg2rad = (deg) => (deg * Math.PI) / 180;
+const toFiniteNumber = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const detectDevicePlatform = () => {
+  if (typeof navigator === 'undefined') return 'unknown';
+  const ua = String(navigator.userAgent || '');
+  const platform = String(navigator.userAgentData?.platform || navigator.platform || '');
+  if (/android/i.test(ua) || /android/i.test(platform)) return 'android';
+  if (/iphone|ipad|ipod/i.test(ua) || /iphone|ipad|ipod/i.test(platform)) return 'ios';
+  if (/mac/i.test(platform) && Number(navigator.maxTouchPoints || 0) > 1) return 'ios';
+  if (/windows|mac|linux/i.test(platform)) return 'desktop';
+  return 'unknown';
+};
+
+const altitudeCalibrationKey = (platform, buildingId) => `${platform || 'unknown'}:${buildingId || 'global'}`;
+
+const readAltitudeCalibrationMap = () => {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(ALTITUDE_CALIBRATION_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+};
+
+const readAltitudeCalibration = (platform, buildingId = null) => {
+  const map = readAltitudeCalibrationMap();
+  const specific = map[altitudeCalibrationKey(platform, buildingId)];
+  const fallback = map[altitudeCalibrationKey(platform, null)];
+  const found = specific || fallback || null;
+  return found && toFiniteNumber(found.offset) !== null ? found : null;
+};
+
+const saveAltitudeCalibration = (calibration) => {
+  if (typeof localStorage === 'undefined' || !calibration) return;
+  const platform = calibration.platform || 'unknown';
+  const map = readAltitudeCalibrationMap();
+  map[altitudeCalibrationKey(platform, calibration.building_id)] = calibration;
+  map[altitudeCalibrationKey(platform, null)] = calibration;
+  try {
+    localStorage.setItem(ALTITUDE_CALIBRATION_STORAGE_KEY, JSON.stringify(map));
+  } catch (e) {}
+};
 
 const getDistanceMeters = (lat1, lon1, lat2, lon2) => {
   if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return Infinity;
@@ -125,6 +174,8 @@ export default function AttendanceIndex() {
 
   const [scannedQrToken, setScannedQrToken] = React.useState(null);
   const [scannedFloor, setScannedFloor] = React.useState(null);
+  const [devicePlatform] = React.useState(() => detectDevicePlatform());
+  const [altitudeCalibration, setAltitudeCalibration] = React.useState(null);
   const LOCAL_STORAGE_KEY = 'attendance_scanned_qr_v1';
 
   // --- Logic Effects ---
@@ -456,6 +507,102 @@ export default function AttendanceIndex() {
     return buildings.find(b => Number(b.building_id) === Number(currentRoomObj.building_id)) || null;
   }, [currentRoomObj, buildings]);
 
+  const altitudeCalibrationBuildingId = React.useMemo(() => {
+    const id = scannedFloor?.building_id ?? currentRoomObj?.building_id ?? currentBuilding?.building_id ?? scheduledBuildingObj?.building_id ?? null;
+    const n = toFiniteNumber(id);
+    return n !== null ? Number(n) : null;
+  }, [scannedFloor, currentRoomObj, currentBuilding, scheduledBuildingObj]);
+
+  const rawAltitude = React.useMemo(() => toFiniteNumber(coords?.altitude), [coords]);
+
+  React.useEffect(() => {
+    setAltitudeCalibration(readAltitudeCalibration(devicePlatform, altitudeCalibrationBuildingId));
+  }, [devicePlatform, altitudeCalibrationBuildingId]);
+
+  React.useEffect(() => {
+    if (devicePlatform !== 'ios' || !scannedFloor) return;
+    const baseline = toFiniteNumber(scannedFloor.baseline_altitude);
+    if (baseline === null || rawAltitude === null) return;
+
+    const offset = baseline - rawAltitude;
+    if (!Number.isFinite(offset) || Math.abs(offset) > IOS_CALIBRATION_MAX_OFFSET_METERS) return;
+
+    const calibration = {
+      platform: devicePlatform,
+      building_id: altitudeCalibrationBuildingId,
+      floor_id: scannedFloor.floor_id ?? null,
+      offset,
+      raw_altitude: rawAltitude,
+      baseline_altitude: baseline,
+      updated_at: Date.now()
+    };
+
+    saveAltitudeCalibration(calibration);
+    setAltitudeCalibration(prev => {
+      const prevOffset = toFiniteNumber(prev?.offset);
+      if (
+        prev &&
+        prevOffset !== null &&
+        Math.abs(prevOffset - offset) < 1 &&
+        String(prev.floor_id || '') === String(calibration.floor_id || '')
+      ) {
+        return prev;
+      }
+      return calibration;
+    });
+  }, [devicePlatform, scannedFloor, rawAltitude, altitudeCalibrationBuildingId]);
+
+  const attendanceAltitude = React.useMemo(() => {
+    const info = {
+      platform: devicePlatform,
+      building_id: altitudeCalibrationBuildingId,
+      raw: rawAltitude,
+      normalized: rawAltitude,
+      offset: null,
+      source: 'raw',
+      calibrated: false
+    };
+
+    if (devicePlatform !== 'ios') return info;
+
+    const scannedBaseline = toFiniteNumber(scannedFloor?.baseline_altitude);
+    if (scannedBaseline !== null) {
+      if (rawAltitude === null) {
+        return {
+          ...info,
+          normalized: scannedBaseline,
+          source: 'ios_scanned_floor',
+          calibrated: true
+        };
+      }
+      const offset = scannedBaseline - rawAltitude;
+      if (Number.isFinite(offset) && Math.abs(offset) <= IOS_CALIBRATION_MAX_OFFSET_METERS) {
+        return {
+          ...info,
+          normalized: rawAltitude + offset,
+          offset,
+          source: 'ios_scanned_floor',
+          calibrated: true
+        };
+      }
+    }
+
+    if (rawAltitude === null) return info;
+
+    const storedOffset = toFiniteNumber(altitudeCalibration?.offset);
+    if (storedOffset !== null && Math.abs(storedOffset) <= IOS_CALIBRATION_MAX_OFFSET_METERS) {
+      return {
+        ...info,
+        normalized: rawAltitude + storedOffset,
+        offset: storedOffset,
+        source: 'ios_saved_offset',
+        calibrated: true
+      };
+    }
+
+    return info;
+  }, [devicePlatform, altitudeCalibrationBuildingId, rawAltitude, scannedFloor, altitudeCalibration]);
+
   React.useEffect(() => {
     if (!coords || !Array.isArray(buildings) || buildings.length === 0) { setCurrentBuilding(null); return; }
     let best = null;
@@ -535,7 +682,9 @@ export default function AttendanceIndex() {
       }
     }
 
-    const alt = scannedFloor && scannedFloor.baseline_altitude != null ? Number(scannedFloor.baseline_altitude) : (typeof coords.altitude === 'number' ? coords.altitude : null);
+    const alt = scannedFloor && scannedFloor.baseline_altitude != null
+      ? Number(scannedFloor.baseline_altitude)
+      : attendanceAltitude.normalized;
     if (alt != null && Array.isArray(floors) && floors.length) {
       const preferred = [];
         
@@ -584,7 +733,7 @@ export default function AttendanceIndex() {
       }
     }
     return best;
-  }, [rooms, floors, detectFloorFromAltitude, scannedFloor, currentBuilding, scheduledBuildingObj]);
+  }, [rooms, floors, detectFloorFromAltitude, scannedFloor, currentBuilding, scheduledBuildingObj, attendanceAltitude]);
 
   const getNearestRoomLabel = (coords) => {
     if (!coords) return { name: 'X', floor: 'X', building: 'X' };
@@ -592,10 +741,17 @@ export default function AttendanceIndex() {
       return { name: 'X', floor: 'X', building: 'X' };
     }
     const room = findNearestRoom(coords);
-    if (!room) return { name: 'X', floor: 'X', building: 'X' };
+    if (!room) {
+      return scannedFloor
+        ? { name: 'No nearby room found on scanned floor', floor: scannedFloor.floor_name || 'Scanned floor', building: 'X' }
+        : { name: 'X', floor: 'X', building: 'X' };
+    }
+    if (scannedFloor && String(room.floor_id) !== String(scannedFloor.floor_id)) {
+      return { name: 'No nearby room found on scanned floor', floor: scannedFloor.floor_name || 'Scanned floor', building: 'X' };
+    }
     const dist = getDistanceMeters(coords.latitude, coords.longitude, room.latitude, room.longitude);
     const roomFloor = (room.floor_id && floors.length) ? floors.find(f => f.floor_id === room.floor_id) : null;
-    const floorName = scannedFloor ? (scannedFloor.floor_name || 'X') : (roomFloor ? roomFloor.floor_name : (detectFloorFromAltitude(coords?.altitude, room.building_id)?.floor_name || 'X'));
+    const floorName = scannedFloor ? (scannedFloor.floor_name || 'X') : (roomFloor ? roomFloor.floor_name : (detectFloorFromAltitude(attendanceAltitude.normalized, room.building_id)?.floor_name || 'X'));
     const buildingObj = buildings.find(b => Number(b.building_id) === Number(room.building_id)) || currentBuilding || null;
     const buildingName = buildingObj ? (buildingObj.building_name || 'X') : 'X';
     return { name: `${room.room_name || 'Unnamed'} (${Math.round(dist)}m)`, floor: floorName, building: buildingName };
@@ -745,11 +901,11 @@ export default function AttendanceIndex() {
       if (base == null || vert == null) return false;
       const min = base - vert;
       const max = base + vert;
-      const alt = (typeof coords.altitude === 'number') ? Number(coords.altitude) : null;
+      const alt = attendanceAltitude.normalized;
       if (alt == null) return false;
       return alt >= min && alt <= max;
     } catch (e) { return false; }
-  }, [scannedFloor, coords]);
+  }, [scannedFloor, coords, attendanceAltitude]);
 
   const scannedFloorRange = React.useMemo(() => {
     if (!scannedFloor) return null;
@@ -760,10 +916,10 @@ export default function AttendanceIndex() {
   }, [scannedFloor]);
 
   const altDetectedFloor = React.useMemo(() => {
-    if (!coords || typeof coords.altitude !== 'number') return null;
+    if (!coords || attendanceAltitude.normalized === null) return null;
     const bId = currentBuilding && currentBuilding.building_id ? Number(currentBuilding.building_id) : null;
-    return detectFloorFromAltitude(coords.altitude, bId);
-  }, [coords, detectFloorFromAltitude, currentBuilding]);
+    return detectFloorFromAltitude(attendanceAltitude.normalized, bId);
+  }, [coords, attendanceAltitude, detectFloorFromAltitude, currentBuilding]);
 
   const isOutsideBuilding = React.useMemo(() => {
     if (!currentRoomObj) return false;
@@ -821,7 +977,7 @@ export default function AttendanceIndex() {
       const floorName = floorObj ? (floorObj.floor_name || `Floor ${floorId}`) : (info.expected_floor_name || 'the expected floor');
       const minAlt = (info.min_altitude != null) ? Number(info.min_altitude).toFixed(1) : null;
       const maxAlt = (info.max_altitude != null) ? Number(info.max_altitude).toFixed(1) : null;
-      const detected = (info.detected_altitude != null) ? Number(info.detected_altitude).toFixed(1) : (coords && typeof coords.altitude === 'number' ? coords.altitude.toFixed(1) : 'N/A');
+      const detected = (info.detected_altitude != null) ? Number(info.detected_altitude).toFixed(1) : (attendanceAltitude.normalized !== null ? Number(attendanceAltitude.normalized).toFixed(1) : 'N/A');
 
       return (
         <div style={{ padding: 10, backgroundColor: '#fff3cd', color: '#856404', borderRadius: 5, margin: '10px 0', textAlign: 'center', border: '1px solid #ffeeba' }}>
@@ -1000,8 +1156,13 @@ export default function AttendanceIndex() {
       latitude: coords?.latitude || 0,
       longitude: coords?.longitude || 0,
       accuracy: coords?.accuracy || 100,
-      altitude: coords?.altitude || null,
-      altitudeAccuracy: coords?.altitudeAccuracy || null,
+      altitude: attendanceAltitude.normalized !== null ? attendanceAltitude.normalized : null,
+      raw_altitude: attendanceAltitude.raw !== null ? attendanceAltitude.raw : null,
+      normalized_altitude: attendanceAltitude.normalized !== null ? attendanceAltitude.normalized : null,
+      altitude_offset: attendanceAltitude.offset !== null ? attendanceAltitude.offset : null,
+      altitude_source: attendanceAltitude.source,
+      device_platform: devicePlatform,
+      altitudeAccuracy: coords?.altitudeAccuracy ?? null,
       qr_token: scannedQrToken || null,
     };
 
@@ -1056,6 +1217,24 @@ export default function AttendanceIndex() {
       if (body && body.error === 'wrong_floor') {
         setWrongFloorInfo(body);
         setErrorMessage('wrong_floor');
+        if (devicePlatform === 'ios' && !scannedQrToken) {
+          try {
+            await ensureSwalLoaded();
+            const res = await window.Swal.fire({
+              title: 'iOS altitude needs calibration',
+              text: 'Scan the floor QR once so the app can align this device altitude with the floor baseline.',
+              icon: 'warning',
+              showCancelButton: true,
+              confirmButtonText: 'Scan QR',
+              cancelButtonText: 'Cancel'
+            });
+            if (res.isConfirmed) openScannerWithPermission();
+          } catch (e) {
+            const ok = window.confirm('iOS altitude needs floor calibration. Scan the floor QR now?');
+            if (ok) openScannerWithPermission();
+          }
+          return;
+        }
       } else {
         setWrongFloorInfo(null);
         setErrorMessage(body && body.error ? body.error : msg);
@@ -1063,7 +1242,7 @@ export default function AttendanceIndex() {
       alert(`Error: ${body && body.error ? body.error : msg}`);
       if (scannedQrToken) setIsCameraVisible(false);
     }
-  }, [findActiveSchedule, findMatchingScheduleGroup, computeActionState, coords, currentRoomObj, isOutOfRange, userId, currentAction, floors, loadMyAttendance]);
+  }, [findActiveSchedule, findMatchingScheduleGroup, computeActionState, coords, attendanceAltitude, devicePlatform, currentRoomObj, isOutOfRange, userId, currentAction, floors, loadMyAttendance]);
 
   React.useEffect(() => {
     handleCheckNowRef.current = handleCheckNow;
@@ -1345,6 +1524,12 @@ export default function AttendanceIndex() {
     return () => { if (timer) clearTimeout(timer); };
   }, [records]);
 
+  const nearestRoomLabel = coords ? getNearestRoomLabel(coords) : null;
+  const roomGuideLabel = scannedFloor ? 'Scanned-floor room' : 'Estimated room';
+  const altitudeLabel = attendanceAltitude.normalized !== null ? `${Number(attendanceAltitude.normalized).toFixed(1)}m` : 'N/A';
+  const rawAltitudeLabel = attendanceAltitude.raw !== null ? `${Number(attendanceAltitude.raw).toFixed(1)}m` : 'N/A';
+  const altitudeDisplayLabel = attendanceAltitude.calibrated ? `${altitudeLabel} (raw ${rawAltitudeLabel})` : altitudeLabel;
+
   // --- Render ---
   return (
     <div className="attendance-container">
@@ -1478,7 +1663,7 @@ export default function AttendanceIndex() {
                           <br/>
                           Range: {scannedFloorRange ? `${Number(scannedFloorRange.min).toFixed(1)}m - ${Number(scannedFloorRange.max).toFixed(1)}m` : 'N/A'}
                           <br/>
-                          Baseline: {scannedFloorRange ? Number(scannedFloorRange.base).toFixed(1) + 'm' : 'N/A'}. Your alt: {coords && typeof coords.altitude === 'number' ? coords.altitude.toFixed(1) + 'm' : 'N/A'}
+                          Baseline: {scannedFloorRange ? Number(scannedFloorRange.base).toFixed(1) + 'm' : 'N/A'}. Your alt: {altitudeDisplayLabel}
                         </div>
                       )}
                       
@@ -1499,9 +1684,9 @@ export default function AttendanceIndex() {
                  <div className="gps-mini-debug">
                    <div className="panel-label mt-2">GPS STATUS</div>
                    GPS: {coords.latitude.toFixed(5)}, {coords.longitude.toFixed(5)} <br/>
-                   Acc: {coords.accuracy?.toFixed(1)}m | Alt: {coords.altitude != null ? `${coords.altitude.toFixed(1)}m` : 'N/A'}
+                    Acc: {coords.accuracy?.toFixed(1)}m | Alt: {altitudeDisplayLabel} | Device: {devicePlatform}
                    <br/>
-                   Loc: {getNearestRoomLabel(coords).name}
+                   {roomGuideLabel}: {nearestRoomLabel ? nearestRoomLabel.name : 'X'}
                  </div>
                )}
             </div>

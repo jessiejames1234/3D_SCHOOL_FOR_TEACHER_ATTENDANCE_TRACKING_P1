@@ -45,6 +45,33 @@ const getNextDateForDay = (dayName) => {
   return `${year}-${month}-${day}`;
 };
 
+const sameId = (a, b) => String(a ?? '') === String(b ?? '');
+
+const getScheduleOffering = (schedule, offerings) => {
+  if (!schedule || schedule.offering_id == null) return null;
+  return offerings.find(o => sameId(o.offering_id, schedule.offering_id)) || null;
+};
+
+const getScheduleTeacherId = (schedule, offerings) => {
+  const directTeacherId = schedule?.teacher_id ?? schedule?.user_id ?? schedule?.original_teacher_id ?? null;
+  if (directTeacherId !== null && directTeacherId !== undefined && String(directTeacherId) !== '') {
+    return String(directTeacherId);
+  }
+  const offering = getScheduleOffering(schedule, offerings);
+  return offering?.user_id !== null && offering?.user_id !== undefined ? String(offering.user_id) : '';
+};
+
+const buildScheduleLabel = (schedule, offerings) => {
+  const offering = getScheduleOffering(schedule, offerings);
+  const subjectCode = schedule?.subject_code || offering?.subject_code || 'Class';
+  const sectionName = schedule?.section_name || offering?.section_name || '';
+  const day = schedule?.day_of_week || '';
+  const start = schedule?.start_time?.slice(0, 5) || '';
+  const end = schedule?.end_time?.slice(0, 5) || '';
+  const room = schedule?.room_name ? ` | ${schedule.room_name}` : '';
+  return `${subjectCode}${sectionName ? ` - ${sectionName}` : ''} (${day} ${start}-${end})${room}`;
+};
+
 export default function SubstituteIndex() {
   const { user } = React.useContext(AuthContext); 
   const isDean = Number(user?.role_id) === 2;
@@ -75,9 +102,7 @@ export default function SubstituteIndex() {
   const classOptions = React.useMemo(() => {
     const map = {};
     schedules.forEach(s => {
-      const off = offerings.find(o => String(o.offering_id) === String(s.offering_id));
-      const label = off ? `${off.subject_code} - ${off.section_name} (${s.day_of_week} ${s.start_time?.slice(0,5) || ''}-${s.end_time?.slice(0,5) || ''})` : `Schedule ${s.schedule_id}`;
-      map[s.schedule_id] = label;
+      map[s.schedule_id] = buildScheduleLabel(s, offerings);
     });
     return Object.keys(map).map(k => ({ id: k, label: map[k] }));
   }, [schedules, offerings]);
@@ -162,17 +187,13 @@ export default function SubstituteIndex() {
 
   const availableSchedules = React.useMemo(() => {
     if (!form.original_teacher_id) return [];
-    
-    const teacherOfferings = offerings.filter(o => String(o.user_id) === String(form.original_teacher_id));
-    const offeringIds = teacherOfferings.map(o => o.offering_id);
-    const teacherSchedules = schedules.filter(s => offeringIds.includes(s.offering_id));
+    const teacherSchedules = schedules.filter(s => sameId(getScheduleTeacherId(s, offerings), form.original_teacher_id));
 
     return teacherSchedules.map(s => {
-      const off = teacherOfferings.find(o => o.offering_id === s.offering_id);
       return {
         schedule_id: s.schedule_id,
         day_of_week: s.day_of_week, 
-        label: `${off ? off.subject_code : 'Class'} - ${off ? off.section_name : ''} (${s.day_of_week} ${s.start_time}-${s.end_time})`
+        label: buildScheduleLabel(s, offerings)
       };
     });
   }, [form.original_teacher_id, offerings, schedules]);
@@ -231,6 +252,7 @@ export default function SubstituteIndex() {
     try {
       // Post the array of schedules
       const response = await apiPost('substitute', {
+        original_teacher_id: form.original_teacher_id,
         substitute_id: form.substitute_id,
         substitutions: form.selectedSchedules 
       });

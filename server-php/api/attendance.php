@@ -737,6 +737,15 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
     $altitude    = $input['altitude'] ?? null;
     $altitudeAccuracy = $input['altitudeAccuracy'] ?? null;
     $qr_token    = $input['qr_token'] ?? null;
+    $devicePlatform = strtolower(trim((string)($input['device_platform'] ?? $input['devicePlatform'] ?? 'unknown')));
+    if (!in_array($devicePlatform, ['android', 'ios', 'desktop', 'unknown'], true)) $devicePlatform = 'unknown';
+    $rawAltitude = $input['raw_altitude'] ?? $input['rawAltitude'] ?? $altitude;
+    $normalizedAltitude = $input['normalized_altitude'] ?? $input['normalizedAltitude'] ?? null;
+    $altitudeOffset = $input['altitude_offset'] ?? $input['altitudeOffset'] ?? null;
+    $altitudeSource = $input['altitude_source'] ?? $input['altitudeSource'] ?? null;
+    if (is_numeric($normalizedAltitude)) {
+        $altitude = $normalizedAltitude;
+    }
 
     // --- SECURITY FIX: STRICT VALIDATION ---
     if ($user_id <= 0) {
@@ -1163,7 +1172,13 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         'attendance' => $final,
         'records' => $finalRows,
         'group_count' => $groupCount,
-        'grouped' => $groupCount > 1
+        'grouped' => $groupCount > 1,
+        'device_platform' => $devicePlatform,
+        'altitude_used' => is_numeric($finalAltitude) ? (float)$finalAltitude : null,
+        'raw_altitude' => is_numeric($rawAltitude) ? (float)$rawAltitude : null,
+        'normalized_altitude' => is_numeric($altitude) ? (float)$altitude : null,
+        'altitude_offset' => is_numeric($altitudeOffset) ? (float)$altitudeOffset : null,
+        'altitude_source' => $altitudeSource
     ]);
 
 } else {

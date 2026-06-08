@@ -1,0 +1,2 @@
+server-php/logs/*
+!server-php/logs/.gitkeep
