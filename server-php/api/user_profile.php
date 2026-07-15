@@ -64,7 +64,7 @@ $build_profile_payload = function($row) use ($hasUserModulePermissions, $decode_
         'email' => $row['email'],
         'contact_no' => isset($row['contact_no']) ? $row['contact_no'] : null,
         'avatar' => $normalize_avatar($row['image'] ?? null),
-        'role_name' => isset($row['role_name']) ? $row['role_name'] : null,
+        'role_name' => isset($row['role_name']) ? app_format_role_name($row['role_name']) : null,
         'permission_mode' => $hasUserModulePermissions ? ($row['permission_mode'] ?? 'default') : 'default',
         'module_permissions' => $hasUserModulePermissions ? $decode_module_permissions($row['module_permissions'] ?? null) : ['allow' => [], 'deny' => []],
     ];
@@ -80,7 +80,7 @@ if ($request_method === 'GET') {
     if (!$user_id) json_response(['ok' => false, 'error' => 'missing_user_id'], 400);
 
     $canView = ($authUserId > 0 && $authUserId === (int)$user_id) || $authRoleId === 1;
-    if (!$canView && $authRoleId === 2) {
+    if (!$canView && in_array($authRoleId, [2, 6], true)) {
         $authDeptId = app_get_user_department_id($mysqli, $authUserId);
         $targetDeptId = app_get_user_department_id($mysqli, $user_id);
         $canView = $authDeptId !== null && $targetDeptId !== null && $authDeptId === $targetDeptId;
@@ -102,8 +102,21 @@ if ($request_method === 'GET') {
     $user_id = (int)$_POST['user_id'];
     if ($user_id <= 0) json_response(['ok' => false, 'error' => 'invalid_user_id'], 400);
 
-    $canUpdate = $authRoleId === 1;
-    if (!$canUpdate) {
+    $postFields = [];
+    foreach ($_POST as $key => $value) {
+        if ($key !== 'user_id') $postFields[] = $key;
+    }
+    $hasAvatarUpload = !empty($_FILES) && !empty($_FILES['avatar']) && $_FILES['avatar']['error'] !== UPLOAD_ERR_NO_FILE;
+    $canUpdateAll = $authRoleId === 1;
+    $canUpdateOwnContact = $authUserId > 0 && $authUserId === $user_id && !$hasAvatarUpload && count($postFields) > 0;
+    foreach ($postFields as $fieldName) {
+        if ($fieldName !== 'contact_no') {
+            $canUpdateOwnContact = false;
+            break;
+        }
+    }
+
+    if (!$canUpdateAll && !$canUpdateOwnContact) {
         json_response(['ok' => false, 'error' => 'forbidden'], 403);
     }
 
@@ -154,6 +167,9 @@ if ($request_method === 'GET') {
         if ($contactNo === '') {
             $fields[] = 'contact_no = NULL';
         } else {
+            if (!$canUpdateAll && !preg_match('/^09\d{9}$/', $contactNo)) {
+                json_response(['ok' => false, 'error' => 'invalid_contact_no'], 400);
+            }
             if (!preg_match('/^[0-9+\-\s()]{7,25}$/', $contactNo)) {
                 json_response(['ok' => false, 'error' => 'invalid_contact_no'], 400);
             }

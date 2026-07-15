@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useContext, useRef, useMemo } from 'react';
 import Table from '../../components/Table.jsx';
 import { AuthContext } from '../../context/AuthContext.jsx';
+import { attendanceFlagKey, attendanceFlagLabel } from '../../utils/attendanceFlags.js';
 
 // --- API CONFIGURATION ---
 const computeApiBase = () => {
@@ -21,6 +22,50 @@ const __API_BASE = computeApiBase();
 const API_ENDPOINT = __API_BASE + '/reports';
 const USERS_ENDPOINT = __API_BASE + '/users'; 
 const ROOMS_ENDPOINT = __API_BASE + '/rooms'; 
+
+const isReportFlagColumn = (key) => {
+  const normalized = String(key || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  return ['flag_in', 'flag_check', 'flag_out'].includes(normalized);
+};
+
+const isReportFlagField = (value) => String(value || '').toLowerCase().includes('flag');
+
+const normalizeReportFlagValue = (value) => {
+  if (value === null || value === undefined || value === '') return value;
+  const raw = String(value).trim();
+  if (/^\d+$/.test(raw)) return attendanceFlagLabel(Number(raw));
+  return attendanceFlagLabel(null, raw);
+};
+
+const normalizeReportFlagReason = (value, field) => {
+  if (!isReportFlagField(field) || !value) return value;
+  return String(value).replace(/\bN\/A\b|\bNA\b/g, 'Upcoming');
+};
+
+const normalizeReportRow = (row, reportType) => {
+  const next = { ...(row || {}) };
+
+  if (reportType === 'attendance_records') {
+    Object.keys(next).forEach((key) => {
+      if (isReportFlagColumn(key)) next[key] = normalizeReportFlagValue(next[key]);
+    });
+  }
+
+  if (reportType === 'attendance_logs') {
+    const field = next.Field ?? next.field ?? '';
+    Object.keys(next).forEach((key) => {
+      const normalized = String(key || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      if (isReportFlagField(field) && (normalized === 'old_value' || normalized === 'new_value')) {
+        next[key] = normalizeReportFlagValue(next[key]);
+      }
+      if (normalized === 'reason') {
+        next[key] = normalizeReportFlagReason(next[key], field);
+      }
+    });
+  }
+
+  return next;
+};
 
 // --- D3 CHART COMPONENTS ---
 
@@ -320,7 +365,8 @@ export default function ReportsPage() {
       
       const apiCols = Array.isArray(data.columns) ? data.columns : [];
       setColumns(apiCols.map(c => ({ label: c, key: c })));
-      setRows(Array.isArray(data.rows) ? data.rows : []);
+      const reportRows = Array.isArray(data.rows) ? data.rows : [];
+      setRows(reportRows.map((row) => normalizeReportRow(row, report)));
 
     } catch (err) {
       console.error(err);
@@ -494,13 +540,19 @@ export default function ReportsPage() {
 
     // DATA PROCESSING BASED ON REPORT TYPE
     if (report === 'attendance_records') {
-        // PIE: Count Status (Present vs Late vs Absent)
-        const counts = { Present: 0, Late: 0, Absent: 0 };
+        // PIE: Count Status
+        const counts = { Present: 0, Late: 0, Absent: 0, Pending: 0, Upcoming: 0, Substituted: 0, 'On Leave': 0 };
         rows.forEach(r => {
             const status = String(r['Flag In'] || r.flag_in || '').toLowerCase();
-            if (status.includes('present')) counts.Present++;
-            else if (status.includes('late')) counts.Late++;
-            else counts.Absent++;
+            const key = attendanceFlagKey(null, status);
+            if (key === 'present') counts.Present++;
+            else if (key === 'late') counts.Late++;
+            else if (key === 'absent') counts.Absent++;
+            else if (key === 'pending') counts.Pending++;
+            else if (key === 'upcoming') counts.Upcoming++;
+            else if (key === 'substituted') counts.Substituted++;
+            else if (key === 'on_leave') counts['On Leave']++;
+            else counts.Upcoming++;
         });
         pie = Object.keys(counts).map(k => ({ label: k, value: counts[k] })).filter(d => d.value > 0);
 

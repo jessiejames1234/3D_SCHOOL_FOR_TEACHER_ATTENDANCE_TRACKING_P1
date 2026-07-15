@@ -6,6 +6,7 @@
 // Example cron job: */1 * * * * /usr/bin/php /path/to/your/project/server-php/scripts/update-missed-attendance.php
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/cron_worker_lib.php';
 
 echo "[CRON] Checking for missed attendance records at " . date('Y-m-d H:i:s') . "\n";
 
@@ -29,11 +30,31 @@ try {
 }
 
 try {
+    $mark_pending_sql = "
+        UPDATE tbl_attendance_records ar
+        JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id
+        SET
+            ar.flag_in_id = CASE WHEN ar.flag_in_id = 1 THEN 8 ELSE ar.flag_in_id END,
+            ar.flag_check_id = CASE WHEN ar.flag_check_id = 1 THEN 8 ELSE ar.flag_check_id END,
+            ar.flag_out_id = CASE WHEN ar.flag_out_id = 1 THEN 8 ELSE ar.flag_out_id END
+        WHERE (ar.flag_in_id = 1 OR ar.flag_check_id = 1 OR ar.flag_out_id = 1)
+          AND TIMESTAMP(ar.date, cs.start_time) <= NOW()
+          AND TIMESTAMP(ar.date, cs.end_time) >= NOW()
+    ";
+
+    $pending_result = $mysqli->query($mark_pending_sql);
+    if ($pending_result) {
+        echo "[CRON] Marked pending rows: " . (int)$mysqli->affected_rows . "\n";
+    } else {
+        echo "[CRON] Pending update failed: " . $mysqli->error . "\n";
+    }
+
+    $absentCandidates = cw_get_absent_notification_candidates($mysqli);
     $sql = "
         SELECT ar.attendance_id 
         FROM tbl_attendance_records ar 
         JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id 
-        WHERE (ar.flag_in_id = 1 OR ar.flag_check_id = 1 OR ar.flag_out_id = 1) 
+        WHERE (ar.flag_in_id IN (1, 8) OR ar.flag_check_id IN (1, 8) OR ar.flag_out_id IN (1, 8))
           AND TIMESTAMP(ar.date, cs.end_time) < NOW()
     ";
 
@@ -79,16 +100,21 @@ try {
     $update_sql = "
         UPDATE tbl_attendance_records 
         SET 
-            flag_in_id = CASE WHEN flag_in_id = 1 THEN 3 ELSE flag_in_id END, 
-            flag_check_id = CASE WHEN flag_check_id = 1 THEN 3 ELSE flag_check_id END, 
-            flag_out_id = CASE WHEN flag_out_id = 1 THEN 3 ELSE flag_out_id END 
+            flag_in_id = CASE WHEN flag_in_id IN (1, 8) THEN 3 ELSE flag_in_id END,
+            flag_check_id = CASE WHEN flag_check_id IN (1, 8) THEN 3 ELSE flag_check_id END,
+            flag_out_id = CASE WHEN flag_out_id IN (1, 8) THEN 3 ELSE flag_out_id END
         WHERE attendance_id IN ($id_list)
     ";
 
     $update_result = $mysqli->query($update_sql);
 
     if ($update_result) {
-        echo "[CRON] Successfully updated " . $mysqli->affected_rows . " records.\n";
+        $affectedRows = (int)$mysqli->affected_rows;
+        echo "[CRON] Successfully updated " . $affectedRows . " records.\n";
+        if ($affectedRows > 0 && !empty($absentCandidates)) {
+            $emailStats = cw_send_absent_notifications($mysqli, $absentCandidates);
+            echo "[CRON] Absent email notifications sent={$emailStats['sent']} failed={$emailStats['failed']} skipped={$emailStats['skipped']}.\n";
+        }
     } else {
         echo "[CRON] Error updating records: " . $mysqli->error . "\n";
     }

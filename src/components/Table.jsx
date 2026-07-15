@@ -68,6 +68,31 @@ function Table({
     setCurrentPage(target);
   };
 
+  const paginationItems = useMemo(() => {
+    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1);
+
+    const pages = new Set([1, totalPages, safeCurrentPage]);
+    if (safeCurrentPage <= 4) {
+      for (let p = 2; p <= 5; p++) pages.add(p);
+    } else if (safeCurrentPage >= totalPages - 3) {
+      for (let p = totalPages - 4; p < totalPages; p++) pages.add(p);
+    } else {
+      pages.add(safeCurrentPage - 1);
+      pages.add(safeCurrentPage + 1);
+    }
+
+    const sorted = Array.from(pages)
+      .filter((page) => page >= 1 && page <= totalPages)
+      .sort((a, b) => a - b);
+
+    const items = [];
+    sorted.forEach((page, idx) => {
+      if (idx > 0 && page - sorted[idx - 1] > 1) items.push(`ellipsis-${idx}`);
+      items.push(page);
+    });
+    return items;
+  }, [safeCurrentPage, totalPages]);
+
   const shouldIgnoreRowClick = (event) => {
     const target = event && event.target;
     if (!target || typeof target.closest !== 'function') return false;
@@ -298,8 +323,8 @@ function Table({
             </span>
           </div>
 
-          <nav aria-label="Pagination">
-            <ul className="inline-flex items-center -space-x-px rounded-md shadow-sm">
+          <nav aria-label="Pagination" className="max-w-full overflow-x-auto pb-1">
+            <ul className="inline-flex items-center gap-1 rounded-md">
               {/* Previous */}
               <li>
                 <button
@@ -313,18 +338,25 @@ function Table({
               </li>
 
               {/* Page Numbers */}
-              {Array.from({ length: totalPages }, (_, i) => i + 1).map((page) => {
-                // Simple logic to not show too many buttons if pages > 10 could be added here
-                // For now, keeping your exact logic
+              {paginationItems.map((item) => {
+                if (typeof item === 'string') {
+                  return (
+                    <li key={item}>
+                      <span className="inline-flex items-center justify-center px-2 py-2 text-gray-400">...</span>
+                    </li>
+                  );
+                }
+                const page = item;
                 const isActive = page === safeCurrentPage;
                 return (
                   <li key={page}>
                     <button
                       onClick={() => goToPage(page)}
-                      className={`px-3 py-2 leading-tight border transition-colors
+                      className={`px-3 py-2 leading-tight border rounded-md transition-colors
                         ${isActive 
                           ? 'z-10 text-white bg-green-600 border-green-600 hover:bg-green-700 hover:text-white' 
                           : 'text-gray-500 bg-white border-gray-300 hover:bg-gray-100 hover:text-gray-700'}`}
+                      style={{ minWidth: 40 }}
                     >
                       {page}
                     </button>

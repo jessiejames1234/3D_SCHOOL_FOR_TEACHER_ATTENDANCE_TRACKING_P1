@@ -2,6 +2,7 @@ import React from 'react';
 import Table from '../../components/Table.jsx';
 import Modal from '../../components/Modal.jsx';
 import { apiGet, apiPut } from '../../services/api.js';
+import { attendanceFlagKey, attendanceFlagLabel } from '../../utils/attendanceFlags.js';
 
 export default function AttendanceEditRequestPage() {
   const [rows, setRows] = React.useState([]);
@@ -21,11 +22,13 @@ export default function AttendanceEditRequestPage() {
   const triedAllForTargetRef = React.useRef(false);
 
   const FLAG_OPTIONS = [
-    { id: 1, name: 'NA' },
+    { id: 1, name: 'Upcoming' },
     { id: 2, name: 'Present' },
     { id: 3, name: 'Absent' },
-    { id: 4, name: 'Excused' },
+    { id: 4, name: 'Substituted' },
     { id: 5, name: 'Late' },
+    { id: 7, name: 'On Leave' },
+    { id: 8, name: 'Pending' },
   ];
 
   const toFlagId = (value, fallback = 1) => {
@@ -184,22 +187,18 @@ export default function AttendanceEditRequestPage() {
   };
 
   const getFlagLabel = (flagId, flagName) => {
-    if (flagName) return flagName;
-    const id = Number(flagId);
-    if (id === 1) return 'NA';
-    if (id === 2) return 'Present';
-    if (id === 3) return 'Absent';
-    if (id === 4) return 'Excused';
-    if (id === 5) return 'Late';
-    return flagId || '-';
+    return attendanceFlagLabel(flagId, flagName);
   };
 
   const flagBubbleClass = (flagId, flagName) => {
-    const label = String(getFlagLabel(flagId, flagName)).toLowerCase();
-    if (label === 'present') return 'bg-[#e8f5ee] text-[#1D8551] border-[#b7e0c9]';
-    if (label === 'absent') return 'bg-rose-100 text-rose-800 border-rose-300';
-    if (label === 'late') return 'bg-amber-100 text-amber-800 border-amber-300';
-    if (label === 'excused') return 'bg-blue-100 text-blue-800 border-blue-300';
+    const key = attendanceFlagKey(flagId, flagName);
+    if (key === 'present') return 'bg-[#e8f5ee] text-[#1D8551] border-[#b7e0c9]';
+    if (key === 'absent') return 'bg-rose-100 text-rose-800 border-rose-300';
+    if (key === 'late') return 'bg-amber-100 text-amber-800 border-amber-300';
+    if (key === 'substituted') return 'bg-blue-100 text-blue-800 border-blue-300';
+    if (key === 'on_leave') return 'bg-sky-100 text-sky-800 border-sky-300';
+    if (key === 'pending') return 'bg-orange-100 text-orange-800 border-orange-300';
+    if (key === 'upcoming') return 'bg-slate-100 text-slate-700 border-slate-300';
     return 'bg-slate-100 text-slate-700 border-slate-300';
   };
 
@@ -211,6 +210,7 @@ export default function AttendanceEditRequestPage() {
   );
 
   const pendingInView = String(viewRow?.status || '').toLowerCase() === 'pending';
+  const remarksLabel = pendingInView ? 'Current Attendance Remarks' : 'Reviewer Message';
 
   const buildApprovalChanges = () => {
     if (!viewRow) return {};
@@ -243,7 +243,15 @@ export default function AttendanceEditRequestPage() {
         </div>
       )
     },
-    { key: 'reason', label: 'Reason', render: (row) => row.reason || '-' },
+    {
+      key: 'reason',
+      label: 'Teacher Reason',
+      render: (row) => (
+        <div className="max-w-xs whitespace-normal break-words leading-snug">
+          {row.reason || '-'}
+        </div>
+      )
+    },
     { key: 'requester', label: 'Requester', render: (row) => row.requested_by_name || '-' },
     {
       key: 'status',
@@ -266,7 +274,7 @@ export default function AttendanceEditRequestPage() {
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
         <div>
           <h2 className="text-2xl font-bold text-gray-800">Attendance Edit Requests</h2>
-          <p className="text-sm text-gray-500">Dean review queue filtered by your department.</p>
+          <p className="text-sm text-gray-500">Department review queue filtered by your department.</p>
         </div>
         <button
           type="button"
@@ -401,6 +409,11 @@ export default function AttendanceEditRequestPage() {
               </div>
             </div>
 
+            <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
+              <div className="text-xs uppercase tracking-wide text-amber-700 font-semibold mb-2">Teacher Request Reason</div>
+              <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">{viewRow.reason || '-'}</div>
+            </div>
+
             {pendingInView ? (
               <div className="rounded-xl border border-[#b7e0c9] bg-[#e8f5ee]/60 p-4">
                 <div className="text-xs uppercase tracking-wide text-[#1D8551] font-semibold mb-3">Edit Flags Before Approve</div>
@@ -449,26 +462,21 @@ export default function AttendanceEditRequestPage() {
                 </div>
 
                 <div className="mt-3">
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">Attendance Remarks (optional)</label>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">Message to Teacher (optional)</label>
                   <textarea
                     value={approvalForm.remarks}
                     onChange={(e) => setApprovalForm((prev) => ({ ...prev, remarks: e.target.value }))}
                     rows={3}
                     className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1D8551]/35"
-                    placeholder="Add final remarks for attendance record"
+                    placeholder="Add a note the teacher can see after approval"
                   />
                 </div>
               </div>
             ) : null}
 
-            <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
-              <div className="text-xs uppercase tracking-wide text-amber-700 font-semibold mb-2">Reason</div>
-              <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">{viewRow.reason || '-'}</div>
-            </div>
-
             {viewRow.attendance_remarks ? (
               <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
-                <div className="text-xs uppercase tracking-wide text-slate-700 font-semibold mb-2">Attendance Remarks</div>
+                <div className="text-xs uppercase tracking-wide text-slate-700 font-semibold mb-2">{remarksLabel}</div>
                 <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">{viewRow.attendance_remarks}</div>
               </div>
             ) : null}

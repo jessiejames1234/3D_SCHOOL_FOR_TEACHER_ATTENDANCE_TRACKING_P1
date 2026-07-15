@@ -123,10 +123,15 @@ while (true) {
         if (!$realtime['ok']) {
             cw_log('[Worker][RealTimeAttendanceManager] failed: ' . implode(' | ', $realtime['errors']));
         } else {
+            $absentNotifications = $realtime['absent_notifications'] ?? ['sent' => 0, 'failed' => 0, 'skipped' => 0];
             cw_log(
                 '[Worker][RealTimeAttendanceManager] success'
                 . ' generated_rows=' . (int)$realtime['generated_rows']
+                . ' pending_rows=' . (int)($realtime['pending_rows'] ?? 0)
                 . ' auto_absent_rows=' . (int)$realtime['auto_absent_rows']
+                . ' absent_email_sent=' . (int)($absentNotifications['sent'] ?? 0)
+                . ' absent_email_failed=' . (int)($absentNotifications['failed'] ?? 0)
+                . ' absent_email_skipped=' . (int)($absentNotifications['skipped'] ?? 0)
             );
         }
     } catch (Throwable $e) {

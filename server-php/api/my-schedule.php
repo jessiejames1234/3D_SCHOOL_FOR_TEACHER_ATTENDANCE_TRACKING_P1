@@ -1,4 +1,4 @@
-<?php
+Developer: Restart Extension Host<?php
 // server-php/api/my-schedule.php
 global $mysqli;
 require_once __DIR__ . '/../helpers/socket_helper.php';

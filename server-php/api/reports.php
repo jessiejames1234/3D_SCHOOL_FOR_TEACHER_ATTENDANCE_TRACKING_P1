@@ -540,8 +540,8 @@ if ($report === 'classroom_utilization') {
                 
                 if ($reqRole === 1) {
                     // Admin: Can see everything, no extra filter needed.
-                } else if ($reqRole === 2) {
-                    // Dean: See own logs OR (same dept AND roles 3 [Program Head], 4 [Secretary], 5 [Teacher])
+                } else if (in_array($reqRole, [2, 6], true)) {
+                    // Dean / department admin: See own logs OR (same dept AND roles 3 [Program Head], 4 [Secretary], 5 [Teacher])
                     $sql .= " AND (l.user_id = ? OR (u.dept_id = ? AND u.role_id IN (3, 4, 5)))";
                     $types .= 'ii';
                     $params[] = $current_user_id;

@@ -5,7 +5,7 @@ import { AuthContext } from '../../context/AuthContext.jsx';
 
 export default function MyAttendance(){
   const { user } = React.useContext(AuthContext);
-  const canRequestEdit = [2, 3, 4, 5].includes(Number(user?.role_id));
+  const canRequestEdit = [2, 3, 4, 5, 6].includes(Number(user?.role_id));
   const [schedules, setSchedules] = React.useState([]);
   const [rooms, setRooms] = React.useState([]);
   const [schools, setSchools] = React.useState([]);

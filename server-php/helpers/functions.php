@@ -139,26 +139,26 @@ function app_permission_matrix() {
     }
 
     $matrix = [
-        'dashboard' => ['admin', 'dean', 'program_head', 'secretary'],
-        'faculty_dashboard' => ['dean', 'program_head', 'secretary', 'teacher'],
-        'users' => ['admin', 'dean', 'program_head', 'secretary'],
-        'attendance' => ['dean', 'program_head', 'secretary', 'teacher'],
-        'attendancemgmt' => ['admin', 'secretary', 'dean', 'program_head'],
-        'class_schedules' => ['admin', 'dean', 'program_head', 'secretary'],
-        '3d_building' => ['admin', 'dean', 'program_head', 'secretary'],
-        'attendance_edits' => ['dean'],
-        'schedule_edits' => ['dean', 'program_head', 'secretary'],
+        'dashboard' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        'faculty_dashboard' => ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+        'users' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        'attendance' => ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+        'attendancemgmt' => ['admin', 'secretary', 'dean', 'department_admin', 'program_head'],
+        'class_schedules' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        '3d_building' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        'attendance_edits' => ['dean', 'department_admin'],
+        'schedule_edits' => ['dean', 'department_admin', 'program_head', 'secretary'],
         'academic_admin' => ['admin'],
-        'academic_manage' => ['admin', 'dean', 'program_head', 'secretary'],
-        'academic_program' => ['admin', 'dean'],
+        'academic_manage' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        'academic_program' => ['admin', 'dean', 'department_admin'],
         'locations' => ['admin'],
-        'reports' => ['admin', 'dean', 'program_head', 'secretary', 'teacher'],
-        'leaves_file' => ['secretary'],
+        'reports' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+        'leaves_file' => ['admin', 'dean', 'department_admin', 'secretary'],
         'leaves_approvals' => ['admin', 'dean', 'program_head'],
-        'substitutions' => ['secretary', 'dean'],
-        'logs' => ['admin', 'dean', 'program_head', 'secretary'],
-        'settings' => ['admin', 'dean'],
-        'attendance_logs' => ['admin', 'dean', 'program_head'],
+        'substitutions' => ['admin', 'dean', 'department_admin', 'secretary'],
+        'logs' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+        'settings' => ['admin', 'dean', 'department_admin'],
+        'attendance_logs' => ['admin', 'dean', 'department_admin', 'program_head'],
     ];
 
     return $matrix;
@@ -171,6 +171,7 @@ function app_role_id_to_name_map() {
         3 => 'program_head',
         4 => 'secretary',
         5 => 'teacher',
+        6 => 'department_admin',
     ];
     return $map;
 }
@@ -179,6 +180,20 @@ function app_role_name_from_id($roleId) {
     $map = app_role_id_to_name_map();
     $rid = (int)$roleId;
     return $map[$rid] ?? null;
+}
+
+function app_format_role_name($roleName) {
+    // Convert role names to proper nouns with correct capitalization
+    // e.g., 'admin' => 'Admin', 'program_head' => 'Program Head'
+    $name = strtolower(trim((string)$roleName));
+
+    // Replace underscores with spaces
+    $name = str_replace('_', ' ', $name);
+
+    // Capitalize each word
+    $name = ucwords($name);
+
+    return $name;
 }
 
 function app_normalize_module_token($value) {

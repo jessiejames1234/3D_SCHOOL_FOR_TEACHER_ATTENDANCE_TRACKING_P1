@@ -169,7 +169,7 @@ function request_edit_apply_scope_filter($scope, $authRole, $authUserId, $authDe
         return;
     }
 
-    if (in_array($authRole, [2, 3, 4, 5], true)) {
+    if (in_array($authRole, [2, 3, 4, 5, 6], true)) {
         $sql .= " AND {$requestedByColumn} = ?";
         $types .= 'i';
         $params[] = $authUserId;
@@ -177,6 +177,19 @@ function request_edit_apply_scope_filter($scope, $authRole, $authUserId, $authDe
     }
 
     json_response(['error' => 'forbidden'], 403);
+}
+
+function request_edit_optional_note_selects($mysqli, $table, $alias) {
+    $fields = ['decision_note', 'dean_message', 'reviewer_note', 'approval_note', 'rejection_note'];
+    $select = '';
+    foreach ($fields as $field) {
+        if (column_exists($mysqli, $table, $field)) {
+            $select .= ", {$alias}.{$field} AS {$field}";
+        } else {
+            $select .= ", NULL AS {$field}";
+        }
+    }
+    return $select;
 }
 
 function build_schedule_schema($mysqli) {
@@ -314,6 +327,7 @@ if ($param1 === 'attendance') {
         $status = strtolower(trim((string)($_GET['status'] ?? '')));
         $validStatuses = ['pending', 'approved', 'rejected'];
         if (!in_array($status, $validStatuses, true)) $status = null;
+        $noteSelects = request_edit_optional_note_selects($mysqli, 'tbl_attendance_edit_requests', 'aer');
 
         $sql = "SELECT
                     aer.request_id,
@@ -322,7 +336,8 @@ if ($param1 === 'attendance') {
                     aer.reason,
                     aer.status,
                     aer.created_at,
-                    aer.decided_by,
+                    aer.decided_by
+                    {$noteSelects},
                     DATE_FORMAT(ar.date, '%Y-%m-%d') AS attendance_date,
                     TIME_FORMAT(ar.checked_in_at, '%H:%i:%s') AS checked_in_at,
                     TIME_FORMAT(ar.checked_mid_at, '%H:%i:%s') AS checked_mid_at,
@@ -367,7 +382,7 @@ if ($param1 === 'attendance') {
             $authRole,
             $authUserId,
             $authDeptId,
-            2,
+            [2, 6],
             'aer.requested_by',
             't.dept_id',
             $sql,
@@ -391,8 +406,8 @@ if ($param1 === 'attendance') {
     }
 
     if ($request_method === 'POST' && empty($param2)) {
-        if (!in_array((int)$authRole, [2, 3, 4, 5], true)) {
-            json_response(['error' => 'forbidden', 'message' => 'Only dean, program head, secretary, and teacher can submit attendance edit requests'], 403);
+        if (!in_array((int)$authRole, [2, 3, 4, 5, 6], true)) {
+            json_response(['error' => 'forbidden', 'message' => 'Only dean, department admin, program head, secretary, and teacher can submit attendance edit requests'], 403);
         }
 
         $attendanceId = isset($input['attendance_id']) ? (int)$input['attendance_id'] : 0;
@@ -438,13 +453,14 @@ if ($param1 === 'attendance') {
             $notifMessage = "{$requesterName} submitted an attendance edit request.";
             $notifLink = '/attendance-edit-requests?request_id=' . $requestId;
             notif_notify_role_dept($mysqli, 2, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
+            notif_notify_role_dept($mysqli, 6, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
         }
         json_response(['ok' => true, 'request_id' => $requestId], 201);
     }
 
     if (($request_method === 'PUT' || $request_method === 'POST') && is_numeric($param2)) {
-        if ($authRole !== 2) {
-            json_response(['error' => 'forbidden', 'message' => 'Only dean can decide attendance edit requests'], 403);
+        if (!in_array((int)$authRole, [2, 6], true)) {
+            json_response(['error' => 'forbidden', 'message' => 'Only dean and department admin can decide attendance edit requests'], 403);
         }
         $requestId = (int)$param2;
         $decision = strtolower(trim((string)($input['decision'] ?? $input['status'] ?? '')));
@@ -635,6 +651,7 @@ if ($param1 === 'schedule') {
         $status = strtolower(trim((string)($_GET['status'] ?? '')));
         $validStatuses = ['pending', 'approved', 'rejected'];
         if (!in_array($status, $validStatuses, true)) $status = null;
+        $noteSelects = request_edit_optional_note_selects($mysqli, 'tbl_schedule_edit_requests', 'ser');
 
         $sql = "SELECT
                     ser.request_id,
@@ -647,7 +664,8 @@ if ($param1 === 'schedule') {
                     ser.reason,
                     ser.status,
                     ser.requested_at,
-                    ser.approved_by,
+                    ser.approved_by
+                    {$noteSelects},
                     cs.room_id AS original_room_id,
                     LOWER(TRIM(cs.day_of_week)) AS original_day_of_week,
                     TIME_FORMAT(cs.start_time, '%H:%i:%s') AS original_start_time,
@@ -683,7 +701,7 @@ if ($param1 === 'schedule') {
             $authRole,
             $authUserId,
             $authDeptId,
-            [2, 3, 4],
+            [2, 3, 4, 6],
             'ser.requested_by',
             't.dept_id',
             $sql,
@@ -707,8 +725,8 @@ if ($param1 === 'schedule') {
     }
 
     if ($request_method === 'POST' && empty($param2)) {
-        if (!in_array((int)$authRole, [2, 3, 4, 5], true)) {
-            json_response(['error' => 'forbidden', 'message' => 'Only dean, program head, secretary, and teacher can submit schedule edit requests'], 403);
+        if (!in_array((int)$authRole, [2, 3, 4, 5, 6], true)) {
+            json_response(['error' => 'forbidden', 'message' => 'Only dean, department admin, program head, secretary, and teacher can submit schedule edit requests'], 403);
         }
 
         $scheduleId = isset($input['schedule_id']) ? (int)$input['schedule_id'] : 0;
@@ -801,6 +819,7 @@ if ($param1 === 'schedule') {
             $notifMessage = "{$requesterName} submitted a schedule edit request.";
             $notifLink = '/schedule-edit-requests?request_id=' . $requestId;
             notif_notify_role_dept($mysqli, 2, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
+            notif_notify_role_dept($mysqli, 6, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
             notif_notify_role_dept($mysqli, 3, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
             notif_notify_role_dept($mysqli, 4, (int)$authDeptId, $notifTitle, $notifMessage, $notifLink, $authUserId, $authUserId);
         }

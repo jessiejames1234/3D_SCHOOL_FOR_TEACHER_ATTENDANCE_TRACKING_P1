@@ -75,7 +75,11 @@ switch ($request_method) {
             $stmt->execute();
             $res = $stmt->get_result()->fetch_assoc();
             
-            if ($authRole && in_array($authRole, [2,3,4,5], true)) {
+            if ($authRole && (int)$authRole === 5) {
+                if (!$res || (int)($res['teacher_id'] ?? 0) !== (int)$authUserId) {
+                    json_response(['error'=>'forbidden'],403);
+                }
+            } elseif ($authRole && in_array($authRole, [2,3,4,6], true)) {
                 $authDept = resolve_auth_dept($mysqli, $authUserId);
                 if ($authDept === null || ($res && isset($res['dept_id']) && (int)$res['dept_id'] !== $authDept)) {
                     json_response(['error'=>'forbidden'],403);
@@ -86,7 +90,9 @@ switch ($request_method) {
 
         $sql = "SELECT l.*, lt.name_type, u.first_name, u.last_name, u.dept_id, ap.first_name AS approver_first, ap.last_name AS approver_last FROM tbl_leaves l LEFT JOIN tbl_leave_type lt ON l.leave_type_id = lt.leave_type_id LEFT JOIN tbl_users u ON l.teacher_id = u.user_id LEFT JOIN tbl_users ap ON l.approved_by = ap.user_id ORDER BY l.leave_id DESC";
         
-        if ($authRole && in_array($authRole, [2,3,4,5], true)) {
+        if ($authRole && (int)$authRole === 5) {
+            $sql = "SELECT l.*, lt.name_type, u.first_name, u.last_name, u.dept_id, ap.first_name AS approver_first, ap.last_name AS approver_last FROM tbl_leaves l LEFT JOIN tbl_leave_type lt ON l.leave_type_id = lt.leave_type_id LEFT JOIN tbl_users u ON l.teacher_id = u.user_id LEFT JOIN tbl_users ap ON l.approved_by = ap.user_id WHERE l.teacher_id = " . intval($authUserId) . " ORDER BY l.leave_id DESC";
+        } elseif ($authRole && in_array($authRole, [2,3,4,6], true)) {
             $authDept = resolve_auth_dept($mysqli, $authUserId);
             if ($authDept === null) json_response([], 200);
             $sql = "SELECT l.*, lt.name_type, u.first_name, u.last_name, u.dept_id, ap.first_name AS approver_first, ap.last_name AS approver_last FROM tbl_leaves l LEFT JOIN tbl_leave_type lt ON l.leave_type_id = lt.leave_type_id LEFT JOIN tbl_users u ON l.teacher_id = u.user_id LEFT JOIN tbl_users ap ON l.approved_by = ap.user_id WHERE u.dept_id = " . intval($authDept) . " ORDER BY l.leave_id DESC";
@@ -107,14 +113,14 @@ switch ($request_method) {
         if (!$teacher_id || !$date_from || !$date_to){ json_response(['error'=>'missing_fields'], 400); }
 
         if ($authRole) {
-            if ($authRole !== 2) {
-                json_response(['error'=>'forbidden','message'=>'Only dean can file leave records.'], 403);
-            } elseif ($authRole === 2) { 
+            if (!in_array((int)$authRole, [2, 6], true)) {
+                json_response(['error'=>'forbidden','message'=>'Only dean and department admin can file leave records.'], 403);
+            } else {
                 $tstmt = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
                 $tstmt->bind_param('i', $teacher_id); $tstmt->execute();
                 $trow = $tstmt->get_result()->fetch_assoc();
                 $authDept = resolve_auth_dept($mysqli, $authUserId);
-                if ($authDept === null || !$trow || $authDept !== (int)$trow['dept_id']) json_response(['error'=>'forbidden_dept', 'message'=>'Dean can only file leaves for users inside your department.'],403);
+                if ($authDept === null || !$trow || $authDept !== (int)$trow['dept_id']) json_response(['error'=>'forbidden_dept', 'message'=>'You can only file leaves for users inside your department.'],403);
             }
         }
 
@@ -190,10 +196,10 @@ switch ($request_method) {
 
         if ($authRole) { 
             $authDept = resolve_auth_dept($mysqli, $authUserId);
-            if ($authRole !== 2) {
-                 json_response(['error'=>'forbidden', 'message'=>'Only dean can edit leave records.'],403);
-            } elseif ($authRole === 2) {
-                 if ($authDept === null || (int)$row['dept_id'] !== $authDept) json_response(['error'=>'forbidden', 'message'=>'Dean cannot edit records outside your specific department.'],403);
+            if (!in_array((int)$authRole, [2, 6], true)) {
+                 json_response(['error'=>'forbidden', 'message'=>'Only dean and department admin can edit leave records.'],403);
+            } else {
+                 if ($authDept === null || (int)$row['dept_id'] !== $authDept) json_response(['error'=>'forbidden', 'message'=>'You cannot edit records outside your specific department.'],403);
             }
         }
 

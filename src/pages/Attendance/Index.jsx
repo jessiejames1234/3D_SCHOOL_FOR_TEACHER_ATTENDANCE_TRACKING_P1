@@ -76,7 +76,7 @@ const isInsideBox = (coords, room) => {
   const latRad = deg2rad(Number(room.latitude || 0));
   const metersPerDegLon = Math.max(1e-6, metersPerDegLat * Math.cos(latRad));
   const deltaLon = Number(room.radius) / metersPerDegLon;
-   
+    
   const minLat = Number(room.latitude) - deltaLat;
   const maxLat = Number(room.latitude) + deltaLat;
   const minLon = Number(room.longitude) - deltaLon;
@@ -127,35 +127,73 @@ const isRecordActiveNow = (record, now = new Date()) => {
 };
 
 const getFlagLabel = (flagId) => {
-  switch (flagId) {
-    case 1: return 'NA';
+  switch (Number(flagId)) {
+    case 1: return 'Upcoming';
     case 2: return 'Present';
     case 3: return 'Absent';
-    case 4: return 'Excused';
+    case 4: return 'Substituted';
     case 5: return 'Late';
+    case 7: return 'On Leave';
+    case 8: return 'Pending';
     default: return '—';
   }
+};
+
+// Status color map matching the attendance management page colors
+const getStatusColor = (flagId) => {
+  switch (Number(flagId)) {
+    case 1: return { bg: '#94a3b8', text: '#ffffff' }; // Upcoming - slate
+    case 2: return { bg: '#15803d', text: '#ffffff' }; // Present - green
+    case 3: return { bg: '#dc2626', text: '#ffffff' }; // Absent - red
+    case 4: return { bg: '#7c3aed', text: '#ffffff' }; // Substituted - violet
+    case 5: return { bg: '#f59e0b', text: '#0f172a' }; // Late - amber
+    case 7: return { bg: '#0ea5e9', text: '#ffffff' }; // On Leave - sky
+    case 8: return { bg: '#f97316', text: '#ffffff' }; // Pending - orange
+    default: return { bg: '#94a3b8', text: '#ffffff' }; // Default - slate
+  }
+};
+
+const getDayOfWeek = (dateStr) => {
+  if (!dateStr) return '';
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return '';
+  return days[d.getDay()];
+};
+
+const formatClockDate = (d) => {
+  if (!d || !(d instanceof Date) || isNaN(d.getTime())) return '—';
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  const month = months[d.getMonth()];
+  const day = d.getDate();
+  const year = d.getFullYear();
+  let hours = d.getHours();
+  const minutes = String(d.getMinutes()).padStart(2, '0');
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+  return `${month} ${day},${year} ${hours}:${minutes}${ampm}`;
 };
 
 export default function AttendanceIndex() {
   const [userId, setUserId] = React.useState(null);
   const [teacherName, setTeacherName] = React.useState('');
-   
+    
   const [records, setRecords] = React.useState([]);
   const [rooms, setRooms] = React.useState([]);
   const [floors, setFloors] = React.useState([]);
   const [buildings, setBuildings] = React.useState([]);
   const [currentBuilding, setCurrentBuilding] = React.useState(null);
-   
+    
   const [coords, setCoords] = React.useState(null);
   const [errorMessage, setErrorMessage] = React.useState(null);
   const [wrongFloorInfo, setWrongFloorInfo] = React.useState(null);
   const [filterMode, setFilterMode] = React.useState('today');
-   
+    
   const [actionAllowed, setActionAllowed] = React.useState(false);
   const [allowAt, setAllowAt] = React.useState(null);
   const [currentAction, setCurrentAction] = React.useState(null);
-   
+    
   const [isCameraVisible, setIsCameraVisible] = React.useState(false);
   const [detectedFloor, setDetectedFloor] = React.useState(null);
   const [usingDbFloor, setUsingDbFloor] = React.useState(false);
@@ -165,7 +203,7 @@ export default function AttendanceIndex() {
   const [previewActive, setPreviewActive] = React.useState(false);
   const scannerStartedRef = React.useRef(false);
   const handleCheckNowRef = React.useRef(null);
-   
+    
   const [nextSchedule, setNextSchedule] = React.useState(null);
   const [nextStartDate, setNextStartDate] = React.useState(null);
   const [nextSecondsLeft, setNextSecondsLeft] = React.useState(null);
@@ -175,6 +213,56 @@ export default function AttendanceIndex() {
   const [scannedQrToken, setScannedQrToken] = React.useState(null);
   const [scannedFloor, setScannedFloor] = React.useState(null);
   const [devicePlatform] = React.useState(() => detectDevicePlatform());
+  const [connectionQuality, setConnectionQuality] = React.useState(null);
+  const pingIntervalRef = React.useRef(null);
+
+  // State for parallel class modal
+  const [parallelModalData, setParallelModalData] = React.useState(null);
+  const [showParallelModal, setShowParallelModal] = React.useState(false);
+
+  const [nowClock, setNowClock] = React.useState(new Date());
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowClock(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  React.useEffect(() => {
+    const measurePing = async () => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setConnectionQuality({ rtt: null, effectiveType: 'offline', label: 'No Signal', color: '#6c757d' });
+        return;
+      }
+      const start = performance.now();
+      let ok = true;
+      try {
+        const ctrl = new AbortController();
+        const timeout = setTimeout(() => ctrl.abort(), 5000);
+        await fetch('/server-php/api/ping.json?t=' + Date.now(), { method: 'GET', cache: 'no-store', mode: 'no-cors', signal: ctrl.signal });
+        clearTimeout(timeout);
+      } catch (_) { ok = false; }
+      const elapsed = Math.round(performance.now() - start);
+      if (!ok) {
+        setConnectionQuality({ rtt: null, effectiveType: 'unknown', label: 'No Signal', color: '#6c757d' });
+        return;
+      }
+      const clamped = Math.min(Math.max(elapsed, 0), 999);
+      let label, color;
+      if (clamped < 100) { label = 'Good'; color = '#28a745'; }
+      else if (clamped < 200) { label = 'Fair'; color = '#ffc107'; }
+      else { label = 'Poor'; color = '#dc3545'; }
+      setConnectionQuality({ rtt: clamped, effectiveType: navigator.connection?.effectiveType || 'unknown', label, color });
+    };
+    measurePing();
+    const onOnline = () => measurePing();
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', () => setConnectionQuality({ rtt: null, effectiveType: 'offline', label: 'No Signal', color: '#6c757d' }));
+    pingIntervalRef.current = setInterval(measurePing, 3000);
+    return () => {
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOnline);
+    };
+  }, []);
   const [altitudeCalibration, setAltitudeCalibration] = React.useState(null);
   const LOCAL_STORAGE_KEY = 'attendance_scanned_qr_v1';
 
@@ -497,10 +585,57 @@ export default function AttendanceIndex() {
     return getActiveSchedules().filter(r => isSameScheduleGroup(r, base));
   }, [getActiveSchedules]);
 
+  const activeSchedule = React.useMemo(() => findActiveSchedule(), [findActiveSchedule]);
+  const activeScheduleGroup = React.useMemo(() => (
+    activeSchedule ? findMatchingScheduleGroup(activeSchedule) : []
+  ), [activeSchedule, findMatchingScheduleGroup]);
+
+  const getScheduleRoomName = React.useCallback((record) => {
+    if (!record) return '';
+    if (record.room_name) return String(record.room_name);
+    const room = rooms.find(r => Number(r.room_id) === Number(record.room_id));
+    return room?.room_name ? String(room.room_name) : '';
+  }, [rooms]);
+
+  const getParallelRoomNames = React.useCallback((record) => {
+    if (!record) return [];
+    const seen = new Set();
+    return records
+      .filter(other => {
+        if (!other || !isSameScheduleGroup(other, record)) return false;
+        const sameAttendance = other.attendance_id && record.attendance_id && String(other.attendance_id) === String(record.attendance_id);
+        const sameSchedule = other.schedule_id && record.schedule_id && String(other.schedule_id) === String(record.schedule_id);
+        return !(sameAttendance || sameSchedule);
+      })
+      .map(getScheduleRoomName)
+      .filter(name => {
+        const key = name.trim().toLowerCase();
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }, [records, getScheduleRoomName]);
+
+  const activeOtherParallelRoomNames = React.useMemo(() => (
+    activeSchedule ? getParallelRoomNames(activeSchedule) : []
+  ), [activeSchedule, getParallelRoomNames]);
+
+  const activeParallelRoomNames = React.useMemo(() => {
+    if (activeScheduleGroup.length <= 1) return [];
+    const seen = new Set();
+    return activeScheduleGroup
+      .map(getScheduleRoomName)
+      .filter(name => {
+        const key = name.trim().toLowerCase();
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }, [activeScheduleGroup, getScheduleRoomName]);
+
   const currentRoomObj = React.useMemo(() => {
-    const active = findActiveSchedule();
-    return active ? rooms.find(r => Number(r.room_id) === Number(active.room_id)) || null : null;
-  }, [records, rooms, findActiveSchedule]);
+    return activeSchedule ? rooms.find(r => Number(r.room_id) === Number(activeSchedule.room_id)) || null : null;
+  }, [activeSchedule, rooms]);
 
   const scheduledBuildingObj = React.useMemo(() => {
     if (!currentRoomObj || !Array.isArray(buildings)) return null;
@@ -863,26 +998,33 @@ export default function AttendanceIndex() {
     if (!Array.isArray(records)) return [];
     const now = new Date();
     const todayStr = formatDateYMD(now);
+    const activeFirst = (list) => list
+      .map((record, index) => ({ record, index, active: isRecordActiveNow(record, now) }))
+      .sort((a, b) => {
+        if (a.active !== b.active) return a.active ? -1 : 1;
+        return a.index - b.index;
+      })
+      .map(item => item.record);
     try {
       if (filterMode === 'today') {
-        return records.filter(r => r.date === todayStr);
+        return activeFirst(records.filter(r => r.date === todayStr));
       }
       if (filterMode === 'past') {
-        return records.filter(r => {
+        return activeFirst(records.filter(r => {
           if (!r.date || !r.end_time) return false;
           return new Date(`${r.date}T${r.end_time}`).getTime() < now.getTime();
-        });
+        }));
       }
       if (filterMode === 'future') {
-        return records.filter(r => {
+        return activeFirst(records.filter(r => {
           if (!r.date || !r.start_time) return false;
           return new Date(`${r.date}T${r.start_time}`).getTime() > now.getTime();
-        });
+        }));
       }
     } catch (e) {
-      return records;
+      return activeFirst(records);
     }
-    return records;
+    return activeFirst(records);
   }, [records, filterMode]);
 
   const currentDist = React.useMemo(() => (coords && currentRoomObj) 
@@ -1494,14 +1636,14 @@ export default function AttendanceIndex() {
         const end = new Date(`${r.date}T${r.end_time}`);
         return now >= start && now <= end;
       }) || null;
-   
+    
       if (!active) {
         setScannedQrToken(null);
         setScannedFloor(null);
         try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch(e){}
         return () => {};
       }
-   
+    
       const endTs = new Date(`${active.date}T${active.end_time}`).getTime();
       const msLeft = endTs - Date.now();
       if (msLeft <= 0) {
@@ -1510,7 +1652,7 @@ export default function AttendanceIndex() {
         try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch(e){}
         return () => {};
       }
-   
+    
       timer = setTimeout(() => {
         setScannedQrToken(null);
         setScannedFloor(null);
@@ -1530,48 +1672,164 @@ export default function AttendanceIndex() {
   const rawAltitudeLabel = attendanceAltitude.raw !== null ? `${Number(attendanceAltitude.raw).toFixed(1)}m` : 'N/A';
   const altitudeDisplayLabel = attendanceAltitude.calibrated ? `${altitudeLabel} (raw ${rawAltitudeLabel})` : altitudeLabel;
 
+  // Helper to render a status badge with color
+  const renderStatusBadge = (flagId, label) => {
+    const colors = getStatusColor(flagId);
+    return (
+      <span style={{ backgroundColor: colors.bg, color: colors.text, padding: '2px 10px', borderRadius: '12px', fontSize: '0.75rem', fontWeight: '800', display: 'inline-block' }}>
+        {label.toUpperCase()}
+      </span>
+    );
+  };
+
+  // Helper to get the status label for a check type
+  const getCheckStatus = (record, checkType) => {
+    if (!record) return { label: '—', flagId: null };
+    if (checkType === 'in') {
+      const flagId = record.flag_in_id != null ? Number(record.flag_in_id) : null;
+      if (flagId && flagId !== 1) return { label: getFlagLabel(flagId), flagId };
+      if (record.time_in) return { label: getFlagLabel(flagId || 2), flagId: flagId || 2 };
+      return { label: getFlagLabel(flagId || 1), flagId: flagId || 1 };
+    }
+    if (checkType === 'mid') {
+      const flagId = record.flag_check_id != null ? Number(record.flag_check_id) : null;
+      if (flagId && flagId !== 1) return { label: getFlagLabel(flagId), flagId };
+      if (record.time_check) return { label: getFlagLabel(flagId || 2), flagId: flagId || 2 };
+      return { label: getFlagLabel(flagId || 1), flagId: flagId || 1 };
+    }
+    if (checkType === 'out') {
+      const flagId = record.flag_out_id != null ? Number(record.flag_out_id) : null;
+      if (flagId && flagId !== 1) return { label: getFlagLabel(flagId), flagId };
+      if (record.time_out) return { label: getFlagLabel(flagId || 2), flagId: flagId || 2 };
+      return { label: getFlagLabel(flagId || 1), flagId: flagId || 1 };
+    }
+    return { label: '—', flagId: null };
+  };
+
+  // Helper to get parallel class data for a schedule
+  const getParallelClassData = (schedule) => {
+    if (!schedule) return [];
+    return records.filter(r => isSameScheduleGroup(r, schedule));
+  };
+
+  // Handle view parallel classes
+  const handleViewParallel = (schedule) => {
+    const parallelData = getParallelClassData(schedule);
+    setParallelModalData(parallelData);
+    setShowParallelModal(true);
+  };
+
+  // Render schedule card (used for both CURRENT and NEXT)
+  const renderScheduleCard = (title, schedule, isCurrent) => {
+    const isParallel = schedule && getParallelClassData(schedule).length > 1;
+    const dayOfWeek = schedule ? getDayOfWeek(schedule.date) : '';
+    const checkIn = getCheckStatus(schedule, 'in');
+    const checkMid = getCheckStatus(schedule, 'mid');
+    const checkOut = getCheckStatus(schedule, 'out');
+
+    return (
+      <div style={{ backgroundColor: '#e2e8f0', borderRadius: '16px', overflow: 'hidden', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)' }}>
+        <div style={{ backgroundColor: isCurrent ? '#15803d' : '#a3b1ab', color: isCurrent ? '#ffffff' : '#1e293b', padding: '12px 20px', fontSize: '1rem', fontWeight: '700', letterSpacing: '0.05em', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>{title}</span>
+          {isParallel && (
+            <span style={{ backgroundColor: isCurrent ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)', padding: '2px 10px', borderRadius: '12px', fontSize: '0.7rem', fontWeight: '800' }}>
+              PARALLEL
+            </span>
+          )}
+        </div>
+        {schedule ? (
+          <div style={{ padding: '20px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', fontSize: '0.9rem', color: '#334155', fontWeight: '600', lineHeight: '1.6' }}>
+            <div>
+              <div style={{ marginBottom: '4px' }}>SECTION: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.section_name || '—'}</span></div>
+              <div style={{ marginBottom: '16px' }}>SUBJECT: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.subject_code ? `${schedule.subject_code} - ${schedule.subject_name || ''}` : '—'}</span></div>
+              <div>BUILDING: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.building_name || '—'}</span></div>
+              <div>FLOOR: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.floor_name || '—'}</span></div>
+              <div>ROOM: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.room_name || '—'}</span></div>
+              {dayOfWeek && <div style={{ marginTop: '8px' }}>DAY: <span style={{ fontWeight: '700', color: '#0f172a' }}>{dayOfWeek}</span></div>}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-start' }}>
+              <div>SCHEDULE: <span style={{ fontWeight: '700', color: '#0f172a' }}>{`${formatTime12(schedule.start_time)} - ${formatTime12(schedule.end_time)}`}</span></div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                CHECK IN: {renderStatusBadge(checkIn.flagId, checkIn.label)}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                CHECK MID: {renderStatusBadge(checkMid.flagId, checkMid.label)}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                CHECK OUT: {renderStatusBadge(checkOut.flagId, checkOut.label)}
+              </div>
+              {isParallel && (
+                <button 
+                  onClick={() => handleViewParallel(schedule)}
+                  style={{ marginTop: '8px', border: 'none', backgroundColor: '#0f172a', color: '#ffffff', padding: '6px 16px', borderRadius: '8px', fontWeight: '700', fontSize: '0.8rem', cursor: 'pointer' }}
+                >
+                  VIEW PARALLEL CLASSES
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div style={{ padding: '28px', textAlign: 'center', color: '#64748b', fontSize: '0.95rem', fontWeight: '600' }}>
+            {isCurrent ? 'No active class schedule at the moment.' : 'No upcoming schedule found for today.'}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   // --- Render ---
   return (
-    <div className="attendance-container">
-      <div className="attendance-card">
+    <div className="attendance-container" style={{ padding: '24px', fontFamily: 'system-ui, -apple-system, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh' }}>
+      
+      {/* HEADER SECTION - Matches Reference Image Top Bar */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
+        <h1 style={{ margin: 0, fontSize: '2.2rem', fontWeight: '800', color: '#0f172a', letterSpacing: '-0.025em' }}>
+          {teacherName || 'John Lester Zarsosa'}
+        </h1>
+        <div style={{ backgroundColor: '#15803d', color: '#ffffff', padding: '10px 24px', borderRadius: '12px', fontSize: '1.2rem', fontWeight: '700', boxShadow: '0 4px 6px -1px rgba(21, 128, 61, 0.3)', letterSpacing: '0.025em' }}>
+          {formatClockDate(nowClock)}
+        </div>
+      </div>
+
+      {/* MAIN CONTAINER CARD */}
+      <div className="attendance-card" style={{ backgroundColor: '#ffffff', borderRadius: '20px', padding: '28px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01)', border: '1px solid #e2e8f0' }}>
         
-        {/* HEADER */}
-        <div className="attendance-header">
-          <h2 className="attendance-title">My Attendance {teacherName ? `– ${teacherName}` : ''}</h2>
-          <div className="header-actions">
-            {!coords && !errorMessage && <p style={{ margin: 0, fontSize: '0.85rem', color: '#666', marginRight: 10 }}>Waiting for location...</p>}
+        {/* CARD TOP BAR: Title & Scan QR Button */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
+          <h2 style={{ margin: 0, fontSize: '1.75rem', fontWeight: '700', color: '#1e293b' }}>My Attendance</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             {!coords && !errorMessage && (
-              <button onClick={startLocationTracking} className="action-btn gps-btn">
+              <button onClick={startLocationTracking} style={{ border: 'none', backgroundColor: '#e2e8f0', color: '#475569', padding: '10px 18px', borderRadius: '10px', fontWeight: '600', cursor: 'pointer', fontSize: '0.95rem' }}>
                 GPS
               </button>
             )}
             <button 
               onClick={openScannerWithPermission} 
               disabled={cameraPermission === 'denied'}
-              className="action-btn qr-btn"
+              style={{ border: 'none', backgroundColor: '#e2e8f0', color: '#1e293b', padding: '10px 24px', borderRadius: '10px', fontWeight: '700', cursor: 'pointer', fontSize: '0.95rem', transition: 'background-color 0.2s' }}
             >
               Scan QR
             </button>
           </div>
         </div>
 
-        {/* BANNERS (Building / Errors) - Full Width */}
-        <div className="attendance-banners">
+        {/* BANNERS (Building / Errors / Warnings) */}
+        <div className="attendance-banners" style={{ marginBottom: '20px' }}>
           {(currentBuilding || scheduledBuildingObj || scannedFloor || usingDbFloor || detectedFloor) && (
-            <div className="status-banner">
+            <div style={{ backgroundColor: '#f1f5f9', padding: '12px 16px', borderRadius: '10px', fontSize: '0.85rem', color: '#475569', marginBottom: '12px' }}>
               {currentBuilding && <div>Detected building: {currentBuilding.building_name || 'Building'} (radius {Math.round(Number(currentBuilding.radius || currentBuilding.building_radius || 0))}m)</div>}
-              {currentRoomObj && <div style={{ marginTop:6 }}>Scheduled building: {currentBuilding ? (scheduledBuildingObj? (scheduledBuildingObj.building_name || 'Building'): 'X') : 'X'}</div>}
+              {currentRoomObj && <div style={{ marginTop:4 }}>Scheduled building: {currentBuilding ? (scheduledBuildingObj? (scheduledBuildingObj.building_name || 'Building'): 'X') : 'X'}</div>}
 
               {isOutsideBuilding && currentRoomObj && scheduledBuildingObj && coords && (
-                <div className="error-banner">
+                <div style={{ color: '#dc2626', fontWeight: '600', marginTop: 4 }}>
                   You are outside {scheduledBuildingObj.building_name || 'the scheduled building'} by {Math.max(0, Math.round(getDistanceMeters(coords.latitude, coords.longitude, Number(scheduledBuildingObj.latitude), Number(scheduledBuildingObj.longitude)) - Number(scheduledBuildingObj.radius || scheduledBuildingObj.building_radius || 0)))}m — attendance denied
                 </div>
               )}
 
-              {scannedFloor && <div className="success-banner">QR validated — floor: {scannedFloor.floor_name || 'floor'}</div>}
-              {!scannedFloor && usingDbFloor && detectedFloor && <div className="success-banner">Using DB floor altitude — floor: {detectedFloor.floor_name || 'floor'}</div>}
+              {scannedFloor && <div style={{ color: '#16a34a', fontWeight: '600', marginTop: 4 }}>QR validated — floor: {scannedFloor.floor_name || 'floor'}</div>}
+              {!scannedFloor && usingDbFloor && detectedFloor && <div style={{ color: '#16a34a', fontWeight: '600', marginTop: 4 }}>Using DB floor altitude — floor: {detectedFloor.floor_name || 'floor'}</div>}
               {!scannedFloor && !usingDbFloor && detectedFloor && currentRoomObj && (
-                <div className="info-banner">
+                <div style={{ color: '#0284c7', fontWeight: '600', marginTop: 4 }}>
                   GPS-detected floor: {detectedFloor.floor_name || '...'} — expected: { (floors.find(f=>String(f.floor_id)===String(currentRoomObj.floor_id)) || {}).floor_name || 'scheduled floor' }
                 </div>
               )}
@@ -1579,122 +1837,234 @@ export default function AttendanceIndex() {
           )}
 
           {!userId && (
-            <div className="error-banner-box">
+            <div style={{ backgroundColor: '#fee2e2', color: '#991b1b', padding: '14px', borderRadius: '10px', marginBottom: '12px', fontSize: '0.9rem' }}>
               <div>No user selected. Open this page with a teacher id in the URL (e.g. ?userId=6) or log in.</div>
-              <div style={{ marginTop:8 }}><button onClick={()=> { const id = prompt('Enter test userId (e.g. 6)'); if (id) { setUserId(Number(id)); } }} className="test-user-btn">Use test user id</button></div>
+              <div style={{ marginTop:8 }}><button onClick={()=> { const id = prompt('Enter test userId (e.g. 6)'); if (id) { setUserId(Number(id)); } }} style={{ backgroundColor: '#991b1b', color: '#fff', border: 'none', padding: '6px 14px', borderRadius: '6px', cursor: 'pointer', fontWeight: '600' }}>Use test user id</button></div>
             </div>
           )}
 
-          {errorMessage && <div className="error-alert">{errorMessage}</div>}
+          {errorMessage && <div style={{ backgroundColor: '#fee2e2', color: '#b91c1c', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '600', fontSize: '0.9rem' }}>{errorMessage}</div>}
           {renderWrongFloorMessage()}
-          {notInAnyBuilding && <div className="warning-banner">You are not inside any known building. Move closer to the building or check location permissions.</div>}
+          {notInAnyBuilding && <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>You are not inside any known building. Move closer to the building or check location permissions.</div>}
           {isOutsideBuilding && currentRoomObj && !scheduledBuildingObj && (
-             <div className="warning-banner">You are not in the correct building for the active class. Move to the assigned building or scan the floor QR.</div>
+             <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>You are not in the correct building for the active class. Move to the assigned building or scan the floor QR.</div>
           )}
-          {isOutOfRange && currentRoomObj && <div className="warning-banner">You are out of range for the active class ({currentDist ? Math.round(currentDist) : 'N/A'}m away). Move closer to room '{currentRoomObj.room_name}'.</div>}
+          {activeParallelRoomNames.length > 1 && (
+            <div style={{ backgroundColor: '#e0f2fe', color: '#0369a1', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontSize: '0.9rem' }}>
+              Parallel class detected for the current time. Rooms in this class group: {activeParallelRoomNames.join(', ')}. Active schedules are shown first.
+            </div>
+          )}
+          {isOutOfRange && currentRoomObj && (
+            <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>
+              You are out of range for the active class ({currentDist ? Math.round(currentDist) : 'N/A'}m away). Move closer to room '{currentRoomObj.room_name}'{activeOtherParallelRoomNames.length > 0 ? ` or another parallel room: ${activeOtherParallelRoomNames.join(', ')}` : ''}.
+            </div>
+          )}
         </div>
 
-        {/* MAIN CONTENT GRID */}
-        <div className="attendance-grid">
+        {/* TWO-COLUMN UI LAYOUT EXACTLY MATCHING THE DESIGN */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: '24px' }}>
           
-          {/* LEFT COLUMN: Filters & List */}
-          <div className="attendance-left">
-            <div className="filter-group">
-              {['today', 'past', 'future'].map(mode => (
-                <button 
-                  key={mode} 
-                  onClick={() => setFilterMode(mode)} 
-                  className={`filter-pill ${filterMode === mode ? 'active' : ''}`}
-                >
-                  {/* Dynamic Labels restored */}
-                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                </button>
-              ))}
+          {/* LEFT COLUMN: Schedules */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
+            
+            {/* CURRENT SCHEDULE CARD */}
+            {renderScheduleCard('CURRENT SCHEDULE', activeSchedule, true)}
+
+            {/* NEXT SCHEDULE CARD */}
+            {renderScheduleCard('NEXT SCHEDULE', nextSchedule, false)}
+
+            {/* PRESERVED FILTER PILLS & LIST FOR EXTENDED USAGE */}
+            <div style={{ marginTop: '10px' }}>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                {['today', 'past', 'future'].map(mode => (
+                  <button 
+                    key={mode} 
+                    onClick={() => setFilterMode(mode)} 
+                    style={{ border: 'none', padding: '6px 14px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: '600', cursor: 'pointer', backgroundColor: filterMode === mode ? '#0f172a' : '#e2e8f0', color: filterMode === mode ? '#ffffff' : '#475569', transition: 'all 0.2s' }}
+                  >
+                    {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '250px', overflowY: 'auto' }}>
+                {filteredRecords.length > 0 ? filteredRecords.map(item => {
+                  const isActive = isRecordActiveNow(item);
+                  const parallelRooms = getParallelRoomNames(item);
+                  return (
+                    <div key={item.attendance_id || `${item.schedule_id}-${item.date}`} style={{ padding: '12px 16px', backgroundColor: isActive ? '#f0fdf4' : '#f8fafc', border: `1px solid ${isActive ? '#86efac' : '#e2e8f0'}`, borderRadius: '10px', fontSize: '0.85rem' }}>
+                      <div style={{ fontWeight: '700', color: '#0f172a', marginBottom: '4px' }}>{item.date} ({item.day_of_week || ''})</div>
+                      {isActive && <div style={{ color: '#16a34a', fontWeight: '600', fontSize: '0.75rem', marginBottom: '4px' }}>Current active schedule</div>}
+                      {parallelRooms.length > 0 && (
+                        <div style={{ color: '#0284c7', fontSize: '0.75rem', marginBottom: '4px' }}>
+                          Parallel room{parallelRooms.length > 1 ? 's' : ''}: {parallelRooms.join(', ')}
+                        </div>
+                      )}
+                      <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Class:</strong> {item.subject_code || ''} - {item.section_name || ''}</div>
+                      <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Time:</strong> {formatTime12(item.start_time)} - {formatTime12(item.end_time)}</div>
+                      <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Room:</strong> {item.room_name || ''}</div>
+                      <div style={{ display: 'flex', gap: '12px', marginTop: '6px', fontSize: '0.75rem', fontWeight: '600', color: '#334155' }}>
+                        <span>In: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_in_id)}</span></span>
+                        <span>Mid: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_check_id)}</span></span>
+                        <span>Out: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_out_id)}</span></span>
+                      </div>
+                    </div>
+                  );
+                }) : (
+                  <div style={{ color: '#64748b', fontSize: '0.85rem', padding: '12px 0' }}>No records for this filter.</div>
+                )}
+              </div>
             </div>
 
-            <div className="records-list">
-              {filteredRecords.length > 0 ? filteredRecords.map(item => (
-                <div key={item.attendance_id || `${item.schedule_id}-${item.date}`} className={`record-card ${isRecordActiveNow(item) ? 'record-card-active' : ''}`}>
-                  <div className="record-header">{item.date} ({item.day_of_week || ''})</div>
-                  <div><span className="record-label">Class:</span> {item.subject_code || ''} - {item.section_name || ''}</div>
-                  <div><span className="record-label">Time:</span> {formatTime12(item.start_time)} - {formatTime12(item.end_time)}</div>
-                  <div><span className="record-label">Room:</span> {item.room_name || ''}</div>
-                  <div><span className="record-label">Check In:</span> {getFlagLabel(item.flag_in_id)}</div>
-                  <div><span className="record-label">Mid Check:</span> {getFlagLabel(item.flag_check_id)}</div>
-                  <div><span className="record-label">Check Out:</span> {getFlagLabel(item.flag_out_id)}</div>
-                </div>
-              )) : (
-                <div className="no-records">No records for this filter.</div>
-              )}
-            </div>
           </div>
 
-          {/* RIGHT COLUMN: Action & Status */}
-          <div className="attendance-right">
-            <div className="status-panel">
-              <div className="panel-label">CURRENT ACTION</div>
-              
-              <div 
-                className={`action-status-btn ${actionAllowed && !isOutOfRange ? 'active' : 'inactive'}`}
-              >
-                 {actionAllowed && !isOutOfRange ? (currentAction ? `Automatically ${currentAction.replace('-', ' ')}` : 'Performing attendance') : (currentAction ? `Ready: ${currentAction.replace('-', ' ')}` : 'No Active Schedule')}
+          {/* RIGHT COLUMN: Action & Status Panel */}
+          <div style={{ backgroundColor: '#d1d5db', borderRadius: '20px', padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px', boxShadow: 'inset 0 2px 4px 0 rgba(0, 0, 0, 0.05)' }}>
+            
+            {/* CURRENT ACTION */}
+            <div>
+              <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#1e293b', marginBottom: '10px', letterSpacing: '0.025em' }}>CURRENT ACTION</div>
+              <div style={{ display: 'flex', justifyContent: 'center' }}>
+                <button 
+                  onClick={() => handleCheckNow(scannedQrToken)}
+                  style={{ backgroundColor: '#15803d', color: '#ffffff', border: 'none', padding: '12px 28px', borderRadius: '10px', fontWeight: '700', fontSize: '0.95rem', boxShadow: '0 4px 6px -1px rgba(21, 128, 61, 0.3)', cursor: 'pointer', transition: 'transform 0.1s', width: 'auto', minWidth: '220px' }}
+                >
+                  {actionAllowed && !isOutOfRange ? (currentAction ? `AUTOMATIC ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK') : (currentAction ? `READY: ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK')}
+                </button>
               </div>
-              
-              {!actionAllowed && allowAt && <div className="allow-at-text">Allowed at: {new Date(allowAt).toLocaleTimeString()}</div>}
-              
+              {!actionAllowed && allowAt && <div style={{ fontSize: '0.8rem', color: '#475569', textAlign: 'center', marginTop: '8px', fontWeight: '600' }}>Allowed at: {new Date(allowAt).toLocaleTimeString()}</div>}
               {nextSchedule && (
-                <div className="next-schedule-info">
-                   Next: {nextSchedule.subject_code} at {formatTime12(nextSchedule.start_time)}
-                   <br/>
-                   {nextSecondsLeft != null ? `Starts in ${nextCountdownStr()}` : ''}
+                <div style={{ fontSize: '0.8rem', color: '#334155', textAlign: 'center', marginTop: '8px', fontWeight: '600' }}>
+                   Next: {nextSchedule.subject_code} at {formatTime12(nextSchedule.start_time)} ({nextSecondsLeft != null ? `Starts in ${nextCountdownStr()}` : ''})
                 </div>
               )}
+            </div>
 
-              <div className="panel-label mt-4">QR STATUS</div>
-              <div className="qr-status-box">
+            {/* QR STATUS */}
+            <div>
+              <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#1e293b', marginBottom: '10px', letterSpacing: '0.025em' }}>QR STATUS</div>
+              <div style={{ backgroundColor: '#15803d', color: '#ffffff', padding: '14px', borderRadius: '12px', textAlign: 'center', fontWeight: '700', fontSize: '0.85rem', lineHeight: '1.5', boxShadow: '0 4px 6px -1px rgba(21, 128, 61, 0.2)', position: 'relative' }}>
                 {!scannedQrToken ? (
-                  <div className="qr-text-inactive">No QR scanned</div>
+                  <div>
+                    <div>NO QR SCANNED YET</div>
+                    <div style={{ fontWeight: '600', opacity: 0.9, fontSize: '0.75rem', marginTop: '4px' }}>Scan room QR code to verify vertical altitude</div>
+                  </div>
                 ) : (
-                  <div className="qr-text-active">
-                      <strong>Scanned: </strong> {(scannedFloor && scannedFloor.floor_name) ? scannedFloor.floor_name : scannedQrToken}
-                      {scannedFloor && (
-                        <div className={`qr-range-info ${scannedFloorInRange ? 'text-success' : 'text-danger'}`}>
-                          {scannedFloorInRange ? 'On scanned floor' : 'Not on scanned floor'}
-                          <br/>
-                          Range: {scannedFloorRange ? `${Number(scannedFloorRange.min).toFixed(1)}m - ${Number(scannedFloorRange.max).toFixed(1)}m` : 'N/A'}
-                          <br/>
-                          Baseline: {scannedFloorRange ? Number(scannedFloorRange.base).toFixed(1) + 'm' : 'N/A'}. Your alt: {altitudeDisplayLabel}
-                        </div>
-                      )}
-                      
-                      {/* Fallback floor detection restored */}
-                      {(!scannedFloorInRange && altDetectedFloor) && (
-                        <div style={{ marginTop: 6, fontSize: 12, color: '#0c5460' }}>
-                          Detected floor by GPS: {altDetectedFloor.floor_name || 'Unknown'}
-                        </div>
-                      )}
-
-                      <button className="clear-qr-btn" onClick={() => { setScannedQrToken(null); setScannedFloor(null); try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch(e){} }}>✕</button>
+                  <div>
+                    <div>SCANNED: {(scannedFloor && scannedFloor.floor_name) ? scannedFloor.floor_name.toUpperCase() : scannedQrToken}</div>
+                    {scannedFloor && (
+                      <div style={{ fontWeight: '600', opacity: 0.9 }}>
+                        {scannedFloorInRange ? 'ON SCANNED FLOOR' : 'NOT ON SCANNED FLOOR'} | BASELINE: {scannedFloorRange ? Number(scannedFloorRange.base).toFixed(2) + 'm' : 'N/A'}
+                      </div>
+                    )}
+                    {(!scannedFloorInRange && altDetectedFloor) && (
+                      <div style={{ marginTop: 4, fontSize: '0.75rem', opacity: 0.85 }}>
+                        Detected floor by GPS: {altDetectedFloor.floor_name || 'Unknown'}
+                      </div>
+                    )}
+                    <button style={{ position: 'absolute', right: '10px', top: '10px', background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1rem', fontWeight: 'bold' }} onClick={() => { setScannedQrToken(null); setScannedFloor(null); try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch(e){} }}>✕</button>
                   </div>
                 )}
               </div>
-
-               {/* Condensed GPS Info */}
-               {coords && (
-                 <div className="gps-mini-debug">
-                   <div className="panel-label mt-2">GPS STATUS</div>
-                   GPS: {coords.latitude.toFixed(5)}, {coords.longitude.toFixed(5)} <br/>
-                    Acc: {coords.accuracy?.toFixed(1)}m | Alt: {altitudeDisplayLabel} | Device: {devicePlatform}
-                   <br/>
-                   {roomGuideLabel}: {nearestRoomLabel ? nearestRoomLabel.name : 'X'}
-                 </div>
-               )}
             </div>
+
+            {/* GPS COORDINATE */}
+            <div>
+              <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#1e293b', marginBottom: '10px', letterSpacing: '0.025em' }}>GPS COORDINATE</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '0.85rem', color: '#334155', fontWeight: '600', marginBottom: '8px' }}>
+                <div>LATITUDE: <span style={{ color: '#0f172a' }}>{coords?.latitude ? coords.latitude.toFixed(7) : '—'}</span></div>
+                <div>LONGITUDE: <span style={{ color: '#0f172a' }}>{coords?.longitude ? coords.longitude.toFixed(7) : '—'}</span></div>
+              </div>
+              <div style={{ fontSize: '0.85rem', color: '#334155', fontWeight: '600', marginBottom: '14px' }}>
+                ALTITUDE: <span style={{ color: '#0f172a' }}>{attendanceAltitude.normalized !== null ? Number(attendanceAltitude.normalized).toFixed(3) : '—'}</span>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.1fr', gap: '12px', alignItems: 'center' }}>
+                <div style={{ fontSize: '0.85rem', color: '#334155', fontWeight: '600', lineHeight: '1.6' }}>
+                  <div>CAMPUS: <span style={{ color: '#0f172a' }}>{activeSchedule?.campus_name || '—'}</span></div>
+                  <div>BUILDING: <span style={{ color: '#0f172a' }}>{currentBuilding?.building_name || activeSchedule?.building_name || '—'}</span></div>
+                  <div>FLOOR: <span style={{ color: '#0f172a' }}>{detectedFloor?.floor_name || activeSchedule?.floor_name || '—'}</span></div>
+                  <div>ROOM: <span style={{ color: '#0f172a' }}>{currentRoomObj?.room_name || activeSchedule?.room_name || '—'}</span></div>
+                </div>
+                <div style={{ backgroundColor: isOutOfRange ? '#dc2626' : '#15803d', color: '#ffffff', padding: '14px 12px', borderRadius: '12px', textAlign: 'center', fontWeight: '800', fontSize: '0.75rem', lineHeight: '1.4', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '64px' }}>
+                  {!activeSchedule ? "NO ACTIVE CLASS SCHEDULE" : isOutOfRange ? "YOU'RE CURRENTLY OUTSIDE OF YOUR SCHEDULED ROOM" : "YOU'RE CURRENTLY INSIDE OF YOUR SCHEDULED ROOM"}
+                </div>
+              </div>
+            </div>
+
+            {/* PRESERVED WIFI SPEED & MINI DEBUG */}
+            <div style={{ borderTop: '1px solid #9ca3af', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {connectionQuality && (
+                <div style={{ fontSize: '0.8rem', color: '#334155', fontWeight: '600' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: '700', color: '#475569', marginBottom: '4px' }}>WIFI SPEED</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontWeight: '700', color: connectionQuality.color }}>● {connectionQuality.label}</span>
+                    <span style={{ color: '#475569' }}>{connectionQuality.rtt !== null ? `${connectionQuality.rtt}ms` : ''}{connectionQuality.effectiveType && connectionQuality.effectiveType !== 'offline' ? `, ${connectionQuality.effectiveType}` : ''}</span>
+                  </div>
+                </div>
+              )}
+              {coords && (
+                <div style={{ fontSize: '0.75rem', color: '#475569', lineHeight: '1.4' }}>
+                  <div style={{ fontWeight: '700', color: '#334155' }}>GPS STATUS</div>
+                  Acc: {coords.accuracy?.toFixed(1)}m | Device: {devicePlatform} | {roomGuideLabel}: {nearestRoomLabel ? nearestRoomLabel.name : 'X'}
+                </div>
+              )}
+            </div>
+
           </div>
 
         </div>
 
-        {/* Modal remains at bottom */}
+        {/* PARALLEL CLASS MODAL */}
+        <Modal show={showParallelModal} title="Parallel Classes" onClose={() => setShowParallelModal(false)}>
+          <div style={{ minWidth: 400, maxHeight: '70vh', overflowY: 'auto' }}>
+            {parallelModalData && parallelModalData.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                {parallelModalData.map((item, idx) => {
+                  const checkIn = getCheckStatus(item, 'in');
+                  const checkMid = getCheckStatus(item, 'mid');
+                  const checkOut = getCheckStatus(item, 'out');
+                  return (
+                    <div key={item.attendance_id || `${item.schedule_id}-${item.date}-${idx}`} style={{ padding: '16px', backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '12px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ fontWeight: '700', color: '#0f172a', fontSize: '1rem' }}>
+                          {item.section_name || 'Section ' + (idx + 1)}
+                        </div>
+                        <div style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: '600' }}>
+                          {item.date} ({getDayOfWeek(item.date)})
+                        </div>
+                      </div>
+                      <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '4px' }}>
+                        <strong>Subject:</strong> {item.subject_code ? `${item.subject_code} - ${item.subject_name || ''}` : '—'}
+                      </div>
+                      <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '4px' }}>
+                        <strong>Time:</strong> {formatTime12(item.start_time)} - {formatTime12(item.end_time)}
+                      </div>
+                      <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '4px' }}>
+                        <strong>Room:</strong> {item.room_name || '—'} | <strong>Building:</strong> {item.building_name || '—'} | <strong>Floor:</strong> {item.floor_name || '—'}
+                      </div>
+                      <div style={{ display: 'flex', gap: '16px', marginTop: '8px', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: '600' }}>
+                          CHECK IN: {renderStatusBadge(checkIn.flagId, checkIn.label)}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: '600' }}>
+                          CHECK MID: {renderStatusBadge(checkMid.flagId, checkMid.label)}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: '600' }}>
+                          CHECK OUT: {renderStatusBadge(checkOut.flagId, checkOut.label)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div style={{ padding: '20px', textAlign: 'center', color: '#64748b', fontSize: '0.9rem' }}>
+                No parallel class data available.
+              </div>
+            )}
+          </div>
+        </Modal>
+
+        {/* PRESERVED MODAL FOR CAMERA QR SCANNING */}
         <Modal show={isCameraVisible} title="Scan QR Code" onClose={() => setIsCameraVisible(false)}>
           <div style={{ position: 'relative', minWidth: 300, minHeight: 300 }}>
             {previewActive && (

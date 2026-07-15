@@ -1,6 +1,7 @@
+import React from 'react';
+import { apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
-import { connectLiveUpdates } from "../../utils/liveUpdates.js";
 
 function DepartmentIndex(){
   const currentUser = React.useMemo(() => { try { return JSON.parse(localStorage.getItem('user') || 'null'); } catch(e) { return null; } }, []);
@@ -24,102 +25,48 @@ function DepartmentIndex(){
     }
   };
 
-  React.useEffect(()=>{
-    (async ()=>{
-      try{
-        const [d, ds] = await Promise.all([apiGet('departments'), apiGet('deans')]);
-        // normalize and cache full list
-        const normalized = Array.isArray(d) ? d.map(x => ({ ...x, _status: String(x.status || '').toLowerCase().trim() })) : [];
-        setAllDepartments(normalized);
-        const list = normalized.filter(x => x._status !== 'archive');
-        setDepartments(list);
-        setDeans(Array.isArray(ds)?ds:[]);
-      }catch(e){ console.error(e); setError('Failed to load departments or deans'); }
-    })();
-  }, []);
+  const loadDepartments = React.useCallback(async ()=>{
+    try{
+      const [d, ds] = await Promise.all([apiGet('departments'), apiGet('deans')]);
+      const normalized = Array.isArray(d) ? d.map(x => ({ ...x, _status: String(x.status || '').toLowerCase().trim() })) : [];
+      setAllDepartments(normalized);
+      setDepartments(showArchived ? normalized.filter(x => x._status === 'archive') : normalized.filter(x => x._status !== 'archive'));
+      setDeans(Array.isArray(ds)?ds:[]);
+    }catch(e){ console.error(e); setError('Failed to load departments or deans'); }
+  }, [showArchived]);
 
   React.useEffect(()=>{
-    let socket = null;
-    let closedByUs = false;
-    let reconnectMs = 1000;
-    const maxReconnect = 30000;
-    let reconnectTimer = null;
-    const handleEntityUpdate = (payload) => {
-      if (!(payload && payload.entity === 'departments')) return;
-      const action = payload.action;
-      const id = Number(payload.dept_id || payload.id || 0);
-      setAllDepartments(prev => {
-        const list = Array.isArray(prev) ? [...prev] : [];
-        if (action === 'create' && id) {
-          const exists = list.find(x => Number(x.dept_id) === id);
-          if (!exists) list.unshift({ ...payload, _status: String(payload.status || '').toLowerCase() });
-        } else if ((action === 'update' || action === 'toggle') && id) {
-          const idx = list.findIndex(x => Number(x.dept_id) === id);
-          if (idx !== -1) {
-            list[idx] = { ...list[idx], ...payload, _status: String(payload.status || list[idx].status || '').toLowerCase() };
-          }
-        } else if (action === 'archive' && id) {
-          const idx = list.findIndex(x => Number(x.dept_id) === id);
-          if (idx !== -1) {
-            list[idx] = { ...list[idx], status: 'archive', _status: 'archive' };
-          }
-        }
-        const visible = showArchived ? list.filter(u => u._status === 'archive') : list.filter(u => u._status !== 'archive');
-        setDepartments(visible);
-        return list;
-      });
-    };
+    loadDepartments();
+  }, [loadDepartments]);
 
-    const connect = ()=>{
+  React.useEffect(()=>{
+    let cancelled = false;
+    let refreshing = false;
+
+    const refreshViaHttps = async ()=>{
+      if (cancelled || document.hidden || refreshing) return;
+      refreshing = true;
       try {
-        socket = connectLiveUpdates({
-          onConnect: ()=>{
-            reconnectMs = 1000;
-          },
-          onRefresh: async ()=>{
-            try{
-              const d = await apiGet('departments');
-              const ds = await apiGet('deans');
-              const normalized = Array.isArray(d)? d.map(x => ({ ...x, _status: String(x.status || '').toLowerCase().trim() })) : [];
-              setAllDepartments(normalized);
-              setDepartments(showArchived ? normalized.filter(u=>u._status==='archive') : normalized.filter(u=>u._status!=='archive'));
-              setDeans(Array.isArray(ds)? ds: []);
-            }catch(err){ console.error('Failed to refresh departments on socket event', err); }
-          },
-          onEntityUpdate: handleEntityUpdate,
-          onError: (err)=>{
-            console.error('Socket.IO error', err);
-            if (!closedByUs) scheduleReconnect();
-            try { if (socket) socket.close(); } catch(e) {}
-          },
-          onDisconnect: ()=>{
-            if (closedByUs) return;
-            scheduleReconnect();
-          },
-        });
+        await loadDepartments();
       } catch(e) {
-        console.error('Socket.IO create error', e);
-        scheduleReconnect();
+        console.error('Failed to refresh departments via HTTPS', e);
+      } finally {
+        refreshing = false;
       }
     };
 
-    const scheduleReconnect = ()=>{
-      if (reconnectTimer) return;
-      reconnectTimer = setTimeout(()=>{
-        reconnectTimer = null;
-        reconnectMs = Math.min(maxReconnect, Math.floor(reconnectMs * 1.5));
-        connect();
-      }, reconnectMs);
-    };
-
-    connect();
+    const intervalId = window.setInterval(refreshViaHttps, 3000);
+    const handleFocusRefresh = ()=> refreshViaHttps();
+    window.addEventListener('focus', handleFocusRefresh);
+    document.addEventListener('visibilitychange', handleFocusRefresh);
 
     return ()=>{
-      closedByUs = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      try { if (socket) socket.close(); } catch(e) {}
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleFocusRefresh);
+      document.removeEventListener('visibilitychange', handleFocusRefresh);
     };
-  }, [showArchived]);
+  }, [loadDepartments]);
 
   const handleToggleShowArchived = async ()=>{
     const next = !showArchived;
@@ -181,17 +128,17 @@ function DepartmentIndex(){
 
   const handleChange = (e)=> setForm(p=>({...p, [e.target.name]: e.target.value}));
 
+  const deanOptions = React.useMemo(() => {
+    return Array.isArray(deans) ? deans : [];
+  }, [deans]);
+
   const validateForm = () => {
     const name = (form.dept_name||'').trim();
     if (!name) return 'Department name is required';
     // duplicate name check (case-insensitive), exclude editing dept
-    const conflictName = departments.find(d => d.dept_name && String(d.dept_name).toLowerCase() === name.toLowerCase() && (!editing || Number(d.dept_id) !== Number(editing.dept_id)));
+    const sourceDepartments = Array.isArray(allDepartments) ? allDepartments : departments;
+    const conflictName = sourceDepartments.find(d => d.dept_name && String(d.dept_name).toLowerCase() === name.toLowerCase() && (!editing || Number(d.dept_id) !== Number(editing.dept_id)));
     if (conflictName) return 'A department with the same name already exists';
-    // dean assigned to another department check
-    if (form.dean_id) {
-      const conflictDean = departments.find(d => Number(d.dean_id) === Number(form.dean_id) && (!editing || Number(d.dept_id) !== Number(editing.dept_id)));
-      if (conflictDean) return 'Selected dean is already assigned to another department';
-    }
     return null;
   };
 
@@ -327,7 +274,7 @@ function DepartmentIndex(){
             <label className="block text-sm font-medium text-gray-700 mb-1">Dean</label>
             <select name="dean_id" value={form.dean_id} onChange={handleChange} className="block w-full border border-gray-200 rounded px-3 py-2">
               <option value="">No dean assigned</option>
-              {deans.map(dn => <option key={dn.user_id} value={dn.user_id}>{dn.first_name} {dn.last_name}</option>)}
+              {deanOptions.map(dn => <option key={dn.user_id} value={dn.user_id}>{dn.first_name} {dn.last_name}</option>)}
             </select>
           </div>
 

@@ -22,7 +22,7 @@ if (!empty($authHeader) && preg_match('/Bearer\s+(\S+)/i', $authHeader, $m)) {
     try {
         $decoded = \Firebase\JWT\JWT::decode($token, new \Firebase\JWT\Key($secret_key, 'HS256'));
         $authUserId = isset($decoded->user_id) ? (int)$decoded->user_id : null;
-    } catch (Throwable $_) { /* ignore invalid token for logging */ }
+    } catch (Throwable $_) { /* ignore   invalid token for logging */ }
 }
 
 global $mysqli;

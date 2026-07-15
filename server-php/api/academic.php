@@ -70,13 +70,13 @@ $getProgramScopeRow = function(int $programId) use ($mysqli) {
 };
 
 $requireAcademicManageAccess = function(string $resourceLabel) use ($authRole) {
-    if (in_array((int)$authRole, [1, 2], true)) return;
-    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can manage {$resourceLabel}."], 403);
+    if (in_array((int)$authRole, [1, 2, 6], true)) return;
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin, dean, and department admin can manage {$resourceLabel}."], 403);
 };
 
 $requireAcademicCreateAccess = function(string $resourceLabel) use ($authRole) {
-    if (in_array((int)$authRole, [1, 2], true)) return;
-    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can create {$resourceLabel}."], 403);
+    if (in_array((int)$authRole, [1, 2, 6], true)) return;
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin, dean, and department admin can create {$resourceLabel}."], 403);
 };
 
 $assertProgramScopeAccess = function(int $programId, string $resourceLabel) use ($authRole, $authDeptId, $getProgramScopeRow) {
@@ -87,17 +87,58 @@ $assertProgramScopeAccess = function(int $programId, string $resourceLabel) use 
 
     if ((int)$authRole === 1) return $program;
 
-    if ((int)$authRole === 2) {
+    if (in_array((int)$authRole, [2, 6], true)) {
         if ($authDeptId === null) {
-            json_response(['error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+            json_response(['error' => 'forbidden', 'message' => 'This account is not assigned to a department.'], 403);
         }
         if ((int)($program['dept_id'] ?? 0) !== (int)$authDeptId) {
-            json_response(['error' => 'forbidden', 'message' => "Dean can only manage {$resourceLabel} within programs in their assigned department."], 403);
+            json_response(['error' => 'forbidden', 'message' => "You can only manage {$resourceLabel} within programs in your assigned department."], 403);
         }
         return $program;
     }
 
-    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin and dean can manage {$resourceLabel}."], 403);
+    json_response(['error' => 'forbidden', 'message' => "View-only access. Only admin, dean, and department admin can manage {$resourceLabel}."], 403);
+};
+
+$academicColumnExists = function(string $table, string $column) use ($mysqli): bool {
+    $tbl = $mysqli->real_escape_string($table);
+    $col = $mysqli->real_escape_string($column);
+    $res = $mysqli->query("SHOW COLUMNS FROM `{$tbl}` LIKE '{$col}'");
+    return $res && $res->num_rows > 0;
+};
+
+$syncDepartmentDeanUser = function(int $deptId, ?int $newDeanId, ?int $oldDeanId = null) use ($mysqli) {
+    if ($newDeanId !== null && $newDeanId > 0) {
+        $setNew = $mysqli->prepare("UPDATE tbl_users SET dept_id = ? WHERE user_id = ? AND role_id = 2");
+        if ($setNew) {
+            $setNew->bind_param('ii', $deptId, $newDeanId);
+            $setNew->execute();
+        }
+    }
+};
+
+$validateProgramHeadOwner = function(?int $headId, int $programId, ?int $deptId = null) use ($mysqli) {
+    if ($headId === null || $headId <= 0) return;
+
+    $uq = $mysqli->prepare("SELECT user_id, role_id FROM tbl_users WHERE user_id = ? LIMIT 1");
+    if (!$uq) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+    $uq->bind_param('i', $headId);
+    $uq->execute();
+    $urow = $uq->get_result()->fetch_assoc();
+    if (!$urow) json_response(['error' => 'invalid_program_head', 'message' => 'Selected program head user does not exist.'], 400);
+    if ((int)($urow['role_id'] ?? 0) !== 3) json_response(['error' => 'invalid_program_head_role', 'message' => 'Selected user is not a program head.'], 400);
+};
+
+$syncProgramHeadUser = function(int $programId, ?int $deptId, ?int $newHeadId, ?int $oldHeadId = null) use ($mysqli, $academicColumnExists) {
+    if (!$academicColumnExists('tbl_users', 'assigned_program_head_id')) return;
+
+    if ($newHeadId !== null && $newHeadId > 0) {
+        $setUser = $mysqli->prepare("UPDATE tbl_users SET dept_id = ?, assigned_program_head_id = ? WHERE user_id = ? AND role_id = 3");
+        if ($setUser) {
+            $setUser->bind_param('iii', $deptId, $programId, $newHeadId);
+            $setUser->execute();
+        }
+    }
 };
 // =================================================================================
 
@@ -145,13 +186,14 @@ switch ($endpoint) {
             }
 
             // Normal update
-            $chk = $mysqli->prepare("SELECT dept_id, dept_name FROM tbl_departments WHERE dept_id = ? LIMIT 1");
+            $chk = $mysqli->prepare("SELECT dept_id, dept_name, dean_id FROM tbl_departments WHERE dept_id = ? LIMIT 1");
             if (!$chk) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $chk->bind_param("i", $deptId);
             $chk->execute();
             $exists = $chk->get_result()->fetch_assoc();
             if (!$exists) json_response(['error' => 'not_found', 'message' => 'Department not found'], 404);
             $oldName = $exists['dept_name']; 
+            $oldDeanId = isset($exists['dean_id']) && $exists['dean_id'] !== null ? (int)$exists['dean_id'] : null;
 
             $fields = [];
             $types = '';
@@ -192,12 +234,6 @@ switch ($endpoint) {
 
                 // If requester is a dean, they may only assign themselves as dean
                 if ($authRole === 2 && $newDeanId !== $authUserId) json_response(['error' => 'forbidden', 'message' => 'Dean users cannot assign another user as dean'], 403);
-
-                $ddup = $mysqli->prepare("SELECT dept_id FROM tbl_departments WHERE dean_id = ? AND dept_id <> ? LIMIT 1");
-                if (!$ddup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-                $ddup->bind_param("ii", $newDeanId, $deptId);
-                $ddup->execute();
-                if ($ddup->get_result()->fetch_assoc()) json_response(['error' => 'dean_in_use', 'message' => 'Selected dean is already assigned to another department.'], 409);
             }
 
             $sql = "UPDATE tbl_departments SET " . implode(', ', $fields) . " WHERE dept_id = ?";
@@ -206,6 +242,11 @@ switch ($endpoint) {
             $types .= 'i'; $values[] = $deptId;
             $stmt->bind_param($types, ...$values);
             if (!$stmt->execute()) json_response(['error' => 'update_failed', 'message' => $stmt->error], 500);
+
+            if (array_key_exists('dean_id', $input)) {
+                $nextDeanId = ($input['dean_id'] === '' || $input['dean_id'] === null) ? null : (int)$input['dean_id'];
+                $syncDepartmentDeanUser($deptId, $nextDeanId, $oldDeanId);
+            }
             
             $targetName = isset($input['dept_name']) ? $input['dept_name'] : $oldName;
             log_system_action($mysqli, $authUserId, 'update_department', "Updated Department details for '$targetName'");
@@ -240,14 +281,6 @@ switch ($endpoint) {
             if ($dup->get_result()->fetch_assoc()) json_response(['error' => 'duplicate_department', 'message' => 'A department with the same name already exists.'], 409);
 
             if ($hasDean) {
-                $ddup = $mysqli->prepare("SELECT dept_id FROM tbl_departments WHERE dean_id = ? LIMIT 1");
-                if (!$ddup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-                $ddup->bind_param("i", $deanId);
-                $ddup->execute();
-                if ($ddup->get_result()->fetch_assoc()) json_response(['error' => 'dean_in_use', 'message' => 'Selected dean is already assigned to another department.'], 409);
-            }
-
-            if ($hasDean) {
                 $stmt = $mysqli->prepare("INSERT INTO tbl_departments (dept_name, dean_id, status) VALUES (?, ?, 'active')");
                 if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $stmt->bind_param("si", $name, $deanId);
@@ -257,11 +290,15 @@ switch ($endpoint) {
                 $stmt->bind_param("s", $name);
             }
             if (!$stmt->execute()) json_response(['error' => 'insert_failed', 'message' => $stmt->error], 500);
+            $newDeptId = (int)$stmt->insert_id;
+            if ($hasDean) {
+                $syncDepartmentDeanUser($newDeptId, $deanId, null);
+            }
             
             log_system_action($mysqli, $authUserId, 'create_department', "Created new department: $name");
 
-            try { trigger_socket_update(['entity' => 'departments', 'action' => 'create', 'dept_id' => $stmt->insert_id]); } catch (Throwable $_) {}
-            json_response(['dept_id' => $stmt->insert_id, 'dept_name' => $name, 'dean_id' => $deanId], 201);
+            try { trigger_socket_update(['entity' => 'departments', 'action' => 'create', 'dept_id' => $newDeptId]); } catch (Throwable $_) {}
+            json_response(['dept_id' => $newDeptId, 'dept_name' => $name, 'dean_id' => $deanId], 201);
         }
         break;
 
@@ -278,7 +315,7 @@ switch ($endpoint) {
             if ($authRole && $authRole !== 1) {
                 if ($authRole === 3) { // program_head
                     $sql = $base . " WHERE p.head_id = " . intval($authUserId) . " ORDER BY d.dept_name, p.program_name";
-                } elseif (in_array($authRole, [2,4], true)) { // dean or secretary
+                } elseif (in_array($authRole, [2,4,6], true)) { // dean, department admin, or secretary
                     // Resolve dept of auth user
                     $deptQ = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
                     if ($deptQ) {
@@ -335,13 +372,15 @@ switch ($endpoint) {
             }
 
             // Normal update
-            $chk = $mysqli->prepare("SELECT program_id, program_name FROM tbl_programs WHERE program_id = ? LIMIT 1");
+            $chk = $mysqli->prepare("SELECT program_id, program_name, dept_id, head_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
             if (!$chk) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $chk->bind_param("i", $programId);
             $chk->execute();
             $exists = $chk->get_result()->fetch_assoc();
             if (!$exists) json_response(['error' => 'not_found', 'message' => 'Program not found'], 404);
             $oldName = $exists['program_name'];
+            $oldHeadId = isset($exists['head_id']) && $exists['head_id'] !== null ? (int)$exists['head_id'] : null;
+            $oldDeptId = isset($exists['dept_id']) && $exists['dept_id'] !== null ? (int)$exists['dept_id'] : null;
 
             $fields = [];
             $types = '';
@@ -355,7 +394,15 @@ switch ($endpoint) {
                 $values[] = (!empty($input['dept_id'])) ? (int)$input['dept_id'] : null; 
             }
             
-            if (isset($input['head_id'])) { $fields[] = 'head_id = ?'; $types .= 'i'; $values[] = (int)$input['head_id']; }
+            if (array_key_exists('head_id', $input)) {
+                if ($input['head_id'] === '' || $input['head_id'] === null) {
+                    $fields[] = 'head_id = NULL';
+                } else {
+                    $fields[] = 'head_id = ?';
+                    $types .= 'i';
+                    $values[] = (int)$input['head_id'];
+                }
+            }
             if (isset($input['status'])) { $fields[] = 'status = ?'; $types .= 's'; $values[] = $input['status']; }
 
             if (empty($fields)) json_response(['message' => 'Nothing to update'], 200);
@@ -369,13 +416,11 @@ switch ($endpoint) {
                 if ($dup->get_result()->fetch_assoc()) json_response(['error' => 'duplicate_program', 'message' => 'A program with the same name already exists.'], 409);
             }
 
-            if (isset($input['head_id']) && $input['head_id'] !== '') {
-                $hid = (int)$input['head_id'];
-                $hdup = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE head_id = ? AND program_id <> ? LIMIT 1");
-                if (!$hdup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-                $hdup->bind_param("ii", $hid, $programId);
-                $hdup->execute();
-                if ($hdup->get_result()->fetch_assoc()) json_response(['error' => 'head_in_use', 'message' => 'Selected program head is already assigned to another program.'], 409);
+            $candidateDeptId = array_key_exists('dept_id', $input)
+                ? ((!empty($input['dept_id'])) ? (int)$input['dept_id'] : null)
+                : $oldDeptId;
+            if (array_key_exists('head_id', $input) && $input['head_id'] !== '' && $input['head_id'] !== null) {
+                $validateProgramHeadOwner((int)$input['head_id'], $programId, $candidateDeptId);
             }
 
             $sql = "UPDATE tbl_programs SET " . implode(', ', $fields) . " WHERE program_id = ?";
@@ -384,6 +429,13 @@ switch ($endpoint) {
             $types .= 'i'; $values[] = $programId;
             $stmt->bind_param($types, ...$values);
             if (!$stmt->execute()) json_response(['error' => 'update_failed', 'message' => $stmt->error], 500);
+
+            if (array_key_exists('head_id', $input) || array_key_exists('dept_id', $input)) {
+                $nextHeadId = array_key_exists('head_id', $input)
+                    ? (($input['head_id'] === '' || $input['head_id'] === null) ? null : (int)$input['head_id'])
+                    : $oldHeadId;
+                $syncProgramHeadUser($programId, $candidateDeptId, $nextHeadId, $oldHeadId);
+            }
             
             // LOGGING
             $targetName = isset($input['program_name']) ? $input['program_name'] : $oldName;
@@ -396,13 +448,14 @@ switch ($endpoint) {
             if ((int)$authRole !== 1) {
                 json_response(['error' => 'forbidden', 'message' => 'View-only access. Only admin can create programs.'], 403);
             }
-            if (empty($input['program_name']) || !isset($input['head_id'])) json_response(['error' => 'validation', 'message' => 'program_name and head_id are required'], 400);
+            if (empty($input['program_name'])) json_response(['error' => 'validation', 'message' => 'program_name is required'], 400);
             $name = trim((string)$input['program_name']);
             
             // UPDATED: Set deptId to null if empty
             $deptId = (!empty($input['dept_id'])) ? (int)$input['dept_id'] : null;
             
-            $headId = (int)$input['head_id'];
+            $hasHead = array_key_exists('head_id', $input) && $input['head_id'] !== '' && $input['head_id'] !== null;
+            $headId = $hasHead ? (int)$input['head_id'] : null;
 
             // Only check dept existence if not null
             if ($deptId !== null) {
@@ -419,22 +472,30 @@ switch ($endpoint) {
             $dup->execute();
             if ($dup->get_result()->fetch_assoc()) json_response(['error' => 'duplicate_program', 'message' => 'A program with the same name already exists.'], 409);
 
-            $hdup = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE head_id = ? LIMIT 1");
-            if (!$hdup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-            $hdup->bind_param("i", $headId);
-            $hdup->execute();
-            if ($hdup->get_result()->fetch_assoc()) json_response(['error' => 'head_in_use', 'message' => 'Selected program head is already assigned to another program.'], 409);
+            if ($hasHead) {
+                $validateProgramHeadOwner($headId, 0, $deptId);
+            }
 
-            $stmt = $mysqli->prepare("INSERT INTO tbl_programs (program_name, dept_id, head_id, status) VALUES (?, ?, ?, 'active')");
-            if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
-            $stmt->bind_param("sii", $name, $deptId, $headId);
+            if ($hasHead) {
+                $stmt = $mysqli->prepare("INSERT INTO tbl_programs (program_name, dept_id, head_id, status) VALUES (?, ?, ?, 'active')");
+                if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+                $stmt->bind_param("sii", $name, $deptId, $headId);
+            } else {
+                $stmt = $mysqli->prepare("INSERT INTO tbl_programs (program_name, dept_id, head_id, status) VALUES (?, ?, NULL, 'active')");
+                if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+                $stmt->bind_param("si", $name, $deptId);
+            }
             if (!$stmt->execute()) json_response(['error' => 'insert_failed', 'message' => $stmt->error], 500);
+            $newProgramId = (int)$stmt->insert_id;
+            if ($hasHead) {
+                $syncProgramHeadUser($newProgramId, $deptId, $headId, null);
+            }
             
             // LOGGING
             log_system_action($mysqli, $authUserId, 'create_program', "Created new program: $name");
 
-            try { trigger_socket_update(['entity' => 'programs', 'action' => 'create', 'program_id' => $stmt->insert_id]); } catch (Throwable $_) {}
-            json_response(['program_id' => $stmt->insert_id, 'program_name' => $name, 'dept_id' => $deptId, 'head_id' => $headId], 201);
+            try { trigger_socket_update(['entity' => 'programs', 'action' => 'create', 'program_id' => $newProgramId]); } catch (Throwable $_) {}
+            json_response(['program_id' => $newProgramId, 'program_name' => $name, 'dept_id' => $deptId, 'head_id' => $headId], 201);
         }
         break;
 
@@ -444,7 +505,7 @@ switch ($endpoint) {
             $baseSql = "SELECT sec.section_id, sec.program_id, sec.year_id, sec.section_name, sec.status, p.program_name, p.dept_id, p.head_id, y.level FROM tbl_sections sec JOIN tbl_programs p ON sec.program_id = p.program_id LEFT JOIN tbl_year_level y ON sec.year_id = y.year_id";
             if ((int)$authRole === 3) {
                 $sql = $baseSql . " WHERE p.head_id = " . intval($authUserId) . " ORDER BY p.program_name, sec.section_name";
-            } elseif (in_array((int)$authRole, [2, 4], true)) {
+            } elseif (in_array((int)$authRole, [2, 4, 6], true)) {
                 if ($authDeptId === null) json_response([]);
                 $sql = $baseSql . " WHERE p.dept_id = " . intval($authDeptId) . " ORDER BY p.program_name, sec.section_name";
             } elseif ((int)$authRole === 1 || $authRole === null) {
@@ -1508,7 +1569,7 @@ switch ($endpoint) {
             $baseSql = "SELECT s.subject_id, s.subject_code, s.subject_name, s.program_id, p.program_name, s.status, p.head_id, p.dept_id FROM tbl_subject s LEFT JOIN tbl_programs p ON s.program_id = p.program_id";
             if ((int)$authRole === 3) {
                 $sql = $baseSql . " WHERE p.head_id = " . intval($authUserId) . " ORDER BY p.program_name, s.subject_code";
-            } elseif (in_array((int)$authRole, [2, 4], true)) {
+            } elseif (in_array((int)$authRole, [2, 4, 6], true)) {
                 if ($authDeptId === null) json_response([]);
                 $sql = $baseSql . " WHERE p.dept_id = " . intval($authDeptId) . " ORDER BY p.program_name, s.subject_code";
             } elseif ((int)$authRole === 1 || $authRole === null) {

@@ -16,49 +16,11 @@ const swalFire = (title, text, icon) => {
   return Promise.resolve();
 };
 
-// Helper function to get the next date for a given day of the week (Timezone Safe)
-const getNextDateForDay = (dayName) => {
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const targetDay = days.findIndex(d => d.toLowerCase() === dayName.toLowerCase());
-  if (targetDay === -1) return '';
-
-  const today = new Date();
-  const currentDay = today.getDay();
-  let daysUntil = targetDay - currentDay;
-
-  // If the day has already passed this week, schedule it for next week
-  if (daysUntil < 0) {
-    daysUntil += 7;
-  } else if (daysUntil === 0) {
-    // If it's today, keep it as today
-    daysUntil = 0; 
-  }
-
-  const targetDate = new Date(today);
-  targetDate.setDate(today.getDate() + daysUntil);
-  
-  // Build the YYYY-MM-DD string using local time to avoid UTC off-by-one errors
-  const year = targetDate.getFullYear();
-  const month = String(targetDate.getMonth() + 1).padStart(2, '0');
-  const day = String(targetDate.getDate()).padStart(2, '0');
-  
-  return `${year}-${month}-${day}`;
-};
-
 const sameId = (a, b) => String(a ?? '') === String(b ?? '');
 
 const getScheduleOffering = (schedule, offerings) => {
   if (!schedule || schedule.offering_id == null) return null;
   return offerings.find(o => sameId(o.offering_id, schedule.offering_id)) || null;
-};
-
-const getScheduleTeacherId = (schedule, offerings) => {
-  const directTeacherId = schedule?.teacher_id ?? schedule?.user_id ?? schedule?.original_teacher_id ?? null;
-  if (directTeacherId !== null && directTeacherId !== undefined && String(directTeacherId) !== '') {
-    return String(directTeacherId);
-  }
-  const offering = getScheduleOffering(schedule, offerings);
-  return offering?.user_id !== null && offering?.user_id !== undefined ? String(offering.user_id) : '';
 };
 
 const buildScheduleLabel = (schedule, offerings) => {
@@ -72,9 +34,19 @@ const buildScheduleLabel = (schedule, offerings) => {
   return `${subjectCode}${sectionName ? ` - ${sectionName}` : ''} (${day} ${start}-${end})${room}`;
 };
 
+const buildAvailableScheduleLabel = (schedule) => {
+  const subjectCode = schedule?.subject_code || schedule?.subject_name || 'Class';
+  const sectionName = schedule?.section_name || '';
+  const day = schedule?.day_of_week || '';
+  const start = schedule?.start_time?.slice(0, 5) || '';
+  const end = schedule?.end_time?.slice(0, 5) || '';
+  const room = schedule?.room_name ? ` | ${schedule.room_name}` : '';
+  return `${subjectCode}${sectionName ? ` - ${sectionName}` : ''} (${day} ${start}-${end})${room}`;
+};
+
 export default function SubstituteIndex() {
   const { user } = React.useContext(AuthContext); 
-  const isDean = Number(user?.role_id) === 2;
+  const isDean = [2, 6].includes(Number(user?.role_id));
   const canAddSubstitution = isDean;
   const [rows, setRows] = React.useState([]);
   
@@ -82,6 +54,8 @@ export default function SubstituteIndex() {
   const [teachers, setTeachers] = React.useState([]);
   const [schedules, setSchedules] = React.useState([]);
   const [offerings, setOfferings] = React.useState([]);
+  const [availableSchedules, setAvailableSchedules] = React.useState([]);
+  const [availableLoading, setAvailableLoading] = React.useState(false);
   
   const [loading, setLoading] = React.useState(false);
   const [showModal, setShowModal] = React.useState(false);
@@ -185,18 +159,35 @@ export default function SubstituteIndex() {
     }
   }, [user]);
 
-  const availableSchedules = React.useMemo(() => {
-    if (!form.original_teacher_id) return [];
-    const teacherSchedules = schedules.filter(s => sameId(getScheduleTeacherId(s, offerings), form.original_teacher_id));
+  React.useEffect(() => {
+    let cancelled = false;
+    const loadAvailableSchedules = async () => {
+      if (!form.original_teacher_id) {
+        setAvailableSchedules([]);
+        setAvailableLoading(false);
+        return;
+      }
+      setAvailableSchedules([]);
+      setAvailableLoading(true);
+      try {
+        const data = await apiGet(`substitute/available?teacher_id=${encodeURIComponent(form.original_teacher_id)}`);
+        if (!cancelled) {
+          setAvailableSchedules(Array.isArray(data) ? data.map(row => ({
+            ...row,
+            label: buildAvailableScheduleLabel(row)
+          })) : []);
+        }
+      } catch (e) {
+        console.error('Failed to load available substitution schedules', e);
+        if (!cancelled) setAvailableSchedules([]);
+      } finally {
+        if (!cancelled) setAvailableLoading(false);
+      }
+    };
 
-    return teacherSchedules.map(s => {
-      return {
-        schedule_id: s.schedule_id,
-        day_of_week: s.day_of_week, 
-        label: buildScheduleLabel(s, offerings)
-      };
-    });
-  }, [form.original_teacher_id, offerings, schedules]);
+    loadAvailableSchedules();
+    return () => { cancelled = true; };
+  }, [form.original_teacher_id]);
 
   // Handle Select / Input changes
   const handleChange = (e) => {
@@ -210,23 +201,21 @@ export default function SubstituteIndex() {
   };
 
   // Handle Checkbox toggles for batch selection
-  const handleScheduleToggle = (schedule_id, day_of_week) => {
-    const calculatedDate = getNextDateForDay(day_of_week);
-    
+  const handleScheduleToggle = (schedule_id, date) => {
     setForm(prev => {
-      const isAlreadySelected = prev.selectedSchedules.some(s => String(s.schedule_id) === String(schedule_id));
+      const isAlreadySelected = prev.selectedSchedules.some(s => String(s.schedule_id) === String(schedule_id) && String(s.date) === String(date));
       
       if (isAlreadySelected) {
         // Remove from array if unchecked
         return { 
           ...prev, 
-          selectedSchedules: prev.selectedSchedules.filter(s => String(s.schedule_id) !== String(schedule_id)) 
+          selectedSchedules: prev.selectedSchedules.filter(s => !(String(s.schedule_id) === String(schedule_id) && String(s.date) === String(date)))
         };
       } else {
         // Add to array if checked
         return { 
           ...prev, 
-          selectedSchedules: [...prev.selectedSchedules, { schedule_id, date: calculatedDate }] 
+          selectedSchedules: [...prev.selectedSchedules, { schedule_id, date }]
         };
       }
     });
@@ -235,7 +224,7 @@ export default function SubstituteIndex() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!canAddSubstitution) {
-      return swalFire('Not allowed', 'Only dean can add substitutions.', 'warning');
+      return swalFire('Not allowed', 'Only dean and department admin can add substitutions.', 'warning');
     }
     if (form.selectedSchedules.length === 0 || !form.substitute_id) {
         return swalFire('Missing Details', 'Please select a substitute and at least one class schedule.', 'warning');
@@ -267,7 +256,7 @@ export default function SubstituteIndex() {
       fetchRows(); 
 
     } catch (err) {
-      const errorMessage = err.response?.data?.message || err.message || 'An unexpected error occurred.';
+      const errorMessage = err.body?.message || err.body?.error || err.message || 'An unexpected error occurred.';
       swalFire('Error', errorMessage, 'error');
     }
   };
@@ -375,26 +364,25 @@ export default function SubstituteIndex() {
               </div>
             ) : availableSchedules.length === 0 ? (
               <div className="p-3 bg-gray-50 border rounded text-sm text-gray-500 text-center">
-                No classes found for this teacher.
+                {availableLoading ? 'Loading available classes...' : 'No active attendance records are available for substitution this week.'}
               </div>
             ) : (
               <div className="border rounded max-h-48 overflow-y-auto bg-gray-50 p-2 space-y-2">
                 {availableSchedules.map(s => {
-                  const isChecked = form.selectedSchedules.some(sel => String(sel.schedule_id) === String(s.schedule_id));
-                  const autoDate = getNextDateForDay(s.day_of_week);
+                  const isChecked = form.selectedSchedules.some(sel => String(sel.schedule_id) === String(s.schedule_id) && String(sel.date) === String(s.date));
                   
                   return (
-                    <label key={s.schedule_id} className={`flex items-start gap-3 p-2 border rounded cursor-pointer transition-colors ${isChecked ? 'bg-green-50 border-green-300' : 'bg-white hover:bg-gray-100'}`}>
+                    <label key={`${s.schedule_id}-${s.date}`} className={`flex items-start gap-3 p-2 border rounded cursor-pointer transition-colors ${isChecked ? 'bg-green-50 border-green-300' : 'bg-white hover:bg-gray-100'}`}>
                       <input 
                         type="checkbox" 
                         className="mt-1 w-4 h-4 text-green-600 rounded focus:ring-green-500"
                         checked={isChecked}
-                        onChange={() => handleScheduleToggle(s.schedule_id, s.day_of_week)}
+                        onChange={() => handleScheduleToggle(s.schedule_id, s.date)}
                       />
                       <div className="flex-1">
                         <div className="font-medium text-sm text-gray-800">{s.label}</div>
                         <div className="text-xs text-green-700 mt-0.5 font-semibold">
-                          Will be scheduled for: {autoDate}
+                          Attendance date: {s.date}
                         </div>
                       </div>
                     </label>

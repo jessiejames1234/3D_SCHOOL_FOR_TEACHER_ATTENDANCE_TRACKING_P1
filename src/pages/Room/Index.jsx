@@ -14,6 +14,8 @@ function RoomIndex(){
   const [lastCoords, setLastCoords] = React.useState(null);
   const [buildings, setBuildings] = React.useState([]);
   const [allFloors, setAllFloors] = React.useState([]);
+  const [selectedBuildingId, setSelectedBuildingId] = React.useState('');
+  const [selectedFloorId, setSelectedFloorId] = React.useState('');
 
   React.useEffect(()=>{ fetchRooms(); }, []);
 
@@ -69,6 +71,31 @@ function RoomIndex(){
     }catch(e){ console.error(e); if (!silent) setError('Failed to load rooms'); }
     finally{ if (!silent) setLoading(false); }
   }
+
+  const floorFilterOptions = React.useMemo(() => {
+    const list = selectedBuildingId
+      ? allFloors.filter(f => String(f.building_id) === String(selectedBuildingId))
+      : allFloors;
+    return list.filter(f => String(f.status || '').toLowerCase() !== 'archive');
+  }, [allFloors, selectedBuildingId]);
+
+  const filteredRooms = React.useMemo(() => {
+    return rooms.filter(room => {
+      const matchesBuilding = !selectedBuildingId || String(room.building_id) === String(selectedBuildingId);
+      const matchesFloor = !selectedFloorId || String(room.floor_id) === String(selectedFloorId);
+      return matchesBuilding && matchesFloor;
+    });
+  }, [rooms, selectedBuildingId, selectedFloorId]);
+
+  const handleBuildingFilterChange = (e) => {
+    setSelectedBuildingId(e.target.value);
+    setSelectedFloorId('');
+  };
+
+  const clearFilters = () => {
+    setSelectedBuildingId('');
+    setSelectedFloorId('');
+  };
 
   const openModal = (r=null) => {
     setError('');
@@ -284,6 +311,40 @@ function RoomIndex(){
         </div>
       </div>
 
+      <div className="mb-4 flex flex-col gap-3 rounded-md border border-gray-200 bg-white p-3 sm:flex-row sm:items-end">
+        <div className="w-full sm:max-w-xs">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Building</label>
+          <select
+            value={selectedBuildingId}
+            onChange={handleBuildingFilterChange}
+            className="block w-full border border-gray-200 rounded px-3 py-2"
+          >
+            <option value="">All buildings</option>
+            {buildings.map(b => (
+              <option key={b.building_id} value={b.building_id}>{b.building_name || b.building_id}</option>
+            ))}
+          </select>
+        </div>
+        <div className="w-full sm:max-w-xs">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Floor</label>
+          <select
+            value={selectedFloorId}
+            onChange={(e) => setSelectedFloorId(e.target.value)}
+            className="block w-full border border-gray-200 rounded px-3 py-2"
+          >
+            <option value="">All floors</option>
+            {floorFilterOptions.map(f => (
+              <option key={f.floor_id} value={f.floor_id}>{f.floor_name || f.floor_id}</option>
+            ))}
+          </select>
+        </div>
+        {(selectedBuildingId || selectedFloorId) && (
+          <button type="button" onClick={clearFilters} className="px-3 py-2 rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50">
+            Clear
+          </button>
+        )}
+      </div>
+
       {/* Show live/last captured coordinates if available */}
       {lastCoords && (
         <div className="mb-3 text-sm text-gray-700">Live coords: Lat: {lastCoords.latitude != null ? Number(lastCoords.latitude).toFixed(7) : 'N/A'}, Lon: {lastCoords.longitude != null ? Number(lastCoords.longitude).toFixed(7) : 'N/A'}</div>
@@ -291,7 +352,7 @@ function RoomIndex(){
 
       {error && <div className="mb-3 text-red-600">{error}</div>}
 
-      <Table columns={columns} data={rooms} loading={loading} pageSize={10} />
+      <Table columns={columns} data={filteredRooms} loading={loading} pageSize={10} />
 
       <Modal show={showModal} title={editing ? 'Edit Room' : 'Add Room'} onClose={closeModal} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { connectLiveUpdates } from '../../utils/liveUpdates.js';
+import { attendanceFlagKey, attendanceFlagLabel } from '../../utils/attendanceFlags.js';
 // Assuming apiGet is globally available or imported. If not, simple fetch wrapper:
 // const apiGet = async (url) => { const r = await fetch(`/server-php/api/${url}`); return r.json(); };
 
@@ -19,7 +19,7 @@ function DashboardPage({ scopeMode = 'managed' }) {
   };
 
   const [d3Loaded, setD3Loaded] = useState(!!(typeof window !== 'undefined' && window.d3));
-  const [wsConnected, setWsConnected] = useState(false);
+  const [httpsPollingActive, setHttpsPollingActive] = useState(false);
   const [containerWidth, setContainerWidth] = useState(1200);
   const [apiError, setApiError] = useState(null);
   const recentPageSize = 20;
@@ -40,14 +40,17 @@ function DashboardPage({ scopeMode = 'managed' }) {
   };
 
   const getStatusMeta = (rawName) => {
-    const normalized = String(rawName || 'NA').trim().toLowerCase();
-    if (normalized === 'present') return { label: 'Present', className: 'bg-green-100 text-green-700' };
-    if (normalized === 'late') return { label: 'Late', className: 'bg-yellow-100 text-yellow-700' };
-    if (normalized === 'on leave') return { label: 'On Leave', className: 'bg-sky-100 text-sky-700' };
-    if (normalized === 'substituted') return { label: 'Substituted', className: 'bg-indigo-100 text-indigo-700' };
-    if (normalized === 'na') return { label: 'NA', className: 'bg-slate-100 text-slate-600' };
-    if (normalized === 'absent') return { label: 'Absent', className: 'bg-red-100 text-red-700' };
-    return { label: 'Unknown', className: 'bg-red-100 text-red-700' };
+    const value = rawName || 'Upcoming';
+    const key = attendanceFlagKey(null, value);
+    const label = attendanceFlagLabel(null, value);
+    if (key === 'present') return { key, label, className: 'bg-green-100 text-green-700' };
+    if (key === 'late') return { key, label, className: 'bg-yellow-100 text-yellow-700' };
+    if (key === 'on_leave') return { key, label, className: 'bg-sky-100 text-sky-700' };
+    if (key === 'substituted') return { key, label, className: 'bg-indigo-100 text-indigo-700' };
+    if (key === 'pending') return { key, label, className: 'bg-orange-100 text-orange-700' };
+    if (key === 'upcoming') return { key, label, className: 'bg-slate-100 text-slate-600' };
+    if (key === 'absent') return { key, label, className: 'bg-red-100 text-red-700' };
+    return { key, label: label || 'Unknown', className: 'bg-red-100 text-red-700' };
   };
 
   const formatDateLabel = (value) => {
@@ -104,24 +107,24 @@ function DashboardPage({ scopeMode = 'managed' }) {
     window.location.hash = '/3d-building';
   };
 
-  const isNaStatus = (rawName) => {
-    const normalized = String(rawName || '').trim().toLowerCase();
-    return normalized === '' || normalized === 'na';
+  const isUpcomingStatus = (rawName) => {
+    const key = attendanceFlagKey(null, rawName || 'Upcoming');
+    return key === 'upcoming';
   };
 
   const renderCheckpoint = (flagName, dateValue, timeValue) => {
-    if (isNaStatus(flagName)) {
-      return <span className="text-xs font-semibold text-slate-300">-</span>;
-    }
     const statusMeta = getStatusMeta(flagName);
+    const hasTime = Boolean(String(timeValue || '').trim());
     return (
       <div className="flex flex-col gap-1">
         <span className={`inline-flex w-fit rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${statusMeta.className}`}>
           {statusMeta.label}
         </span>
-        <span className="whitespace-nowrap font-mono text-[10px] text-slate-400">
-          {formatDateTimeLabel(dateValue, timeValue || '')}
-        </span>
+        {hasTime ? (
+          <span className="whitespace-nowrap font-mono text-[10px] text-slate-400">
+            {formatDateTimeLabel(dateValue, timeValue || '')}
+          </span>
+        ) : null}
       </div>
     );
   };
@@ -147,7 +150,7 @@ function DashboardPage({ scopeMode = 'managed' }) {
     return () => clearInterval(timer);
   }, [d3Loaded]);
 
-  // central data loader used by initial load and websocket notifications
+  // Central data loader used by initial load and HTTPS polling.
   const loadData = async () => {
     setApiError(null);
     try {
@@ -171,85 +174,21 @@ function DashboardPage({ scopeMode = 'managed' }) {
   useEffect(() => {
     const rows = (data?.recent_attendance || []).filter((r) => {
       const statuses = [r.flag_in_name, r.flag_check_name, r.flag_out_name];
-      return statuses.some((value) => !isNaStatus(value));
+      return statuses.some((value) => !isUpcomingStatus(value));
     });
     const pages = Math.max(1, Math.ceil(rows.length / recentPageSize));
     setRecentPage((prev) => Math.min(Math.max(prev, 1), pages));
   }, [data?.recent_attendance]);
 
-  // 4. WebSocket / Polling Logic
+  // 4. HTTPS polling refresh
   useEffect(() => {
-    let socket = null;
-    let closedByUs = false;
-    let reconnectMs = 1000;
-    const maxReconnect = 30000;
-    let pollTimer = null;
-    let reconnectTimer = null;
-
-    const startPolling = () => {
-      if (pollTimer) return;
-      pollTimer = setInterval(() => {
-        loadData();
-      }, 15 * 1000); // 15s fallback
-    };
-
-    const stopPolling = () => {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    };
-
-    const scheduleReconnect = () => {
-      if (reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        reconnectMs = Math.min(maxReconnect, Math.floor(reconnectMs * 1.5));
-        connect();
-      }, reconnectMs);
-    };
-
-    const connect = () => {
-      try {
-        socket = connectLiveUpdates({
-          onConnect: () => {
-            setWsConnected(true);
-            reconnectMs = 1000;
-            stopPolling();
-          },
-          onRefresh: () => {
-            loadData();
-          },
-          onEntityUpdate: () => {
-            loadData();
-          },
-          onError: (err) => {
-            console.error('Socket.IO error', err);
-            if (!closedByUs) {
-              startPolling();
-              scheduleReconnect();
-            }
-            try { if (socket) socket.close(); } catch (e) {}
-          },
-          onDisconnect: () => {
-            setWsConnected(false);
-            if (closedByUs) return;
-            startPolling();
-            scheduleReconnect();
-          },
-        });
-      } catch (e) {
-        console.error('Socket.IO create failed', e);
-        startPolling();
-        scheduleReconnect();
-      }
-    };
-
-    connect();
+    setHttpsPollingActive(true);
+    const pollTimer = setInterval(() => {
+      loadData();
+    }, 15 * 1000);
 
     return () => {
-      closedByUs = true;
-      setWsConnected(false);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      try { if (socket) socket.close(); } catch (e) {}
-      stopPolling();
+      clearInterval(pollTimer);
     };
   }, []);
 
@@ -308,8 +247,14 @@ function DashboardPage({ scopeMode = 'managed' }) {
     const d3 = window.d3;
     const el = refs.donut.current; if (!el) return;
     el.innerHTML = '';
-    const attendance = data.summary.attendance_today || { present: 0, absent: 0, late: 0 };
-    const series = [{ key: 'Present', value: attendance.present, color: '#22c55e' }, { key: 'Late', value: attendance.late, color: '#eab308' }, { key: 'Absent', value: attendance.absent, color: '#ef4444' }];
+    const attendance = data.summary.attendance_today || { present: 0, absent: 0, late: 0, pending: 0, upcoming: 0 };
+    const series = [
+      { key: 'Present', value: Number(attendance.present || 0), color: '#22c55e' },
+      { key: 'Late', value: Number(attendance.late || 0), color: '#eab308' },
+      { key: 'Absent', value: Number(attendance.absent || 0), color: '#ef4444' },
+      { key: 'Pending', value: Number(attendance.pending || 0), color: '#f97316' },
+      { key: 'Upcoming', value: Number(attendance.upcoming || 0), color: '#94a3b8' }
+    ];
 
     const cardWidth = Math.max(220, el.clientWidth || 280);
     const W = Math.min(360, cardWidth);
@@ -651,6 +596,8 @@ function DashboardPage({ scopeMode = 'managed' }) {
     { key: 'present', label: 'Present', value: Number(attendanceToday.present || 0), className: 'bg-emerald-100 text-emerald-700 border-emerald-200' },
     { key: 'late', label: 'Late', value: Number(attendanceToday.late || 0), className: 'bg-amber-100 text-amber-700 border-amber-200' },
     { key: 'absent', label: 'Absent', value: Number(attendanceToday.absent || 0), className: 'bg-red-100 text-red-700 border-red-200' },
+    { key: 'pending', label: 'Pending', value: Number(attendanceToday.pending || 0), className: 'bg-orange-100 text-orange-700 border-orange-200' },
+    { key: 'upcoming', label: 'Upcoming', value: Number(attendanceToday.upcoming || 0), className: 'bg-slate-100 text-slate-700 border-slate-200' },
   ];
   const floorDistributionRows = (data?.viz?.floor_distribution_30d || []).map((item) => ({
     floor_name: item.floor_name || '-',
@@ -662,7 +609,7 @@ function DashboardPage({ scopeMode = 'managed' }) {
   }));
   const recentAttendanceRows = (data?.recent_attendance || []).filter((r) => {
     const statuses = [r.flag_in_name, r.flag_check_name, r.flag_out_name];
-    return statuses.some((value) => !isNaStatus(value));
+    return statuses.some((value) => !isUpcomingStatus(value));
   });
   const recentTotalRows = recentAttendanceRows.length;
   const recentTotalPages = Math.max(1, Math.ceil(recentTotalRows / recentPageSize));
@@ -692,9 +639,9 @@ function DashboardPage({ scopeMode = 'managed' }) {
                 {isSelfDashboard ? 'My Dashboard' : 'Dashboard'}
               </h1>
               <div className="mt-3 flex flex-wrap items-center gap-3">
-                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${wsConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
-                  <span className={`h-2 w-2 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
-                  {wsConnected ? 'Live updates active' : 'Polling fallback mode'}
+                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${httpsPollingActive ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                  <span className={`h-2 w-2 rounded-full ${httpsPollingActive ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+                  {httpsPollingActive ? 'HTTPS polling active' : 'Starting HTTPS polling'}
                 </span>
                 <span className="text-xs font-medium text-slate-500">
                   Snapshot date: {formatDateLabel(attendanceToday.date || toLocalYmd(new Date()))}
@@ -857,7 +804,7 @@ function DashboardPage({ scopeMode = 'managed' }) {
           </Panel>
         </div>
 
-        <Panel title="Recent Live Scans" subtitle="Most recent non-NA attendance scans from classrooms and floors.">
+        <Panel title="Recent Live Scans" subtitle="Most recent attendance checkpoints from classrooms and floors.">
           <div className="overflow-x-auto">
             <table className="min-w-full text-left text-sm">
               <thead className="border-b border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-slate-500">

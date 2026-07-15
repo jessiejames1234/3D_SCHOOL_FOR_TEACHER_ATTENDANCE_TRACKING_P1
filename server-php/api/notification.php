@@ -100,19 +100,44 @@ function notif_api_bind_dynamic($stmt, $types, &$params) {
     return call_user_func_array([$stmt, 'bind_param'], $refs);
 }
 
+function notif_api_ensure_navbar_hidden_column($mysqli) {
+    static $hasColumn = null;
+    if ($hasColumn !== null) return $hasColumn;
+
+    $check = $mysqli->query("SHOW COLUMNS FROM tbl_notifications LIKE 'navbar_hidden_at'");
+    if ($check && $check->num_rows > 0) {
+        $hasColumn = true;
+        return true;
+    }
+
+    try {
+        $altered = $mysqli->query("ALTER TABLE tbl_notifications ADD COLUMN navbar_hidden_at DATETIME NULL DEFAULT NULL AFTER is_read");
+        $hasColumn = (bool)$altered;
+    } catch (Throwable $e) {
+        $hasColumn = false;
+    }
+    return $hasColumn;
+}
+
 $authUserId = notif_api_auth_user_id();
+$hasNavbarHiddenColumn = notif_api_ensure_navbar_hidden_column($mysqli);
 
 if ($request_method === 'GET') {
     $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 20;
     if ($limit <= 0) $limit = 20;
     if ($limit > 100) $limit = 100;
     $onlyUnread = isset($_GET['unread']) && in_array(strtolower((string)$_GET['unread']), ['1', 'true', 'yes'], true);
+    $includeHidden = isset($_GET['include_hidden']) && in_array(strtolower((string)$_GET['include_hidden']), ['1', 'true', 'yes'], true);
 
-    $sql = "SELECT notif_id, user_id, title, message, link, is_read, created_at
+    $selectHiddenColumn = $hasNavbarHiddenColumn ? ', navbar_hidden_at' : '';
+    $sql = "SELECT notif_id, user_id, title, message, link, is_read, created_at{$selectHiddenColumn}
             FROM tbl_notifications
             WHERE user_id = ?";
     $types = 'i';
     $params = [$authUserId];
+    if (!$includeHidden && $hasNavbarHiddenColumn) {
+        $sql .= " AND navbar_hidden_at IS NULL";
+    }
     if ($onlyUnread) {
         $sql .= " AND is_read = 0";
     }
@@ -171,7 +196,11 @@ if ($request_method === 'GET') {
         }
     }
 
-    $countStmt = $mysqli->prepare("SELECT COUNT(*) AS unread_count FROM tbl_notifications WHERE user_id = ? AND is_read = 0");
+    $countSql = "SELECT COUNT(*) AS unread_count FROM tbl_notifications WHERE user_id = ? AND is_read = 0";
+    if (!$includeHidden && $hasNavbarHiddenColumn) {
+        $countSql .= " AND navbar_hidden_at IS NULL";
+    }
+    $countStmt = $mysqli->prepare($countSql);
     $count = 0;
     if ($countStmt) {
         $countStmt->bind_param('i', $authUserId);
@@ -223,19 +252,27 @@ if ($request_method === 'PUT' || $request_method === 'POST') {
 
 if ($request_method === 'DELETE') {
     if ($param1 === 'clear-read') {
-        $stmt = $mysqli->prepare("DELETE FROM tbl_notifications WHERE user_id = ? AND is_read = 1");
+        if ($hasNavbarHiddenColumn) {
+            $stmt = $mysqli->prepare("UPDATE tbl_notifications SET navbar_hidden_at = COALESCE(navbar_hidden_at, NOW()) WHERE user_id = ? AND is_read = 1");
+        } else {
+            $stmt = $mysqli->prepare("UPDATE tbl_notifications SET is_read = 1 WHERE user_id = ? AND is_read = 1");
+        }
         if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
         $stmt->bind_param('i', $authUserId);
-        if (!$stmt->execute()) json_response(['error' => 'delete_failed', 'message' => $stmt->error], 500);
-        json_response(['ok' => true, 'deleted' => (int)$stmt->affected_rows]);
+        if (!$stmt->execute()) json_response(['error' => 'hide_failed', 'message' => $stmt->error], 500);
+        json_response(['ok' => true, 'hidden' => (int)$stmt->affected_rows, 'preserved' => true]);
     }
 
     if ($param1 === 'clear-all') {
-        $stmt = $mysqli->prepare("DELETE FROM tbl_notifications WHERE user_id = ?");
+        if ($hasNavbarHiddenColumn) {
+            $stmt = $mysqli->prepare("UPDATE tbl_notifications SET is_read = 1, navbar_hidden_at = COALESCE(navbar_hidden_at, NOW()) WHERE user_id = ?");
+        } else {
+            $stmt = $mysqli->prepare("UPDATE tbl_notifications SET is_read = 1 WHERE user_id = ?");
+        }
         if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
         $stmt->bind_param('i', $authUserId);
-        if (!$stmt->execute()) json_response(['error' => 'delete_failed', 'message' => $stmt->error], 500);
-        json_response(['ok' => true, 'deleted' => (int)$stmt->affected_rows]);
+        if (!$stmt->execute()) json_response(['error' => 'hide_failed', 'message' => $stmt->error], 500);
+        json_response(['ok' => true, 'hidden' => (int)$stmt->affected_rows, 'preserved' => true]);
     }
 
     json_response(['error' => 'invalid_delete_action'], 400);

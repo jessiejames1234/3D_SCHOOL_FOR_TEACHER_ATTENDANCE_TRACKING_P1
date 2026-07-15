@@ -3,7 +3,7 @@ import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet } from '../../services/api.js';
 import { canAccessModule, resolveRoleName } from '../../utils/moduleAccess.js';
 
-const DEFAULT_HOME_TITLE = 'Time is Gold';
+const DEFAULT_HOME_TITLE = 'Welcome to COC Attendance WEB';
 const DEFAULT_HOME_TITLE_COLOR = '#c69500';
 
 const moduleShortcuts = [
@@ -133,6 +133,19 @@ const roleProfiles = {
       ['Department visibility', 'Watch attendance activity across faculty under your scope.'],
       ['Request decisions', 'Review attendance edit requests and leave-related activity with context.'],
       ['Quality control', 'Spot late, absent, substituted, and leave records before they become reporting problems.']
+    ]
+  },
+  department_admin: {
+    title: 'Department admin hub',
+    intro: 'Manage department users, track attendance, review faculty activity, monitor schedule changes, and keep department operations moving clearly.',
+    primaryLabel: 'Manage Users',
+    primaryPath: '/users',
+    secondaryLabel: 'Review Records',
+    secondaryPath: '/attendancemgmt',
+    focus: [
+      ['Department users', 'Add and maintain users only inside your assigned department.'],
+      ['Department visibility', 'Watch attendance activity across faculty under your scope.'],
+      ['Quality control', 'Review requests, schedules, substitutions, reports, and logs with department context.']
     ]
   },
   program_head: {
@@ -307,7 +320,9 @@ function HomeIndex() {
 
   const loadHomeSettings = React.useCallback(async () => {
     try {
-      const data = await apiGet('app-settings/home');
+      const deptId = user?.dept_id;
+      const query = deptId ? `?dept_id=${deptId}` : '';
+      const data = await apiGet(`app-settings/home${query}`);
       const title = String(data?.home_title || '').trim();
       const color = String(data?.home_title_color || '').trim();
       setHomeTitle(title || DEFAULT_HOME_TITLE);
@@ -317,7 +332,7 @@ function HomeIndex() {
       setHomeTitle(DEFAULT_HOME_TITLE);
       setHomeTitleColor(DEFAULT_HOME_TITLE_COLOR);
     }
-  }, []);
+  }, [user?.dept_id]);
 
   React.useEffect(() => {
     loadHomeSettings();

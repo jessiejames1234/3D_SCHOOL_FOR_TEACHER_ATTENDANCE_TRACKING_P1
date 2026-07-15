@@ -404,7 +404,7 @@ $offeringsWhereSql = '';
 if ($authRole === 1) {
     $teacherCountExpr = "(SELECT COUNT(*) FROM tbl_users u WHERE {$activeUserCondition})";
     $summaryMeta['teacher_label'] = 'Users';
-} elseif ($forceSelfScope && in_array($authRole, [2, 3, 4, 5], true)) {
+} elseif ($forceSelfScope && in_array($authRole, [2, 3, 4, 5, 6], true)) {
     $summaryMeta['teacher_label'] = 'My Records';
     $summaryMeta['scope'] = 'self';
     $summaryMeta['department_display'] = $authDeptName !== '' ? $authDeptName : null;
@@ -434,7 +434,7 @@ if ($authRole === 1) {
         $subjectsCountExpr = "0";
     }
     $teachersWhereSql = "{$activeUserCondition} AND u.user_id = " . (int)$authUserId;
-} elseif ($authRole === 2 && $scopedDeptId) {
+} elseif (in_array($authRole, [2, 6], true) && $scopedDeptId) {
     $summaryMeta['teacher_label'] = 'People';
     $summaryMeta['department_display'] = $authDeptName !== '' ? $authDeptName : ('Department #' . (int)$scopedDeptId);
     $departmentsCountExpr = "(SELECT COUNT(*) FROM tbl_departments d WHERE d.dept_id = " . (int)$scopedDeptId . ")";
@@ -741,6 +741,13 @@ if ($param1 === null || $param1 === '' || $param1 === 'full') {
          ORDER BY checks DESC, ro.role_id ASC";
     $by_role = $hasRolesTable ? dashboard_db_fetch_all($mysqli, $role_sql) : [];
     $by_role = dashboard_cast_int_fields($by_role, ['role_id', 'checks']);
+    // Format role names to proper nouns for display
+    $by_role = array_map(function($item) {
+        if (isset($item['role_name'])) {
+            $item['role_name'] = app_format_role_name($item['role_name']);
+        }
+        return $item;
+    }, $by_role);
 
     $weekly_sql = "SELECT
             DATE_FORMAT(ar.date, '%Y-%m-%d') AS d,

@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/personal_notification_helper.php';
+
 function notif_table_exists($mysqli) {
     static $checked = null;
     if ($checked !== null) return $checked;
@@ -39,6 +41,9 @@ function notif_insert($mysqli, $userId, $title, $message, $link = '', $actorUser
     $stmt->bind_param('isss', $uid, $cleanTitle, $cleanMessage, $cleanLink);
     $ok = $stmt->execute();
     $stmt->close();
+    if ($ok) {
+        personal_notif_send_general_update($mysqli, $uid, $cleanTitle, $cleanMessage, new DateTime());
+    }
     return (bool)$ok;
 }
 

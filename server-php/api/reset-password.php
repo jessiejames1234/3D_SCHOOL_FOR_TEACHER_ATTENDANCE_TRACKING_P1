@@ -54,7 +54,11 @@ if (!hash_equals($row['otp_code'], $otp)) {
 }
 
 $passwordHash = password_hash($newPassword, PASSWORD_BCRYPT);
-$up = $mysqli->prepare("UPDATE tbl_users SET password_hash = ? WHERE email = ?");
+$firstLoginColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'is_first_login'");
+$hasFirstLoginCol = $firstLoginColCheck && $firstLoginColCheck->num_rows > 0;
+$up = $hasFirstLoginCol
+    ? $mysqli->prepare("UPDATE tbl_users SET password_hash = ?, is_first_login = 0 WHERE email = ?")
+    : $mysqli->prepare("UPDATE tbl_users SET password_hash = ? WHERE email = ?");
 $up->bind_param("ss", $passwordHash, $email);
 if (!$up->execute()) {
     json_response(['error' => 'Failed to update password'], 500);

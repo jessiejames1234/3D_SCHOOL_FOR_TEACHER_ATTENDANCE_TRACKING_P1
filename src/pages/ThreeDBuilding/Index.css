@@ -498,6 +498,421 @@
   }
 }
 
+.tdb-teacher-status-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  margin: 0;
+  background: rgba(0, 0, 0, 0.25);
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.tdb-teacher-status-card {
+  width: min(380px, 90vw);
+  border-radius: 12px;
+  padding: 18px;
+  background: rgba(17, 24, 39, 0.95);
+  color: #f9fafb;
+  border: 1px solid rgba(31, 147, 88, 0.6);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tdb-teacher-status-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.tdb-teacher-status-avatar {
+  width: 64px;
+  height: 64px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 2px solid rgba(31, 147, 88, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.tdb-teacher-status-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.tdb-teacher-status-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.tdb-teacher-status-name {
+  font-size: 16px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.tdb-teacher-status-room {
+  font-size: 13px;
+  color: #d1fae5;
+  margin-top: 3px;
+}
+
+.tdb-teacher-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.tdb-teacher-status-badge--present {
+  background: #1f9257;
+  color: #ffffff;
+}
+
+.tdb-teacher-status-badge--late {
+  background: #ffb020;
+  color: #3b2c0a;
+}
+
+.tdb-teacher-status-badge--absent {
+  background: #dc3545;
+  color: #ffffff;
+}
+
+.tdb-teacher-status-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.tdb-teacher-status-actions .btn {
+  min-width: 88px;
+  border-radius: 6px;
+}
+
+.tdb-room-explorer-btn {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 18;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #d0d3d8;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: bold;
+  color: #1f2937;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.tdb-room-explorer-btn:hover {
+  background: rgba(255, 255, 255, 1);
+  transform: scale(1.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+}
+
+.tdb-room-explorer-panel {
+  position: absolute;
+  top: 60px;
+  left: 12px;
+  z-index: 18;
+  width: clamp(240px, 20vw, 320px);
+  max-height: calc(100% - 80px);
+  background: rgba(240, 244, 248, 0.98);
+  border: 1px solid #c8d0d6;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tdb-room-explorer-header {
+  padding: 12px;
+  border-bottom: 1px solid #e0e5ea;
+  background: #1f9257;
+  color: #ffffff;
+}
+
+.tdb-room-explorer-title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tdb-room-explorer-search {
+  margin-top: 10px;
+  padding: 6px 8px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.15);
+  color: #ffffff;
+  width: 100%;
+}
+
+.tdb-room-explorer-search::placeholder {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.tdb-room-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.tdb-room-list-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+  color: #2f3742;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.tdb-room-list-item:hover {
+  background: rgba(31, 147, 88, 0.1);
+  border-color: rgba(31, 147, 88, 0.3);
+}
+
+.tdb-room-list-item--selected {
+  background: rgba(31, 147, 88, 0.2);
+  border-color: #1f9257;
+  font-weight: 600;
+}
+
+.tdb-room-list-item-name {
+  font-weight: 600;
+  color: #111827;
+}
+
+.tdb-room-list-item-meta {
+  font-size: 10px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+
+.tdb-room-list-item-count {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 4px;
+  background: #1f9257;
+  color: #ffffff;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.tdb-navigator-section {
+  padding: 12px 12px 0;
+}
+
+.tdb-navigator-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #374151;
+  margin-bottom: 8px;
+}
+
+.tdb-navigator-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tdb-navigator-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  font-size: 12px;
+  border: 1px solid rgba(31, 147, 88, 0.2);
+  background: rgba(255, 255, 255, 0.9);
+  color: #111827;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.tdb-navigator-chip:hover,
+.tdb-navigator-chip--active {
+  background: #1f9257;
+  border-color: #1f9257;
+  color: #ffffff;
+}
+
+.tdb-navigator-empty {
+  padding: 12px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.tdb-tooltip {
+  position: fixed;
+  z-index: 20;
+  background: rgba(17, 24, 39, 0.95);
+  color: #ffffff;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(31, 147, 88, 0.5);
+}
+
+.tdb-room-info-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 29;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.tdb-room-info-card {
+  width: min(420px, 90vw);
+  border-radius: 12px;
+  padding: 20px;
+  background: rgba(17, 24, 39, 0.95);
+  color: #f9fafb;
+  border: 1px solid rgba(31, 147, 88, 0.6);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.tdb-room-info-header {
+  border-bottom: 1px solid rgba(31, 147, 88, 0.3);
+  padding-bottom: 12px;
+}
+
+.tdb-room-info-title {
+  font-size: 18px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.tdb-room-info-meta {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #d1fae5;
+}
+
+.tdb-room-info-occupants {
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.tdb-room-info-occupants-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #d1fae5;
+  margin-bottom: 8px;
+}
+
+.tdb-room-occupant {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 12px;
+  color: #e5e7eb;
+}
+
+.tdb-room-occupant-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(31, 147, 88, 0.6);
+  flex-shrink: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tdb-room-occupant-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.tdb-room-occupant-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.tdb-room-occupant-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tdb-room-occupant-status {
+  font-size: 10px;
+  color: #a5b4fc;
+  margin-top: 1px;
+}
+
+.tdb-room-info-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.tdb-room-info-actions .btn {
+  min-width: 80px;
+  border-radius: 6px;
+}
+
+.tdb-room-info-empty {
+  text-align: center;
+  padding: 16px 0;
+  color: #a5b4fc;
+  font-size: 12px;
+}
+
 .tdb-active-class {
   position: absolute;
   top: 10px;

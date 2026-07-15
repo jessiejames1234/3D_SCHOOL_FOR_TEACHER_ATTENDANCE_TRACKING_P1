@@ -3,6 +3,7 @@
 require_once __DIR__ . '/../helpers/socket_helper.php';
 require_once __DIR__ . '/../helpers/log_helper.php'; // enable system logging
 require_once __DIR__ . '/../helpers/mail_helper.php';
+require_once __DIR__ . '/../helpers/notification_helper.php';
 
 // No need to include db/helpers again, index.php does it.
 global $mysqli;
@@ -69,29 +70,30 @@ $roleIdToName = [
     3 => 'program_head',
     4 => 'secretary',
     5 => 'teacher',
+    6 => 'department_admin',
 ];
 
 $permissionMatrix = [
-    'dashboard' => ['admin', 'dean', 'program_head', 'secretary'],
-    'faculty_dashboard' => ['dean', 'program_head', 'secretary', 'teacher'],
-    'users' => ['admin', 'dean', 'program_head', 'secretary'],
-    'attendance' => ['dean', 'program_head', 'secretary', 'teacher'],
-    'attendancemgmt' => ['admin', 'secretary', 'dean', 'program_head'],
-    'class_schedules' => ['admin', 'dean', 'program_head', 'secretary'],
-    '3d_building' => ['admin', 'dean', 'program_head', 'secretary'],
-    'attendance_edits' => ['dean'],
-    'schedule_edits' => ['dean', 'program_head', 'secretary'],
+    'dashboard' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    'faculty_dashboard' => ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+    'users' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    'attendance' => ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+    'attendancemgmt' => ['admin', 'secretary', 'dean', 'department_admin', 'program_head'],
+    'class_schedules' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    '3d_building' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    'attendance_edits' => ['dean', 'department_admin'],
+    'schedule_edits' => ['dean', 'department_admin', 'program_head', 'secretary'],
     'academic_admin' => ['admin'],
-    'academic_manage' => ['admin', 'dean', 'program_head', 'secretary'],
-    'academic_program' => ['admin', 'dean'],
+    'academic_manage' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    'academic_program' => ['admin', 'dean', 'department_admin'],
     'locations' => ['admin'],
-    'reports' => ['admin', 'dean', 'program_head', 'secretary', 'teacher'],
-    'leaves_file' => ['admin', 'dean', 'secretary'],
+    'reports' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+    'leaves_file' => ['admin', 'dean', 'department_admin', 'secretary'],
     'leaves_approvals' => ['admin', 'dean', 'program_head'],
-    'substitutions' => ['admin', 'dean', 'secretary'],
-    'logs' => ['admin', 'dean', 'program_head', 'secretary'],
-    'settings' => ['admin', 'dean'],
-    'attendance_logs' => ['admin', 'dean', 'program_head'],
+    'substitutions' => ['admin', 'dean', 'department_admin', 'secretary'],
+    'logs' => ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+    'settings' => ['admin', 'dean', 'department_admin'],
+    'attendance_logs' => ['admin', 'dean', 'department_admin', 'program_head'],
 ];
 $allModuleKeys = array_values(array_keys($permissionMatrix));
 $allModuleLookup = array_fill_keys($allModuleKeys, true);
@@ -235,6 +237,8 @@ switch ($endpoint) {
             json_response(['error' => 'unauthorized', 'message' => 'Authentication required'], 401);
         }
         $isAdminRole = ((int)$authRoleId === 1);
+        $isDepartmentAdminRole = ((int)$authRoleId === 6);
+        $isDeanLikeRole = in_array((int)$authRoleId, [2, 6], true);
 
         $normalize_user_email = function($value) {
             return strtolower(trim((string)$value));
@@ -246,25 +250,101 @@ switch ($endpoint) {
             return trim((string)$value);
         };
         $is_valid_id_number = function($value) {
-            return (bool)preg_match('/^02-\d{4}-\d+$/', trim((string)$value));
+            return (bool)preg_match('/^\d{2}-\d{3}-[A-Za-z]$/', trim((string)$value));
         };
         $assignedHeadColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'assigned_program_head_id'");
         $hasAssignedProgramHeadCol = $assignedHeadColCheck && $assignedHeadColCheck->num_rows > 0;
 
-        $validateAssignedProgramHead = function($headId, $deptId) use ($mysqli) {
+        $validateAssignedProgramHead = function($programId, $deptId, $requireOwner = false) use ($mysqli) {
             $pq = $mysqli->prepare("SELECT p.program_id, p.dept_id, p.head_id, u.role_id FROM tbl_programs p LEFT JOIN tbl_users u ON p.head_id = u.user_id WHERE p.program_id = ? LIMIT 1");
-            if (!$pq) return 'Failed to validate Program Head program assignment.';
-            $pq->bind_param("i", $headId);
+            if (!$pq) return 'Failed to validate assigned program.';
+            $pq->bind_param("i", $programId);
             $pq->execute();
             $programRow = $pq->get_result()->fetch_assoc();
             if (!$programRow) return 'Assigned program does not exist.';
-            if (empty($programRow['head_id'])) return 'Assigned program has no Program Head.';
-            if ((int)($programRow['role_id'] ?? 0) !== 3) return 'Assigned program head user is invalid.';
+            if ($requireOwner) {
+                if (empty($programRow['head_id'])) return 'Assigned program has no Program Head.';
+                if ((int)($programRow['role_id'] ?? 0) !== 3) return 'Assigned program head user is invalid.';
+            }
             $programDeptId = isset($programRow['dept_id']) && $programRow['dept_id'] !== null ? (int)$programRow['dept_id'] : null;
             if ($deptId !== null && $programDeptId !== null && (int)$programDeptId !== (int)$deptId) {
                 return 'Assigned program must belong to the same department.';
             }
             return null;
+        };
+
+        $validateDeanDepartmentOwner = function($deptId, $userId = null) use ($mysqli) {
+            if ($deptId === null || $deptId === '') return null;
+            if ((int)$deptId <= 0) return 'Selected department does not exist.';
+            $dq = $mysqli->prepare("SELECT dept_id FROM tbl_departments WHERE dept_id = ? LIMIT 1");
+            if (!$dq) return 'Failed to validate department.';
+            $deptId = (int)$deptId;
+            $dq->bind_param('i', $deptId);
+            $dq->execute();
+            $dept = $dq->get_result()->fetch_assoc();
+            if (!$dept) return 'Selected department does not exist.';
+            return null;
+        };
+
+        $validateProgramHeadProgramOwner = function($programId, $deptId, $userId = null) use ($mysqli) {
+            if ($programId === null || $programId === '') return null;
+            if ((int)$programId <= 0) return 'Selected program does not exist.';
+            $pq = $mysqli->prepare("SELECT program_id, dept_id, head_id FROM tbl_programs WHERE program_id = ? LIMIT 1");
+            if (!$pq) return 'Failed to validate program ownership.';
+            $programId = (int)$programId;
+            $pq->bind_param('i', $programId);
+            $pq->execute();
+            $program = $pq->get_result()->fetch_assoc();
+            if (!$program) return 'Selected program does not exist.';
+
+            $programDeptId = isset($program['dept_id']) && $program['dept_id'] !== null ? (int)$program['dept_id'] : null;
+            if ($deptId !== null && $programDeptId !== null && (int)$programDeptId !== (int)$deptId) {
+                return 'Selected program must belong to the selected department.';
+            }
+
+            return null;
+        };
+
+        $syncUserOwnership = function($userId, $roleId, $deptId, $programId = null) use ($mysqli, $hasAssignedProgramHeadCol) {
+            $userId = (int)$userId;
+            $roleId = (int)$roleId;
+            $deptId = ($deptId === null || $deptId === '') ? null : (int)$deptId;
+            $programId = ($programId === null || $programId === '') ? null : (int)$programId;
+
+            if ($roleId === 2 && $deptId !== null) {
+                $clearOld = $mysqli->prepare("UPDATE tbl_departments SET dean_id = NULL WHERE dean_id = ? AND dept_id <> ?");
+                if ($clearOld) {
+                    $clearOld->bind_param('ii', $userId, $deptId);
+                    $clearOld->execute();
+                }
+                $setDeptOwner = $mysqli->prepare("UPDATE tbl_departments SET dean_id = ? WHERE dept_id = ?");
+                if ($setDeptOwner) {
+                    $setDeptOwner->bind_param('ii', $userId, $deptId);
+                    $setDeptOwner->execute();
+                }
+            } else {
+                $clearDean = $mysqli->prepare("UPDATE tbl_departments SET dean_id = NULL WHERE dean_id = ?");
+                if ($clearDean) {
+                    $clearDean->bind_param('i', $userId);
+                    $clearDean->execute();
+                }
+            }
+
+            if ($hasAssignedProgramHeadCol) {
+                if ($roleId === 3 && $programId !== null) {
+                    $setProgramOwner = $mysqli->prepare("UPDATE tbl_programs SET head_id = ? WHERE program_id = ?");
+                    if ($setProgramOwner) {
+                        $setProgramOwner->bind_param('ii', $userId, $programId);
+                        $setProgramOwner->execute();
+                    }
+                } else {
+                    $clearProgramHead = $mysqli->prepare("UPDATE tbl_programs SET head_id = NULL WHERE head_id = ?");
+                    if ($clearProgramHead) {
+                        $clearProgramHead->bind_param('i', $userId);
+                        $clearProgramHead->execute();
+                    }
+                }
+            }
         };
 
         $sendAccountCreatedEmail = function($firstName, $lastName, $email, $idNumber) use ($mysqli, $authUserId) {
@@ -501,7 +581,7 @@ switch ($endpoint) {
                 $roleFilter = isset($_GET['role']) && is_numeric($_GET['role']) ? (int)$_GET['role'] : null;
                 $deptFilter = isset($_GET['dept_id']) && is_numeric($_GET['dept_id']) ? (int)$_GET['dept_id'] : null;
                 $isProgramHeadRole = ((int)$authRoleId === 3);
-                $isDeanRole = ((int)$authRoleId === 2);
+                $isDeanRole = in_array((int)$authRoleId, [2, 6], true);
                 $isSecretaryRole = ((int)$authRoleId === 4);
 
                 $sql = "SELECT user_id, first_name, last_name FROM tbl_users WHERE status = 'active'";
@@ -672,7 +752,7 @@ switch ($endpoint) {
                         $params[] = (int)$authUserId;
                         $params[] = (int)$authUserId;
                     }
-                } elseif ((int)$authRoleId === 2) {
+                } elseif (in_array((int)$authRoleId, [2, 6], true)) {
                     if ($authUserDeptId === null) {
                         json_response([]);
                     }
@@ -699,12 +779,20 @@ switch ($endpoint) {
             }
             $stmt->execute();
             $res = $stmt->get_result();
-            json_response($res ? $res->fetch_all(MYSQLI_ASSOC) : []);
+            $users = $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+            // Format role names to proper nouns for display
+            $users = array_map(function($user) {
+                if (isset($user['role_name'])) {
+                    $user['role_name'] = app_format_role_name($user['role_name']);
+                }
+                return $user;
+            }, $users);
+            json_response($users);
 
         } elseif ($request_method === 'POST' && $param1 === 'import') {
-            // Admin-only bulk import. Default password = school ID (id_number)
-            if (!$isAdminRole) {
-                json_response(['error' => 'forbidden', 'message' => 'Only admin can import users'], 403);
+            // Admin can import broadly. Department admin can import only allowed roles in their own department.
+            if (!$isAdminRole && !$isDepartmentAdminRole) {
+                json_response(['error' => 'forbidden', 'message' => 'Only admin and department admin can import users'], 403);
             }
 
             $rows = isset($input['rows']) && is_array($input['rows']) ? $input['rows'] : [];
@@ -712,6 +800,9 @@ switch ($endpoint) {
                 json_response(['error' => 'validation', 'message' => 'rows is required and must be a non-empty array'], 400);
             }
             $previewOnly = !empty($input['preview']);
+            if ($isDepartmentAdminRole && $authUserDeptId === null) {
+                json_response(['error' => 'forbidden', 'message' => 'Your account is not assigned to a department.'], 403);
+            }
 
             $roleMap = [];
             $rolesRes = $mysqli->query("SELECT role_id, role_name FROM tbl_roles");
@@ -734,6 +825,10 @@ switch ($endpoint) {
             $roleMap['programhead'] = $roleMap['program_head'];
             $roleMap['secretary'] = $roleMap['secretary'] ?? 4;
             $roleMap['teacher'] = $roleMap['teacher'] ?? 5;
+            $roleMap['department_admin'] = $roleMap['department_admin'] ?? 6;
+            $roleMap['departmentadmin'] = $roleMap['department_admin'];
+            $roleMap['dept_admin'] = $roleMap['department_admin'];
+            $roleMap['deptadmin'] = $roleMap['department_admin'];
 
             $deptNameToId = [];
             $deptRes = $mysqli->query("SELECT dept_id, dept_name FROM tbl_departments");
@@ -751,13 +846,15 @@ switch ($endpoint) {
                 return preg_replace('/[^a-z0-9]+/', '', strtolower(trim((string)$value)));
             };
             $programNameToId = [];
+            $programById = [];
             if ($hasAssignedProgramHeadCol) {
-                $programRes = $mysqli->query("SELECT program_id, program_name FROM tbl_programs");
+                $programRes = $mysqli->query("SELECT program_id, program_name, dept_id, head_id FROM tbl_programs");
                 if ($programRes) {
                     while ($pr = $programRes->fetch_assoc()) {
                         $programId = (int)($pr['program_id'] ?? 0);
                         $programName = trim((string)($pr['program_name'] ?? ''));
                         if ($programId <= 0) continue;
+                        $programById[$programId] = $pr;
 
                         $programNameLower = strtolower($programName);
                         if ($programNameLower !== '') {
@@ -849,9 +946,9 @@ switch ($endpoint) {
                     $errors[] = ['row' => $rowNum, 'message' => 'Invalid email. Must be @phinmaed.com'];
                     continue;
                 }
-                if (!$is_valid_id_number($schoolId)) {
+            if (!$is_valid_id_number($schoolId)) {
                     $skipped++;
-                    $errors[] = ['row' => $rowNum, 'message' => 'Invalid school_id format. Expected 02-xxxx-<any digits>'];
+                    $errors[] = ['row' => $rowNum, 'message' => 'Invalid school_id format. Must match ##-###-letter (e.g. 24-018-F)'];
                     continue;
                 }
 
@@ -874,29 +971,54 @@ switch ($endpoint) {
                     $errors[] = ['row' => $rowNum, 'message' => 'Admin role is not allowed.'];
                     continue;
                 }
+                if ($isDepartmentAdminRole && !in_array($roleId, [3, 4, 5], true)) {
+                    $skipped++;
+                    $errors[] = ['row' => $rowNum, 'message' => 'Department admin can only import Program Head, Secretary, and Teacher users.'];
+                    continue;
+                }
 
                 $deptId = null;
-                if ($roleId !== 1) {
+                if ($isDepartmentAdminRole) {
+                    $deptId = (int)$authUserDeptId;
+                    if ($deptRaw !== '') {
+                        $providedDeptId = null;
+                        if (is_numeric($deptRaw)) {
+                            $providedDeptId = (int)$deptRaw;
+                        } else {
+                            $deptKey = strtolower(trim((string)$deptRaw));
+                            if (isset($deptNameToId[$deptKey])) $providedDeptId = (int)$deptNameToId[$deptKey];
+                        }
+                        if (!$providedDeptId || (int)$providedDeptId !== (int)$authUserDeptId) {
+                            $skipped++;
+                            $errors[] = ['row' => $rowNum, 'message' => 'Department admin can only import users in their assigned department.'];
+                            continue;
+                        }
+                    }
+                } elseif ($roleId !== 1) {
+                    $departmentRequired = true;
                     if ($deptRaw === '') {
-                        $skipped++;
-                        $errors[] = ['row' => $rowNum, 'message' => 'Department is required for non-admin users'];
-                        continue;
-                    }
-                    if (is_numeric($deptRaw)) {
-                        $deptId = (int)$deptRaw;
+                        if ($departmentRequired) {
+                            $skipped++;
+                            $errors[] = ['row' => $rowNum, 'message' => 'Department is required for this role'];
+                            continue;
+                        }
                     } else {
-                        $deptKey = strtolower(trim((string)$deptRaw));
-                        if (isset($deptNameToId[$deptKey])) $deptId = (int)$deptNameToId[$deptKey];
-                    }
-                    if (!$deptId) {
-                        $skipped++;
-                        $errors[] = ['row' => $rowNum, 'message' => 'Invalid department value'];
-                        continue;
+                        if (is_numeric($deptRaw)) {
+                            $deptId = (int)$deptRaw;
+                        } else {
+                            $deptKey = strtolower(trim((string)$deptRaw));
+                            if (isset($deptNameToId[$deptKey])) $deptId = (int)$deptNameToId[$deptKey];
+                        }
+                        if (!$deptId) {
+                            $skipped++;
+                            $errors[] = ['row' => $rowNum, 'message' => 'Invalid department value'];
+                            continue;
+                        }
                     }
                 }
 
                 $assignedProgramId = null;
-                if ($roleId === 5) {
+                if (in_array($roleId, [2, 3, 4, 5], true)) {
                     if (!$hasAssignedProgramHeadCol) {
                         $skipped++;
                         $errors[] = ['row' => $rowNum, 'message' => 'Database is missing assigned_program_head_id. Run the latest SQL migration first.'];
@@ -905,7 +1027,10 @@ switch ($endpoint) {
 
                     if ($programRaw === '') {
                         $skipped++;
-                        $errors[] = ['row' => $rowNum, 'message' => 'Assigned program is required for teachers. Provide program_id or program_name.'];
+                        $programRequiredMsg = $roleId === 3
+                            ? 'Owned program is required for program heads. Provide program_id or program_name.'
+                            : 'Assigned program is required for this role. Provide program_id or program_name.';
+                        $errors[] = ['row' => $rowNum, 'message' => $programRequiredMsg];
                         continue;
                     }
 
@@ -923,16 +1048,18 @@ switch ($endpoint) {
                         }
                     }
 
-                    if (!$assignedProgramId) {
+                    if (!$assignedProgramId || !isset($programById[$assignedProgramId])) {
                         $skipped++;
                         $errors[] = ['row' => $rowNum, 'message' => "Program '{$programRaw}' not recognized. Use a valid program_id or program_name."];
                         continue;
                     }
 
-                    $assignedHeadError = $validateAssignedProgramHead($assignedProgramId, $deptId);
-                    if ($assignedHeadError !== null) {
+                    $programDeptId = isset($programById[$assignedProgramId]['dept_id']) && $programById[$assignedProgramId]['dept_id'] !== null
+                        ? (int)$programById[$assignedProgramId]['dept_id']
+                        : null;
+                    if ($programDeptId !== null && $deptId !== null && (int)$programDeptId !== (int)$deptId) {
                         $skipped++;
-                        $errors[] = ['row' => $rowNum, 'message' => $assignedHeadError];
+                        $errors[] = ['row' => $rowNum, 'message' => 'Selected program must belong to the selected department.'];
                         continue;
                     }
                 }
@@ -978,8 +1105,9 @@ switch ($endpoint) {
                 }
 
                 $passwordHash = password_hash((string)$schoolId, PASSWORD_BCRYPT);
-                $stmtToUse = ($hasAssignedProgramHeadCol && $roleId === 5) ? $insertStmtWithAssigned : $insertStmtNoAssigned;
-                if ($hasAssignedProgramHeadCol && $roleId === 5) {
+                $usesAssignedProgram = $hasAssignedProgramHeadCol && $assignedProgramId !== null;
+                $stmtToUse = $usesAssignedProgram ? $insertStmtWithAssigned : $insertStmtNoAssigned;
+                if ($usesAssignedProgram) {
                     $stmtToUse->bind_param(
                         'iissssssi',
                         $roleId,
@@ -1012,6 +1140,9 @@ switch ($endpoint) {
                     unset($seenEmails[$emailKey], $seenSchoolIds[$schoolIdKey]);
                     continue;
                 }
+
+                $newImportUserId = (int)$mysqli->insert_id;
+                $syncUserOwnership($newImportUserId, $roleId, $deptId, $assignedProgramId);
 
                 $mailResult = $sendAccountCreatedEmail($firstName, $lastName, $email, $schoolId);
                 if (!empty($mailResult['sent'])) {
@@ -1051,12 +1182,34 @@ switch ($endpoint) {
             ]);
 
         } elseif (($request_method === 'PUT' || $request_method === 'POST') && is_numeric($param1)) {
-            if (!$isAdminRole) {
-                json_response(['error' => 'forbidden', 'message' => 'View-only access. Only admin can modify users.'], 403);
+            if (!$isAdminRole && !$isDepartmentAdminRole) {
+                json_response(['error' => 'forbidden', 'message' => 'View-only access. Only admin and department admin can modify users.'], 403);
             }
             $userId = (int)$param1;
+            $ensureDepartmentAdminUserScope = function() use ($mysqli, $isDepartmentAdminRole, $authUserDeptId, $userId) {
+                if (!$isDepartmentAdminRole) return null;
+                if ($authUserDeptId === null) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin is not assigned to a department.'], 403);
+                }
+                $scopeStmt = $mysqli->prepare("SELECT user_id, role_id, dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
+                if (!$scopeStmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+                $scopeStmt->bind_param('i', $userId);
+                $scopeStmt->execute();
+                $target = $scopeStmt->get_result()->fetch_assoc();
+                if (!$target) json_response(['error' => 'not_found', 'message' => 'User not found'], 404);
+                $targetRoleId = isset($target['role_id']) ? (int)$target['role_id'] : 0;
+                $targetDeptId = isset($target['dept_id']) && $target['dept_id'] !== null ? (int)$target['dept_id'] : null;
+                if (!in_array($targetRoleId, [3, 4, 5], true)) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin can only manage Program Head, Secretary, and Teacher users.'], 403);
+                }
+                if ($targetDeptId === null || (int)$targetDeptId !== (int)$authUserDeptId) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin can only manage users inside the same department.'], 403);
+                }
+                return $target;
+            };
 
             if ($param2 === 'toggle') {
+                $ensureDepartmentAdminUserScope();
                 $u = $mysqli->prepare("SELECT status FROM tbl_users WHERE user_id = ? LIMIT 1");
                 if (!$u) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $u->bind_param("i", $userId);
@@ -1107,6 +1260,7 @@ switch ($endpoint) {
             }
 
             if ($param2 === 'archive') {
+                $ensureDepartmentAdminUserScope();
                 $up = $mysqli->prepare("UPDATE tbl_users SET status = ? WHERE user_id = ?");
                 if (!$up) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $statusVal = 'archive';
@@ -1141,6 +1295,76 @@ switch ($endpoint) {
                 json_response(['user_id' => $userId, 'status' => 'archive']);
             }
 
+            if ($param2 === 'reset-default-password') {
+                if (!$isAdminRole) {
+                    json_response(['error' => 'forbidden', 'message' => 'Only Admin can reset passwords to default.'], 403);
+                }
+
+                $firstLoginColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'is_first_login'");
+                $hasFirstLoginCol = $firstLoginColCheck && $firstLoginColCheck->num_rows > 0;
+                if (!$hasFirstLoginCol) {
+                    $alterOk = $mysqli->query("ALTER TABLE tbl_users ADD COLUMN is_first_login TINYINT(1) NOT NULL DEFAULT 0");
+                    if (!$alterOk) {
+                        json_response(['error' => 'schema_mismatch', 'message' => 'Unable to prepare first-login password reset flag.'], 500);
+                    }
+                }
+
+                $targetStmt = $mysqli->prepare("SELECT user_id, role_id, first_name, last_name, email, id_number FROM tbl_users WHERE user_id = ? LIMIT 1");
+                if (!$targetStmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+                $targetStmt->bind_param('i', $userId);
+                if (!$targetStmt->execute()) json_response(['error' => 'execute_failed', 'message' => $targetStmt->error], 500);
+                $targetUser = $targetStmt->get_result()->fetch_assoc();
+                $targetStmt->close();
+
+                if (!$targetUser) {
+                    json_response(['error' => 'not_found', 'message' => 'User not found'], 404);
+                }
+                if ((int)($targetUser['role_id'] ?? 0) === 1) {
+                    json_response(['error' => 'forbidden', 'message' => 'Admin accounts cannot be reset from this emergency tool.'], 403);
+                }
+
+                $defaultPassword = trim((string)($targetUser['id_number'] ?? ''));
+                if ($defaultPassword === '') {
+                    json_response(['error' => 'validation', 'message' => 'This user has no ID number to use as the default password.'], 400);
+                }
+
+                $passwordHash = password_hash($defaultPassword, PASSWORD_BCRYPT);
+                $resetStmt = $mysqli->prepare("UPDATE tbl_users SET password_hash = ?, is_first_login = 1 WHERE user_id = ?");
+                if (!$resetStmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+                $resetStmt->bind_param('si', $passwordHash, $userId);
+                if (!$resetStmt->execute()) json_response(['error' => 'update_failed', 'message' => $resetStmt->error], 500);
+                $resetStmt->close();
+
+                $targetName = trim((string)($targetUser['first_name'] ?? '') . ' ' . (string)($targetUser['last_name'] ?? ''));
+                if ($targetName === '') $targetName = (string)($targetUser['email'] ?? ('User ID ' . $userId));
+                log_system_action($mysqli, $authUserId, 'reset_user_password_default', "Reset password to default for '{$targetName}' and required password change on next login.");
+
+                $notified = false;
+                try {
+                    $notified = (bool)notif_insert(
+                        $mysqli,
+                        $userId,
+                        'Password reset required',
+                        'An administrator reset your account password to the default. You must change your password on next login.',
+                        '',
+                        $authUserId
+                    );
+                } catch (Throwable $_) {}
+
+                try {
+                    $payload = ['entity' => 'users', 'action' => 'password_reset_required', 'user_id' => $userId];
+                    trigger_socket_update($payload);
+                } catch (Throwable $_) {}
+
+                json_response([
+                    'ok' => true,
+                    'user_id' => $userId,
+                    'message' => 'Password reset to default. User must change password on next login.',
+                    'is_first_login' => 1,
+                    'notified' => $notified,
+                ]);
+            }
+
             // Normal update: validate and apply
             // Check user exists
             $existingSelectAssigned = $hasAssignedProgramHeadCol ? ", assigned_program_head_id" : "";
@@ -1150,6 +1374,21 @@ switch ($endpoint) {
             $checkExisting->execute();
             $existing = $checkExisting->get_result()->fetch_assoc();
             if (!$existing) json_response(['error' => 'not_found', 'message' => 'User not found'], 404);
+            if ($isDepartmentAdminRole) {
+                $existingRoleId = isset($existing['role_id']) ? (int)$existing['role_id'] : 0;
+                $existingDeptId = isset($existing['dept_id']) && $existing['dept_id'] !== null ? (int)$existing['dept_id'] : null;
+                $requestedRoleId = isset($input['role_id']) ? (int)$input['role_id'] : $existingRoleId;
+                if ($authUserDeptId === null) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin is not assigned to a department.'], 403);
+                }
+                if (!in_array($existingRoleId, [3, 4, 5], true) || !in_array($requestedRoleId, [3, 4, 5], true)) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin can only manage Program Head, Secretary, and Teacher users.'], 403);
+                }
+                if ($existingDeptId === null || (int)$existingDeptId !== (int)$authUserDeptId) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin can only manage users inside the same department.'], 403);
+                }
+                $input['dept_id'] = (int)$authUserDeptId;
+            }
 
             if (isset($input['email'])) {
                 $input['email'] = $normalize_user_email($input['email']);
@@ -1169,9 +1408,9 @@ switch ($endpoint) {
                     json_response(['error' => 'validation', 'message' => 'ID number is required'], 400);
                 }
                 if (!$is_valid_id_number($input['id_number'])) {
-                    json_response(['error' => 'validation', 'message' => 'ID number must match 02-xxxx-<any digits>'], 400);
-                }
-                $dupId = $mysqli->prepare("SELECT user_id FROM tbl_users WHERE id_number = ? AND user_id <> ? LIMIT 1");
+                json_response(['error' => 'validation', 'message' => 'ID number must match format ##-###-letter (e.g. 24-018-F)'], 400);
+            }
+            $dupId = $mysqli->prepare("SELECT user_id FROM tbl_users WHERE id_number = ? AND user_id <> ? LIMIT 1");
                 if (!$dupId) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
                 $dupId->bind_param("si", $input['id_number'], $userId);
                 $dupId->execute();
@@ -1180,23 +1419,47 @@ switch ($endpoint) {
                 }
             }
 
-            if ($hasAssignedProgramHeadCol) {
-                $targetRoleId = isset($input['role_id']) ? (int)$input['role_id'] : (int)($existing['role_id'] ?? 0);
-                $targetDeptId = array_key_exists('dept_id', $input)
-                    ? (($input['dept_id'] === '' || $input['dept_id'] === null) ? null : (int)$input['dept_id'])
-                    : (isset($existing['dept_id']) && $existing['dept_id'] !== null ? (int)$existing['dept_id'] : null);
+            $targetRoleId = isset($input['role_id']) ? (int)$input['role_id'] : (int)($existing['role_id'] ?? 0);
+            $targetDeptId = array_key_exists('dept_id', $input)
+                ? (($input['dept_id'] === '' || $input['dept_id'] === null) ? null : (int)$input['dept_id'])
+                : (isset($existing['dept_id']) && $existing['dept_id'] !== null ? (int)$existing['dept_id'] : null);
+            if ($targetRoleId !== 1 && $targetDeptId === null) {
+                json_response(['error' => 'validation', 'message' => 'Department is required for this role.'], 400);
+            }
 
-                if ($targetRoleId === 5 && array_key_exists('assigned_program_head_id', $input)) {
-                    if ($input['assigned_program_head_id'] === '' || $input['assigned_program_head_id'] === null) {
-                        json_response(['error' => 'validation', 'message' => 'Assigned program is required for teachers.'], 400);
-                    }
-                    $assignedHeadId = (int)$input['assigned_program_head_id'];
-                    $assignedHeadError = $validateAssignedProgramHead($assignedHeadId, $targetDeptId);
-                    if ($assignedHeadError !== null) {
-                        json_response(['error' => 'validation', 'message' => $assignedHeadError], 400);
+            if ($hasAssignedProgramHeadCol) {
+                $targetProgramId = array_key_exists('assigned_program_head_id', $input)
+                    ? (($input['assigned_program_head_id'] === '' || $input['assigned_program_head_id'] === null) ? null : (int)$input['assigned_program_head_id'])
+                    : (isset($existing['assigned_program_head_id']) && $existing['assigned_program_head_id'] !== null ? (int)$existing['assigned_program_head_id'] : null);
+
+                if ($targetRoleId === 2) {
+                    $deanOwnerError = $validateDeanDepartmentOwner($targetDeptId, $userId);
+                    if ($deanOwnerError !== null) {
+                        json_response(['error' => 'validation', 'message' => $deanOwnerError], 400);
                     }
                 }
-            } elseif (array_key_exists('assigned_program_head_id', $input)) {
+
+                if (in_array($targetRoleId, [2, 3, 4, 5], true)) {
+                    if ($targetProgramId === null) {
+                        $programRequiredMessage = $targetRoleId === 3
+                            ? 'Owned program is required for program heads.'
+                            : 'Assigned program is required for this role.';
+                        json_response(['error' => 'validation', 'message' => $programRequiredMessage], 400);
+                    }
+
+                    if ($targetRoleId === 3) {
+                        $programOwnerError = $validateProgramHeadProgramOwner($targetProgramId, $targetDeptId, $userId);
+                        if ($programOwnerError !== null) {
+                            json_response(['error' => 'validation', 'message' => $programOwnerError], 400);
+                        }
+                    } else {
+                        $assignedHeadError = $validateAssignedProgramHead($targetProgramId, $targetDeptId);
+                        if ($assignedHeadError !== null) {
+                            json_response(['error' => 'validation', 'message' => $assignedHeadError], 400);
+                        }
+                    }
+                }
+            } elseif (array_key_exists('assigned_program_head_id', $input) || in_array($targetRoleId, [2, 3, 4, 5], true)) {
                 json_response(['error' => 'schema_mismatch', 'message' => 'Database is missing assigned_program_head_id. Run the latest SQL migration first.'], 500);
             }
 
@@ -1210,15 +1473,27 @@ switch ($endpoint) {
             if (isset($input['email'])) { $fields[] = 'email = ?'; $types .= 's'; $values[] = $input['email']; }
             if (isset($input['contact_no'])) { $fields[] = 'contact_no = ?'; $types .= 's'; $values[] = $input['contact_no']; }
             if (isset($input['id_number'])) { $fields[] = 'id_number = ?'; $types .= 's'; $values[] = $input['id_number']; }
-            if (isset($input['dept_id'])) { $fields[] = 'dept_id = ?'; $types .= 'i'; $values[] = (int)$input['dept_id']; }
+            if (array_key_exists('dept_id', $input)) {
+                if ($input['dept_id'] === '' || $input['dept_id'] === null) {
+                    $fields[] = 'dept_id = NULL';
+                } else {
+                    $fields[] = 'dept_id = ?';
+                    $types .= 'i';
+                    $values[] = (int)$input['dept_id'];
+                }
+            }
             if ($hasAssignedProgramHeadCol) {
                 $targetRoleId = isset($input['role_id']) ? (int)$input['role_id'] : (int)($existing['role_id'] ?? 0);
-                if ($targetRoleId !== 5) {
+                if (!in_array($targetRoleId, [2, 3, 4, 5], true)) {
                     $fields[] = 'assigned_program_head_id = NULL';
                 } elseif (array_key_exists('assigned_program_head_id', $input)) {
-                    $fields[] = 'assigned_program_head_id = ?';
-                    $types .= 'i';
-                    $values[] = (int)$input['assigned_program_head_id'];
+                    if ($input['assigned_program_head_id'] === '' || $input['assigned_program_head_id'] === null) {
+                        $fields[] = 'assigned_program_head_id = NULL';
+                    } else {
+                        $fields[] = 'assigned_program_head_id = ?';
+                        $types .= 'i';
+                        $values[] = (int)$input['assigned_program_head_id'];
+                    }
                 }
             }
             if (isset($input['is_first_login'])) { $fields[] = 'is_first_login = ?'; $types .= 'i'; $values[] = (int)$input['is_first_login']; }
@@ -1234,9 +1509,24 @@ switch ($endpoint) {
             $values[] = $userId;
             $stmt->bind_param($types, ...$values);
             if (!$stmt->execute()) json_response(['error' => 'update_failed', 'message' => $stmt->error], 500);
+
+            $finalRoleId = isset($input['role_id']) ? (int)$input['role_id'] : (int)($existing['role_id'] ?? 0);
+            $finalDeptId = array_key_exists('dept_id', $input)
+                ? (($input['dept_id'] === '' || $input['dept_id'] === null) ? null : (int)$input['dept_id'])
+                : (isset($existing['dept_id']) && $existing['dept_id'] !== null ? (int)$existing['dept_id'] : null);
+            $finalProgramId = null;
+            if ($hasAssignedProgramHeadCol) {
+                if (array_key_exists('assigned_program_head_id', $input)) {
+                    $finalProgramId = ($input['assigned_program_head_id'] === '' || $input['assigned_program_head_id'] === null) ? null : (int)$input['assigned_program_head_id'];
+                } elseif (isset($existing['assigned_program_head_id']) && $existing['assigned_program_head_id'] !== null) {
+                    $finalProgramId = (int)$existing['assigned_program_head_id'];
+                }
+            }
+            $syncUserOwnership($userId, $finalRoleId, $finalDeptId, $finalProgramId);
+
             $dept_id = null;
-            if (isset($input['dept_id'])) {
-                $dept_id = (int)$input['dept_id'];
+            if (array_key_exists('dept_id', $input)) {
+                $dept_id = ($input['dept_id'] === '' || $input['dept_id'] === null) ? null : (int)$input['dept_id'];
             } else {
                 $dStmt = $mysqli->prepare("SELECT dept_id FROM tbl_users WHERE user_id = ? LIMIT 1");
                 if ($dStmt) {
@@ -1272,8 +1562,8 @@ switch ($endpoint) {
             json_response(['user_id' => $userId] + $input);
 
         } elseif ($request_method === 'POST') {
-            if (!$isAdminRole) {
-                json_response(['error' => 'forbidden', 'message' => 'View-only access. Only admin can create users.'], 403);
+            if (!$isAdminRole && !$isDepartmentAdminRole) {
+                json_response(['error' => 'forbidden', 'message' => 'View-only access. Only admin and department admin can create users.'], 403);
             }
             // Create new user - validate required fields
             if (empty($input['email']) || empty($input['first_name']) || empty($input['last_name']) || empty($input['id_number']) || !isset($input['role_id'])) {
@@ -1285,7 +1575,7 @@ switch ($endpoint) {
                 json_response(['error' => 'validation', 'message' => 'Email must use @phinmaed.com'], 400);
             }
             if (!$is_valid_id_number($input['id_number'])) {
-                json_response(['error' => 'validation', 'message' => 'ID number must match 02-xxxx-<any digits>'], 400);
+                json_response(['error' => 'validation', 'message' => 'ID number must match format ##-###-letter (e.g. 24-018-F)'], 400);
             }
 
             // Ensure email uniqueness
@@ -1311,13 +1601,26 @@ switch ($endpoint) {
                 json_response(['error' => 'validation', 'message' => 'Admin role is not allowed.'], 400);
             }
             $deptVal = isset($input['dept_id']) && $input['dept_id'] !== '' ? (int)$input['dept_id'] : null;
+            if ($isDepartmentAdminRole) {
+                if ($authUserDeptId === null) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin is not assigned to a department.'], 403);
+                }
+                if (!in_array($roleVal, [3, 4, 5], true)) {
+                    json_response(['error' => 'forbidden', 'message' => 'Department admin can only create Program Head, Secretary, and Teacher users.'], 403);
+                }
+                $deptVal = (int)$authUserDeptId;
+                $input['dept_id'] = $deptVal;
+            }
             if ($roleVal !== 1 && $deptVal === null) {
-                json_response(['error' => 'validation', 'message' => 'Department is required for non-admin users.'], 400);
+                json_response(['error' => 'validation', 'message' => 'Department is required for this role.'], 400);
             }
             if ($roleVal === 1) {
                 $deptVal = null;
             }
-            if ($roleVal === 5 && !$hasAssignedProgramHeadCol) {
+            $hasAssignedProgramInput = array_key_exists('assigned_program_head_id', $input)
+                && $input['assigned_program_head_id'] !== ''
+                && $input['assigned_program_head_id'] !== null;
+            if (in_array($roleVal, [2, 3, 4, 5], true) && !$hasAssignedProgramHeadCol) {
                 json_response(['error' => 'schema_mismatch', 'message' => 'Database is missing assigned_program_head_id. Run the latest SQL migration first.'], 500);
             }
             $idNumberVal = $input['id_number'];
@@ -1325,14 +1628,31 @@ switch ($endpoint) {
             $contactNoVal = $input['contact_no'] ?? null;
             $assignedHeadVal = null;
 
-            if ($hasAssignedProgramHeadCol && $roleVal === 5) {
-                if (!array_key_exists('assigned_program_head_id', $input) || $input['assigned_program_head_id'] === '' || $input['assigned_program_head_id'] === null) {
-                    json_response(['error' => 'validation', 'message' => 'Assigned program is required for teachers.'], 400);
+            if ($roleVal === 2) {
+                $deanOwnerError = $validateDeanDepartmentOwner($deptVal, null);
+                if ($deanOwnerError !== null) {
+                    json_response(['error' => 'dean_department_in_use', 'message' => $deanOwnerError], 409);
+                }
+            }
+
+            if ($hasAssignedProgramHeadCol && in_array($roleVal, [2, 3, 4, 5], true)) {
+                if (!$hasAssignedProgramInput) {
+                    $programRequiredMessage = $roleVal === 3
+                        ? 'Owned program is required for program heads.'
+                        : 'Assigned program is required for this role.';
+                    json_response(['error' => 'validation', 'message' => $programRequiredMessage], 400);
                 }
                 $assignedHeadVal = (int)$input['assigned_program_head_id'];
-                $assignedHeadError = $validateAssignedProgramHead($assignedHeadVal, $deptVal);
-                if ($assignedHeadError !== null) {
-                    json_response(['error' => 'validation', 'message' => $assignedHeadError], 400);
+                if ($roleVal === 3) {
+                    $programOwnerError = $validateProgramHeadProgramOwner($assignedHeadVal, $deptVal, null);
+                    if ($programOwnerError !== null) {
+                        json_response(['error' => 'validation', 'message' => $programOwnerError], 400);
+                    }
+                } else {
+                    $assignedHeadError = $validateAssignedProgramHead($assignedHeadVal, $deptVal);
+                    if ($assignedHeadError !== null) {
+                        json_response(['error' => 'validation', 'message' => $assignedHeadError], 400);
+                    }
                 }
             }
 
@@ -1353,6 +1673,7 @@ switch ($endpoint) {
             }
             if (!$stmt->execute()) json_response(['error' => 'insert_failed', 'message' => $stmt->error], 500);
             $newId = $stmt->insert_id;
+            $syncUserOwnership($newId, $roleVal, $deptVal, $assignedHeadVal);
             
             $dept_id = isset($input['dept_id']) ? (int)$input['dept_id'] : null;
 
@@ -1390,7 +1711,53 @@ switch ($endpoint) {
     case 'roles':
         if ($request_method === 'GET') {
             $result = $mysqli->query("SELECT role_id, role_name FROM tbl_roles ORDER BY role_id");
-            json_response($result->fetch_all(MYSQLI_ASSOC));
+            $roles = $result->fetch_all(MYSQLI_ASSOC);
+            // Format role names to proper nouns for display
+            $roles = array_map(function($role) {
+                return [
+                    'role_id' => $role['role_id'],
+                    'role_name' => app_format_role_name($role['role_name'])
+                ];
+            }, $roles);
+            json_response($roles);
+        } elseif ($request_method === 'POST') {
+            // Only admin can create roles
+            if ((int)$authRoleId !== 1) {
+                json_response(['error' => 'forbidden', 'message' => 'Only admin can create roles'], 403);
+            }
+
+            $input = json_decode(file_get_contents("php://input"), true) or $input = [];
+            $role_name = trim($input['role_name'] ?? '');
+
+            if (!$role_name) {
+                json_response(['error' => 'validation_error', 'message' => 'Role name is required'], 400);
+            }
+
+            // Check if role already exists (case-insensitive)
+            $checkStmt = $mysqli->prepare("SELECT role_id FROM tbl_roles WHERE LOWER(role_name) = LOWER(?)");
+            if (!$checkStmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $checkStmt->bind_param("s", $role_name);
+            $checkStmt->execute();
+            $existingRole = $checkStmt->get_result()->fetch_assoc();
+            if ($existingRole) {
+                json_response(['error' => 'duplicate_error', 'message' => 'Role name already exists'], 409);
+            }
+
+            // Get the next role_id (max + 1)
+            $maxResult = $mysqli->query("SELECT MAX(role_id) as max_id FROM tbl_roles");
+            $maxRow = $maxResult->fetch_assoc();
+            $nextRoleId = ($maxRow['max_id'] ?? 0) + 1;
+
+            // Insert the new role
+            $insertStmt = $mysqli->prepare("INSERT INTO tbl_roles (role_id, role_name) VALUES (?, ?)");
+            if (!$insertStmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $insertStmt->bind_param("is", $nextRoleId, $role_name);
+
+            if (!$insertStmt->execute()) {
+                json_response(['error' => 'insert_failed', 'message' => $mysqli->error], 500);
+            }
+
+            json_response(['role_id' => $nextRoleId, 'role_name' => $role_name], 201);
         }
         break;
     
@@ -1450,7 +1817,7 @@ switch ($endpoint) {
                 json_response($res ? $res->fetch_all(MYSQLI_ASSOC) : []);
             }
 
-            if (in_array((int)$authRoleId, [2, 4], true)) {
+            if (in_array((int)$authRoleId, [2, 4, 6], true)) {
                 if ($authUserDeptId === null) {
                     json_response([]);
                 }
@@ -1468,7 +1835,7 @@ switch ($endpoint) {
 
     case 'deans':
          if ($request_method === 'GET') {
-             $result = $mysqli->query("SELECT user_id, first_name, last_name FROM tbl_users WHERE role_id = 2 AND status = 1 ORDER BY last_name, first_name");
+             $result = $mysqli->query("SELECT user_id, first_name, last_name FROM tbl_users WHERE role_id = 2 AND LOWER(TRIM(COALESCE(status, 'active'))) IN ('active', '1', 'true') ORDER BY last_name, first_name");
              json_response($result->fetch_all(MYSQLI_ASSOC));
          }
          break;
@@ -1516,10 +1883,10 @@ switch ($endpoint) {
         $activeSemesterId = $resolve_active_semester_id();
 
         $isAdminRole = ((int)$authRoleId === 1);
-        $isDeanRole = ((int)$authRoleId === 2);
+        $isDeanRole = in_array((int)$authRoleId, [2, 6], true);
         $isProgramHeadRole = ((int)$authRoleId === 3);
         $isSecretaryRole = ((int)$authRoleId === 4);
-        $canManageClassSchedules = in_array((int)$authRoleId, [1, 2, 3], true);
+        $canManageClassSchedules = in_array((int)$authRoleId, [1, 2, 3, 6], true);
         $programHeadProgramIds = [];
         if ($isProgramHeadRole && $authUserId) {
             $phStmt = $mysqli->prepare("SELECT program_id FROM tbl_programs WHERE head_id = ?");
@@ -1545,13 +1912,13 @@ switch ($endpoint) {
 
         $require_schedule_manage_access = function() use ($canManageClassSchedules) {
             if ($canManageClassSchedules) return;
-            json_response(['error' => 'forbidden', 'message' => 'Only admin, dean, and program head can manage class schedules.'], 403);
+            json_response(['error' => 'forbidden', 'message' => 'Only admin, dean, department admin, and program head can manage class schedules.'], 403);
         };
 
         $require_dean_scope = function() use ($isDeanRole, $authUserDeptId) {
             if (!$isDeanRole) return;
             if ($authUserDeptId === null) {
-                json_response(['error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+                json_response(['error' => 'forbidden', 'message' => 'Your account is not assigned to a department.'], 403);
             }
         };
 
@@ -1666,6 +2033,8 @@ switch ($endpoint) {
             return null;
         };
 
+        $parallelSubjectTimeMessage = 'This subject already has an overlapping schedule on the selected day. Parallel classes for the same subject must use the exact same start and end time.';
+
         $enforce_program_scope_for_subject_section = function($subjectId, $sectionId) use (
             $isProgramHeadRole,
             $programHeadProgramIds,
@@ -1702,7 +2071,7 @@ switch ($endpoint) {
             $deptId = $programId ? $get_dept_id_for_program($programId) : null;
 
             if ($deptId === null || (int)$deptId !== (int)$authUserDeptId) {
-                json_response(['error' => 'forbidden', 'message' => 'Dean can only manage schedules within their assigned department.'], 403);
+                json_response(['error' => 'forbidden', 'message' => 'You can only manage schedules within your assigned department.'], 403);
             }
         };
 
@@ -1754,7 +2123,7 @@ switch ($endpoint) {
                 $require_dean_scope();
                 $scheduleDeptId = $get_dept_id_for_schedule($scheduleId);
                 if ($scheduleDeptId === null || (int)$scheduleDeptId !== (int)$authUserDeptId) {
-                    json_response(['error' => 'forbidden', 'message' => 'Dean can only delete schedules within their assigned department.'], 403);
+                    json_response(['error' => 'forbidden', 'message' => 'You can only delete schedules within your assigned department.'], 403);
                 }
             }
 
@@ -1826,7 +2195,7 @@ switch ($endpoint) {
                 $require_dean_scope();
                 $scheduleDeptId = $get_dept_id_for_schedule($scheduleId);
                 if ($scheduleDeptId === null || (int)$scheduleDeptId !== (int)$authUserDeptId) {
-                    json_response(['error' => 'forbidden', 'message' => 'Dean can only update schedules within their assigned department.'], 403);
+                    json_response(['error' => 'forbidden', 'message' => 'You can only update schedules within your assigned department.'], 403);
                 }
             }
 
@@ -1886,25 +2255,39 @@ switch ($endpoint) {
                 json_response(['error' => 'duplicate_schedule', 'message' => 'Schedule already exists.'], 409);
             }
 
-            // Check room overlap: same day, same room, overlapping times
+            // ===== CHECK 2: ROOM OVERLAP =====
             $roomOverlap = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND room_id = ? AND NOT (end_time <= ? OR start_time >= ?) AND schedule_id <> ? LIMIT 1");
             if (!$roomOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $roomOverlap->bind_param("isissi", $semesterId, $dayOfWeek, $roomId, $startTime, $endTime, $scheduleId);
             $roomOverlap->execute();
             if ($roomOverlap->get_result()->fetch_assoc()) {
-                json_response(['error' => 'time_conflict', 'message' => 'Time conflict: room already has a class during this time'], 409);
+                json_response(['error' => 'time_conflict', 'message' => 'Room Conflict: The selected room is already occupied during this timeframe.'], 409);
             }
 
-            // Block duplicate section+subject assignments on the same day (same semester).
-            if ($sectionId && $subjectId) {
-                $secSubjectDup = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND subject_id = ? AND schedule_id <> ? LIMIT 1");
-                if ($secSubjectDup) {
-                    $secSubjectDup->bind_param('isiii', $semesterId, $dayOfWeek, $sectionId, $subjectId, $scheduleId);
-                    $secSubjectDup->execute();
-                    if ($secSubjectDup->get_result()->fetch_assoc()) {
-                        json_response(['error' => 'duplicate_section_subject', 'message' => 'Duplicate not allowed: this section already has this subject on the selected day'], 409);
-                    }
+            // ===== CHECK 3: SECTION OVERLAP (Fixes Bug 2) =====
+            $sectionOverlap = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND NOT (end_time <= ? OR start_time >= ?) AND schedule_id <> ? LIMIT 1");
+            if (!$sectionOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $sectionOverlap->bind_param("isissi", $semesterId, $dayOfWeek, $sectionId, $startTime, $endTime, $scheduleId);
+            $sectionOverlap->execute();
+            if ($sectionOverlap->get_result()->fetch_assoc()) {
+                json_response(['error' => 'section_conflict', 'message' => 'Section Conflict: This student section is already scheduled for another class during this timeframe.'], 409);
+            }
+
+            // ===== CHECK 4: TEACHER OVERLAP WITH PARALLEL CLASS LOGIC (Fixes Bug 1) =====
+            $teacherOverlap = $mysqli->prepare("SELECT schedule_id, subject_id, start_time, end_time FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND user_id = ? AND NOT (end_time <= ? OR start_time >= ?) AND schedule_id <> ? LIMIT 1");
+            if (!$teacherOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $teacherOverlap->bind_param("isissi", $semesterId, $dayOfWeek, $teacherId, $startTime, $endTime, $scheduleId);
+            $teacherOverlap->execute();
+            $teacherConflict = $teacherOverlap->get_result()->fetch_assoc();
+
+            if ($teacherConflict) {
+                if ((int)$teacherConflict['subject_id'] !== (int)$subjectId) {
+                    json_response(['error' => 'teacher_conflict', 'message' => 'Teacher Conflict: The instructor is already teaching a DIFFERENT subject during this timeframe.'], 409);
                 }
+                if ($teacherConflict['start_time'] !== $startTime || $teacherConflict['end_time'] !== $endTime) {
+                    json_response(['error' => 'parallel_time_mismatch', 'message' => 'Parallel Class Error: To merge sections under this teacher, the start and end times must match the existing class exactly.'], 409);
+                }
+                // Same teacher, same subject, exact matching time -> PARALLEL CLASS APPROVED!
             }
 
             // Now perform update: set user_id, semester_id, subject_id, section_id, room_id, day_of_week, start_time, end_time
@@ -1974,28 +2357,48 @@ switch ($endpoint) {
                 }
             }
 
+            // ===== CHECK 1: EXACT DUPLICATE =====
             $dup = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE room_id = ? AND subject_id = ? AND section_id = ? AND user_id = ? AND semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND start_time = ? AND end_time = ? LIMIT 1");
             if (!$dup) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
             $dup->bind_param("iiiiisss", $roomId, $subjectId, $sectionId, $teacherId, $semesterId, $dayOfWeek, $startTime, $endTime);
             $dup->execute();
             if ($dup->get_result()->fetch_assoc()) {
-                json_response(['error' => 'duplicate_schedule', 'message' => 'Schedule already exists.'], 409);
+                json_response(['error' => 'duplicate_schedule', 'message' => 'This exact schedule already exists.'], 409);
             }
 
+            // ===== CHECK 2: ROOM OVERLAP =====
             $roomOverlap = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND room_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
-            if ($roomOverlap) {
-                $roomOverlap->bind_param("isiss", $semesterId, $dayOfWeek, $roomId, $startTime, $endTime);
-                $roomOverlap->execute();
-                if ($roomOverlap->get_result()->fetch_assoc()) json_response(['error' => 'time_conflict', 'message' => 'Time conflict: room already has a class during this time'], 409);
+            if (!$roomOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $roomOverlap->bind_param("isiss", $semesterId, $dayOfWeek, $roomId, $startTime, $endTime);
+            $roomOverlap->execute();
+            if ($roomOverlap->get_result()->fetch_assoc()) {
+                json_response(['error' => 'time_conflict', 'message' => 'Room Conflict: The selected room is already occupied during this timeframe.'], 409);
             }
 
-            $secSubjectDup = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND subject_id = ? LIMIT 1");
-            if ($secSubjectDup) {
-                $secSubjectDup->bind_param("isii", $semesterId, $dayOfWeek, $sectionId, $subjectId);
-                $secSubjectDup->execute();
-                if ($secSubjectDup->get_result()->fetch_assoc()) {
-                    json_response(['error' => 'duplicate_section_subject', 'message' => 'Duplicate not allowed: this section already has this subject on the selected day'], 409);
+            // ===== CHECK 3: SECTION OVERLAP (Fixes Bug 2) =====
+            $sectionOverlap = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
+            if (!$sectionOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $sectionOverlap->bind_param("isiss", $semesterId, $dayOfWeek, $sectionId, $startTime, $endTime);
+            $sectionOverlap->execute();
+            if ($sectionOverlap->get_result()->fetch_assoc()) {
+                json_response(['error' => 'section_conflict', 'message' => 'Section Conflict: This student section is already scheduled for another class during this timeframe.'], 409);
+            }
+
+            // ===== CHECK 4: TEACHER OVERLAP WITH PARALLEL CLASS LOGIC (Fixes Bug 1) =====
+            $teacherOverlap = $mysqli->prepare("SELECT schedule_id, subject_id, start_time, end_time FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND user_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
+            if (!$teacherOverlap) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+            $teacherOverlap->bind_param("isiss", $semesterId, $dayOfWeek, $teacherId, $startTime, $endTime);
+            $teacherOverlap->execute();
+            $teacherConflict = $teacherOverlap->get_result()->fetch_assoc();
+
+            if ($teacherConflict) {
+                if ((int)$teacherConflict['subject_id'] !== (int)$subjectId) {
+                    json_response(['error' => 'teacher_conflict', 'message' => 'Teacher Conflict: The instructor is already teaching a DIFFERENT subject during this timeframe.'], 409);
                 }
+                if ($teacherConflict['start_time'] !== $startTime || $teacherConflict['end_time'] !== $endTime) {
+                    json_response(['error' => 'parallel_time_mismatch', 'message' => 'Parallel Class Error: To merge sections under this teacher, the start and end times must match the existing class exactly.'], 409);
+                }
+                // Same teacher, same subject, exact matching time -> PARALLEL CLASS APPROVED!
             }
 
             $stmt = $mysqli->prepare("INSERT INTO tbl_class_schedules (user_id, semester_id, subject_id, section_id, room_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -2264,7 +2667,8 @@ switch ($endpoint) {
             $acceptedRows = [];
 
             $roomOverlapStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND room_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
-            $secSubjectDupStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND subject_id = ? LIMIT 1");
+            $sectionOverlapStmt = $mysqli->prepare("SELECT schedule_id FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND section_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
+            $teacherOverlapStmt = $mysqli->prepare("SELECT schedule_id, subject_id, start_time, end_time FROM tbl_class_schedules WHERE semester_id = ? AND LOWER(TRIM(day_of_week)) = ? AND user_id = ? AND NOT (end_time <= ? OR start_time >= ?) LIMIT 1");
 
             $stmt = $mysqli->prepare("INSERT INTO tbl_class_schedules (user_id, semester_id, subject_id, section_id, room_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
             if (!$stmt) json_response(['error' => 'Failed to prepare schedule insert', 'details' => $mysqli->error], 500);
@@ -2345,7 +2749,7 @@ switch ($endpoint) {
                     }
                 }
 
-                $teacherVal = $get_value($normalized, ['user_id', 'teacher_id', 'teacher', 'teacher_name', 'teacher_email']);
+            $teacherVal = $get_value($normalized, ['user_id', 'teacher_id', 'teacher', 'teacher_name', 'teachername', 'name', 'teacher_email']);
                 $teacher = null;
                 if ($teacherVal !== null && is_numeric($teacherVal)) {
                     $teacher = $teacherById[(string)(int)$teacherVal] ?? null;
@@ -2408,45 +2812,76 @@ switch ($endpoint) {
                     if ((int)$accepted['semester_id'] !== $semesterId) continue;
                     if ($accepted['day_of_week'] !== $day) continue;
 
-                    $sameSectionAndSubject = ((int)$accepted['section_id'] === $sectionIdForCheck)
-                        && ((int)$accepted['subject_id'] === $subjectIdForCheck);
-                    if ($sameSectionAndSubject) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Duplicate not allowed: this section already has this subject on the selected day'];
-                        $skipped++;
-                        $conflict = true;
-                        break;
+                    // Only check conflicts when time blocks overlap
+                    if (!$time_overlaps($startTime, $endTime, $accepted['start_time'], $accepted['end_time'])) continue;
+
+                    // 1. Room Conflict in batch
+                    if ((int)$accepted['room_id'] === $roomIdForCheck) {
+                        $errors[] = ['row' => $rowNumber, 'message' => 'Room Conflict: Room already assigned in this batch during this time'];
+                        $skipped++; $conflict = true; break;
                     }
 
-                    if (!$time_overlaps($startTime, $endTime, $accepted['start_time'], $accepted['end_time'])) continue;
-                    if ((int)$accepted['room_id'] === $roomIdForCheck) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Conflict: room already has a class during this time'];
-                        $skipped++;
-                        $conflict = true;
-                        break;
+                    // 2. Section Conflict in batch (Fixes Bug 2 in batches)
+                    if ((int)$accepted['section_id'] === $sectionIdForCheck) {
+                        $errors[] = ['row' => $rowNumber, 'message' => 'Section Conflict: Section already assigned to another class in this batch during this time'];
+                        $skipped++; $conflict = true; break;
+                    }
+
+                    // 3. Teacher Parallel Class Check in batch (Fixes Bug 3 in batches)
+                    if ((int)$accepted['teacher_id'] === $teacherId) {
+                        $sameSubject = ((int)$accepted['subject_id'] === $subjectIdForCheck);
+                        $sameExactTime = (string)$accepted['start_time'] === (string)$startTime && (string)$accepted['end_time'] === (string)$endTime;
+
+                        if (!$sameSubject) {
+                            $errors[] = ['row' => $rowNumber, 'message' => 'Teacher Conflict: Instructor assigned to a different subject at this time in batch'];
+                            $skipped++; $conflict = true; break;
+                        }
+                        if ($sameSubject && !$sameExactTime) {
+                            $errors[] = ['row' => $rowNumber, 'message' => 'Parallel Class Error: Times must match exactly for parallel classes in batch'];
+                            $skipped++; $conflict = true; break;
+                        }
+                        // Same teacher, same subject, exact matching time -> PARALLEL CLASS ALLOWED!
                     }
                 }
                 if ($conflict) continue;
 
+                // 1. Layer 1 Database Room Check
                 if ($roomOverlapStmt) {
                     $roomOverlapStmt->bind_param('isiss', $semesterId, $day, $roomIdForCheck, $startTime, $endTime);
                     $roomOverlapStmt->execute();
-                    $rv = $roomOverlapStmt->get_result();
-                    if ($rv && $rv->fetch_assoc()) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Conflict: room already has a class during this time'];
-                        $skipped++;
-                        $conflict = true;
+                    if ($roomOverlapStmt->get_result()->fetch_assoc()) {
+                        $errors[] = ['row' => $rowNumber, 'message' => 'Conflict: Room already has a class during this time.'];
+                        $skipped++; $conflict = true;
                     }
                 }
                 if ($conflict) continue;
 
-                if ($secSubjectDupStmt) {
-                    $secSubjectDupStmt->bind_param('isii', $semesterId, $day, $sectionIdForCheck, $subjectIdForCheck);
-                    $secSubjectDupStmt->execute();
-                    $sv = $secSubjectDupStmt->get_result();
-                    if ($sv && $sv->fetch_assoc()) {
-                        $errors[] = ['row' => $rowNumber, 'message' => 'Duplicate not allowed: this section already has this subject on the selected day'];
-                        $skipped++;
-                        $conflict = true;
+                // 2. Layer 1 Database Section Check
+                if ($sectionOverlapStmt) {
+                    $sectionOverlapStmt->bind_param('isiss', $semesterId, $day, $sectionIdForCheck, $startTime, $endTime);
+                    $sectionOverlapStmt->execute();
+                    if ($sectionOverlapStmt->get_result()->fetch_assoc()) {
+                        $errors[] = ['row' => $rowNumber, 'message' => 'Section Conflict: This section is already scheduled for another class during this time.'];
+                        $skipped++; $conflict = true;
+                    }
+                }
+                if ($conflict) continue;
+
+                // 3. Layer 1 Database Teacher / Parallel Check
+                if ($teacherOverlapStmt) {
+                    $teacherOverlapStmt->bind_param('isiss', $semesterId, $day, $teacherId, $startTime, $endTime);
+                    $teacherOverlapStmt->execute();
+                    $tConflict = $teacherOverlapStmt->get_result()->fetch_assoc();
+
+                    if ($tConflict) {
+                        if ((int)$tConflict['subject_id'] !== (int)$subjectIdForCheck) {
+                            $errors[] = ['row' => $rowNumber, 'message' => 'Teacher Conflict: Instructor is already teaching a DIFFERENT subject at this time.'];
+                            $skipped++; $conflict = true;
+                        } else if ($tConflict['start_time'] !== $startTime || $tConflict['end_time'] !== $endTime) {
+                            $errors[] = ['row' => $rowNumber, 'message' => 'Parallel Class Error: Times must match exactly for parallel classes.'];
+                            $skipped++; $conflict = true;
+                        }
+                        // Same teacher, same subject, exact time -> PARALLEL CLASS APPROVED!
                     }
                 }
                 if ($conflict) continue;

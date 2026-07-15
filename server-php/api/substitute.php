@@ -109,6 +109,87 @@ list($subJoinOffering, $subTeacherExpr, $subSubjectExpr, $subSectionExpr) = subs
 // ENDPOINTS
 // =================================================================================
 
+if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutions'], true) && $param1 === 'available') {
+    if (!in_array((int)$authUserRole, [2, 6], true)) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Only dean and department admin can view available substitution schedules.'], 403);
+    }
+    if (in_array((int)$authUserRole, [2, 6], true) && $authUserDept === null) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Your account is not assigned to a department.'], 403);
+    }
+    if ($subTeacherExpr === 'NULL') {
+        json_response([]);
+    }
+
+    $teacherId = isset($_GET['teacher_id']) ? (int)$_GET['teacher_id'] : (isset($_GET['original_teacher_id']) ? (int)$_GET['original_teacher_id'] : 0);
+    if ($teacherId <= 0) {
+        json_response(['ok' => false, 'error' => 'missing_teacher_id', 'message' => 'teacher_id is required.'], 400);
+    }
+
+    $sql = "
+        SELECT
+            ar.attendance_id,
+            ar.user_id AS teacher_id,
+            ar.schedule_id,
+            DATE_FORMAT(ar.date, '%Y-%m-%d') AS date,
+            cs.day_of_week,
+            cs.start_time,
+            cs.end_time,
+            cs.room_id,
+            r.floor_id,
+            r.room_name,
+            {$subSubjectExpr} AS subject_id,
+            {$subSectionExpr} AS section_id,
+            s.subject_code,
+            s.subject_name,
+            sec.section_name,
+            sem.semester_id,
+            sem.term AS semester_term,
+            DATE_FORMAT(sem.start_date, '%Y-%m-%d') AS semester_start,
+            DATE_FORMAT(sem.end_date, '%Y-%m-%d') AS semester_end,
+            ar.flag_in_id,
+            ar.flag_check_id,
+            ar.flag_out_id
+        FROM tbl_attendance_records ar
+        JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id
+        {$subJoinOffering}
+        JOIN tbl_semesters sem ON cs.semester_id = sem.semester_id
+        LEFT JOIN tbl_rooms r ON cs.room_id = r.room_id
+        LEFT JOIN tbl_subject s ON {$subSubjectExpr} = s.subject_id
+        LEFT JOIN tbl_sections sec ON {$subSectionExpr} = sec.section_id
+        LEFT JOIN tbl_users orig_teacher ON {$subTeacherExpr} = orig_teacher.user_id
+        LEFT JOIN tbl_substitutions existing_sub ON existing_sub.schedule_id = ar.schedule_id AND existing_sub.date = ar.date
+        WHERE ar.user_id = ?
+          AND ar.user_id = {$subTeacherExpr}
+          AND ar.date >= CURDATE()
+          AND ar.date < DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+          AND sem.status = 'active'
+          AND CURDATE() BETWEEN sem.start_date AND sem.end_date
+          AND ar.date BETWEEN sem.start_date AND sem.end_date
+          AND existing_sub.substitution_id IS NULL
+          AND COALESCE(ar.flag_in_id, 1) = 1
+          AND COALESCE(ar.flag_check_id, 1) = 1
+          AND COALESCE(ar.flag_out_id, 1) = 1
+    ";
+
+    $types = 'i';
+    $params = [$teacherId];
+    if (in_array((int)$authUserRole, [2, 6], true)) {
+        $sql .= " AND orig_teacher.dept_id = ?";
+        $types .= 'i';
+        $params[] = (int)$authUserDept;
+    }
+    $sql .= " ORDER BY ar.date ASC, cs.start_time ASC, cs.end_time ASC";
+
+    $stmt = $mysqli->prepare($sql);
+    if (!$stmt) json_response(['error' => 'prepare_failed', 'message' => $mysqli->error], 500);
+    $stmt->bind_param($types, ...$params);
+    if (!$stmt->execute()) {
+        json_response(['error' => 'execute_failed', 'message' => $stmt->error], 500);
+    }
+    $res = $stmt->get_result();
+    json_response($res ? $res->fetch_all(MYSQLI_ASSOC) : []);
+}
+
 if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutions'], true)) {
     
     $sql = "
@@ -130,11 +211,15 @@ if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutio
             s.subject_code,
             sec.section_name,
             cs.start_time,
-            cs.end_time
+            cs.end_time,
+            orig_ar.attendance_id AS original_attendance_id,
+            sub_ar.attendance_id AS substitute_attendance_id
 
         FROM tbl_substitutions ss
         LEFT JOIN tbl_class_schedules cs ON ss.schedule_id = cs.schedule_id
         {$subJoinOffering}
+        LEFT JOIN tbl_attendance_records orig_ar ON orig_ar.schedule_id = ss.schedule_id AND orig_ar.date = ss.date AND orig_ar.user_id = {$subTeacherExpr}
+        LEFT JOIN tbl_attendance_records sub_ar ON sub_ar.schedule_id = ss.schedule_id AND sub_ar.date = ss.date AND sub_ar.user_id = ss.substitute_user_id
         LEFT JOIN tbl_subject s ON {$subSubjectExpr} = s.subject_id
         LEFT JOIN tbl_sections sec ON {$subSectionExpr} = sec.section_id
         LEFT JOIN tbl_users orig_teacher ON {$subTeacherExpr} = orig_teacher.user_id
@@ -152,12 +237,21 @@ if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutio
         $types .= 'i';
     }
 
-    // --- DEPARTMENT FILTERING ---
-    if ($authUserRole !== 1 && $authUserDept !== null) {
+    // --- ROLE FILTERING ---
+    if ((int)$authUserRole === 5) {
+        $where[] = "(({$subTeacherExpr} = ? OR ss.substitute_user_id = ?) AND orig_ar.attendance_id IS NOT NULL)";
+        $params[] = (int)$authUserId;
+        $params[] = (int)$authUserId;
+        $types .= 'ii';
+    } else {
+        $where[] = "orig_ar.attendance_id IS NOT NULL";
+    }
+
+    if ((int)$authUserRole !== 5 && $authUserRole !== 1 && $authUserDept !== null) {
         $where[] = "orig_teacher.dept_id = ?";
         $params[] = $authUserDept;
         $types .= 'i';
-    } elseif ($authUserRole !== 1 && $authUserDept === null) {
+    } elseif ((int)$authUserRole !== 5 && $authUserRole !== 1 && $authUserDept === null) {
         $where[] = "1 = 0";
     }
 
@@ -188,11 +282,11 @@ if ($request_method === 'GET' && in_array($endpoint, ['substitute', 'substitutio
 }
 
 elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substitutions'], true)) {
-    if ((int)$authUserRole !== 2) {
-        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Only dean can add substitutions.'], 403);
+    if (!in_array((int)$authUserRole, [2, 6], true)) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Only dean and department admin can add substitutions.'], 403);
     }
-    if ((int)$authUserRole === 2 && $authUserDept === null) {
-        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Dean is not assigned to a department.'], 403);
+    if (in_array((int)$authUserRole, [2, 6], true) && $authUserDept === null) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Your account is not assigned to a department.'], 403);
     }
 
     // Accept both the batch payload used by the Substitutions page and
@@ -223,165 +317,205 @@ elseif ($request_method === 'POST' && in_array($endpoint, ['substitute', 'substi
         json_response(['ok' => false, 'error' => 'not_found', 'message' => 'Selected substitute user was not found.'], 404);
     }
     $subDeptId = isset($subDeptRow['dept_id']) && $subDeptRow['dept_id'] !== null ? (int)$subDeptRow['dept_id'] : null;
-    if ((int)$authUserRole === 2 && ($subDeptId === null || $subDeptId !== (int)$authUserDept)) {
-        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'Dean can only assign substitutes within their own department.'], 403);
+    if (in_array((int)$authUserRole, [2, 6], true) && ($subDeptId === null || $subDeptId !== (int)$authUserDept)) {
+        json_response(['ok' => false, 'error' => 'forbidden', 'message' => 'You can only assign substitutes within your own department.'], 403);
     }
 
     // Start Transaction for safe bulk insert
     $mysqli->begin_transaction();
 
     try {
-        $deptScopeStmt = $mysqli->prepare("
-            SELECT orig_teacher.user_id AS teacher_id, orig_teacher.dept_id
-            FROM tbl_class_schedules cs
+        if ($subTeacherExpr === 'NULL') {
+            throw new Exception('Schedule teacher mapping is not available.');
+        }
+
+        $attendanceStmt = $mysqli->prepare("
+            SELECT
+                ar.attendance_id,
+                ar.user_id AS orig_user_id,
+                ar.schedule_id,
+                ar.room_id,
+                ar.floor_id,
+                DATE_FORMAT(ar.date, '%Y-%m-%d') AS date,
+                ar.flag_in_id,
+                ar.flag_check_id,
+                ar.flag_out_id,
+                cs.start_time,
+                cs.end_time,
+                orig_teacher.dept_id,
+                s.subject_code,
+                sec.section_name
+            FROM tbl_attendance_records ar
+            JOIN tbl_class_schedules cs ON ar.schedule_id = cs.schedule_id
             {$subJoinOffering}
+            JOIN tbl_semesters sem ON cs.semester_id = sem.semester_id
             LEFT JOIN tbl_users orig_teacher ON {$subTeacherExpr} = orig_teacher.user_id
-            WHERE cs.schedule_id = ?
+            LEFT JOIN tbl_subject s ON {$subSubjectExpr} = s.subject_id
+            LEFT JOIN tbl_sections sec ON {$subSectionExpr} = sec.section_id
+            WHERE ar.schedule_id = ?
+              AND ar.date = ?
+              AND ar.user_id = {$subTeacherExpr}
+              AND sem.status = 'active'
+              AND CURDATE() BETWEEN sem.start_date AND sem.end_date
+              AND ar.date BETWEEN sem.start_date AND sem.end_date
             LIMIT 1
         ");
-        if (!$deptScopeStmt) {
-            throw new Exception('Failed to validate schedule scope: ' . $mysqli->error);
-        }
-        $checkStmt = $mysqli->prepare("SELECT substitution_id FROM tbl_substitutions WHERE schedule_id = ? AND date = ?");
+        $checkStmt = $mysqli->prepare("SELECT substitution_id FROM tbl_substitutions WHERE schedule_id = ? AND date = ? LIMIT 1");
+        $conflictStmt = $mysqli->prepare("
+            SELECT ar.attendance_id
+            FROM tbl_attendance_records ar
+            JOIN tbl_class_schedules cs2 ON ar.schedule_id = cs2.schedule_id
+            WHERE ar.user_id = ?
+              AND ar.date = ?
+              AND NOT (cs2.end_time <= ? OR cs2.start_time >= ?)
+            LIMIT 1
+        ");
         $insertStmt = $mysqli->prepare("INSERT INTO tbl_substitutions (schedule_id, substitute_user_id, date) VALUES (?, ?, ?)");
+        $insertAttendanceStmt = $mysqli->prepare("
+            INSERT INTO tbl_attendance_records
+                (user_id, schedule_id, room_id, floor_id, date, flag_in_id, flag_check_id, flag_out_id, remarks)
+            VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?)
+        ");
+        $markOrigStmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 4, flag_check_id = 4, flag_out_id = 4 WHERE attendance_id = ?");
 
-        $inserted_count = 0;
-        $createdSubs = [];
+        if (!$attendanceStmt || !$checkStmt || !$conflictStmt || !$insertStmt || !$insertAttendanceStmt || !$markOrigStmt) {
+            throw new Exception('Failed to prepare substitution validation: ' . $mysqli->error);
+        }
+
+        $today = new DateTime('today');
+        $weekEnd = (clone $today)->modify('+7 days');
+        $selectedKeys = [];
+        $batchSlots = [];
+        $validatedSubs = [];
+        $originalTeacherScheduleCounts = [];
 
         foreach ($substitutions as $sub) {
-            $schedule_id = (int)$sub['schedule_id'];
-            $date = $sub['date'];
-
-            if ((int)$authUserRole === 2) {
-                $deptScopeStmt->bind_param('i', $schedule_id);
-                $deptScopeStmt->execute();
-                $deptScopeRow = $deptScopeStmt->get_result()->fetch_assoc();
-                $scheduleTeacherId = isset($deptScopeRow['teacher_id']) && $deptScopeRow['teacher_id'] !== null ? (int)$deptScopeRow['teacher_id'] : null;
-                if ($originalTeacherId && $scheduleTeacherId !== $originalTeacherId) {
-                    throw new Exception('Selected schedule does not belong to the selected original teacher.');
-                }
-                $scheduleDeptId = isset($deptScopeRow['dept_id']) && $deptScopeRow['dept_id'] !== null ? (int)$deptScopeRow['dept_id'] : null;
-                if ($scheduleDeptId === null || $scheduleDeptId !== (int)$authUserDept) {
-                    throw new Exception('Dean can only manage substitutions for schedules inside their department.');
-                }
+            $schedule_id = isset($sub['schedule_id']) ? (int)$sub['schedule_id'] : 0;
+            $date = isset($sub['date']) ? trim((string)$sub['date']) : '';
+            if ($schedule_id <= 0 || $date === '') {
+                throw new Exception('Each selected substitution must include a schedule and date.');
             }
 
-            // 1. Check for duplicate
+            $dateObj = DateTime::createFromFormat('Y-m-d', $date);
+            if (!$dateObj || $dateObj->format('Y-m-d') !== $date) {
+                throw new Exception('Invalid substitution date. Use YYYY-MM-DD.');
+            }
+            if ($dateObj < $today || $dateObj >= $weekEnd) {
+                throw new Exception('Only attendance records within the current 7-day schedule window can be substituted.');
+            }
+
+            $payloadKey = $schedule_id . '|' . $date;
+            if (isset($selectedKeys[$payloadKey])) {
+                throw new Exception('The same class/date was selected more than once.');
+            }
+            $selectedKeys[$payloadKey] = true;
+
+            $attendanceStmt->bind_param('is', $schedule_id, $date);
+            $attendanceStmt->execute();
+            $attRow = $attendanceStmt->get_result()->fetch_assoc();
+            if (!$attRow) {
+                throw new Exception("No active teacher attendance record exists for the selected class on {$date}.");
+            }
+
+            $origUserId = isset($attRow['orig_user_id']) ? (int)$attRow['orig_user_id'] : 0;
+            if ($origUserId <= 0) {
+                throw new Exception('Selected schedule has no original teacher attendance owner.');
+            }
+            if ($originalTeacherId && $origUserId !== (int)$originalTeacherId) {
+                throw new Exception('Selected schedule does not belong to the selected original teacher.');
+            }
+            if ($origUserId === (int)$sub_id) {
+                throw new Exception('The substitute teacher must be different from the original teacher.');
+            }
+            if (in_array((int)$authUserRole, [2, 6], true)) {
+                $scheduleDeptId = isset($attRow['dept_id']) && $attRow['dept_id'] !== null ? (int)$attRow['dept_id'] : null;
+                if ($scheduleDeptId === null || $scheduleDeptId !== (int)$authUserDept) {
+                    throw new Exception('You can only manage substitutions for schedules inside your department.');
+                }
+            }
+            if ((int)($attRow['flag_in_id'] ?? 1) !== 1 || (int)($attRow['flag_check_id'] ?? 1) !== 1 || (int)($attRow['flag_out_id'] ?? 1) !== 1) {
+                throw new Exception("Only upcoming attendance records can be substituted. This class already has another attendance status on {$date}.");
+            }
+
             $checkStmt->bind_param('is', $schedule_id, $date);
             $checkStmt->execute();
             if ($checkStmt->get_result()->num_rows > 0) {
                 throw new Exception("A substitution for this class on $date already exists.");
             }
 
-            // 2. Insert
+            $startTime = $attRow['start_time'];
+            $endTime = $attRow['end_time'];
+
+            $conflictStmt->bind_param('isss', $sub_id, $date, $startTime, $endTime);
+            $conflictStmt->execute();
+            if ($conflictStmt->get_result()->num_rows > 0) {
+                throw new Exception("The selected substitute already has an overlapping class on {$date} ({$startTime}-{$endTime}).");
+            }
+
+            foreach ($batchSlots as $slot) {
+                if ($slot['date'] === $date && !($slot['end_time'] <= $startTime || $slot['start_time'] >= $endTime)) {
+                    throw new Exception("The selected substitute would have overlapping substitute classes on {$date}.");
+                }
+            }
+
+            $batchSlots[] = [
+                'date' => $date,
+                'start_time' => $startTime,
+                'end_time' => $endTime,
+            ];
+            $validatedSubs[] = [
+                'attendance_id' => (int)$attRow['attendance_id'],
+                'schedule_id' => $schedule_id,
+                'room_id' => (int)$attRow['room_id'],
+                'floor_id' => (int)$attRow['floor_id'],
+                'date' => $date,
+                'orig_user_id' => $origUserId,
+                'subject_code' => $attRow['subject_code'] ?? 'class',
+                'section_name' => $attRow['section_name'] ?? '',
+            ];
+        }
+
+        $inserted_count = 0;
+        $createdAttendance = 0;
+
+        foreach ($validatedSubs as $sub) {
+            $schedule_id = (int)$sub['schedule_id'];
+            $roomId = (int)$sub['room_id'];
+            $floorId = (int)$sub['floor_id'];
+            $date = (string)$sub['date'];
+            $origAttendanceId = (int)$sub['attendance_id'];
+            $origUserId = (int)$sub['orig_user_id'];
+
             $insertStmt->bind_param('iis', $schedule_id, $sub_id, $date);
             if (!$insertStmt->execute()) {
                 throw new Exception("Failed to insert schedule: " . $insertStmt->error);
             }
             $inserted_count++;
-            // record created substitution for post-processing
-            $createdSubs[] = ['schedule_id' => $schedule_id, 'date' => $date, 'substitution_id' => $insertStmt->insert_id];
-        }
 
-        // --- After inserting substitutions, attempt to create attendance records for the substitute user ---
-        // We will copy existing original teacher attendance rows (if any) into new rows for the substitute
-        $createdAttendance = 0;
-        $messages = [];
-        $originalTeacherScheduleCounts = [];
-
-        // Prepare statements used in processing
-        $schedQ = $mysqli->prepare("SELECT cs.schedule_id, cs.start_time, cs.end_time, cs.room_id, {$subTeacherExpr} AS orig_user_id FROM tbl_class_schedules cs {$subJoinOffering} WHERE cs.schedule_id = ? LIMIT 1");
-        $origAttQ = $mysqli->prepare("SELECT attendance_id FROM tbl_attendance_records WHERE schedule_id = ? AND date = ? AND user_id = ? LIMIT 1");
-        $dupSubAttQ = $mysqli->prepare("SELECT 1 FROM tbl_attendance_records WHERE user_id = ? AND schedule_id = ? AND date = ? LIMIT 1");
-        $conflictQ = $mysqli->prepare("SELECT ar.attendance_id FROM tbl_attendance_records ar JOIN tbl_class_schedules cs2 ON ar.schedule_id = cs2.schedule_id WHERE ar.user_id = ? AND ar.date = ? AND NOT (cs2.end_time <= ? OR cs2.start_time >= ?) LIMIT 1");
-        $copyAttStmt = $mysqli->prepare("INSERT INTO tbl_attendance_records (user_id, schedule_id, room_id, floor_id, date, checked_in_at, altitude_in, latitude_in, longitude_in, flag_in_id, checked_mid_at, altitude_check, latitude_check, longitude_check, flag_check_id, checked_out_at, altitude_out, latitude_out, longitude_out, flag_out_id, remarks) SELECT ?, schedule_id, room_id, floor_id, date, checked_in_at, altitude_in, latitude_in, longitude_in, flag_in_id, checked_mid_at, altitude_check, latitude_check, longitude_check, flag_check_id, checked_out_at, altitude_out, latitude_out, longitude_out, flag_out_id, remarks FROM tbl_attendance_records WHERE attendance_id = ?");
-        // Prepare statement to mark the original attendance as 'substituted' (flag id = 4)
-        $markOrigStmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 4, flag_check_id = 4, flag_out_id = 4 WHERE attendance_id = ?");
-
-        foreach ($createdSubs as $cs) {
-            $schedule_id = (int)$cs['schedule_id'];
-            $date = $cs['date'];
-
-            // get schedule and original teacher
-            $schedQ->bind_param('i', $schedule_id);
-            $schedQ->execute();
-            $sres = $schedQ->get_result();
-            $srow = $sres ? $sres->fetch_assoc() : null;
-            if (!$srow) {
-                $messages[] = "Schedule $schedule_id not found, skipping attendance creation.";
-                continue;
-            }
-            $orig_user = isset($srow['orig_user_id']) ? (int)$srow['orig_user_id'] : 0;
-            if ($orig_user <= 0) {
-                $messages[] = "No original teacher mapping for schedule {$schedule_id}; skipped.";
-                continue;
-            }
-            if (!isset($originalTeacherScheduleCounts[$orig_user])) {
-                $originalTeacherScheduleCounts[$orig_user] = 0;
-            }
-            $originalTeacherScheduleCounts[$orig_user]++;
-            $s_start = $srow['start_time'];
-            $s_end = $srow['end_time'];
-
-            // find original attendance row for that schedule/date
-            $origAttQ->bind_param('iss', $schedule_id, $date, $orig_user);
-            $origAttQ->execute();
-            $oRes = $origAttQ->get_result();
-            $origAtt = $oRes ? $oRes->fetch_assoc() : null;
-
-            if (!$origAtt) {
-                // nothing to copy; skip
-                $messages[] = "No attendance record for original teacher (user_id={$orig_user}) for schedule {$schedule_id} on {$date}; skipped.";
-                continue;
-            }
-
-            $orig_attendance_id = (int)$origAtt['attendance_id'];
-
-            // check substitute does not already have attendance for same schedule/date
-            $dupSubAttQ->bind_param('iis', $sub_id, $schedule_id, $date);
-            $dupSubAttQ->execute();
-            if ($dupSubAttQ->get_result()->num_rows > 0) {
-                $messages[] = "Substitute (user_id={$sub_id}) already has attendance for schedule {$schedule_id} on {$date}; skipped.";
-                continue;
-            }
-
-            // check time overlap conflicts for substitute on that date
-            $conflictQ->bind_param('isss', $sub_id, $date, $s_start, $s_end);
-            $conflictQ->execute();
-            if ($conflictQ->get_result()->num_rows > 0) {
-                $messages[] = "Time conflict detected for substitute (user_id={$sub_id}) on {$date} for schedule {$schedule_id}; skipped.";
-                continue;
-            }
-
-            // perform copy-insert
-            $copyAttStmt->bind_param('ii', $sub_id, $orig_attendance_id);
-            if (!$copyAttStmt->execute()) {
-                $messages[] = "Failed to create attendance for substitute on schedule {$schedule_id} date {$date}: " . $copyAttStmt->error;
-                continue;
+            $remark = 'Substitute attendance created for original attendance #' . $origAttendanceId . '.';
+            $insertAttendanceStmt->bind_param('iiiiss', $sub_id, $schedule_id, $roomId, $floorId, $date, $remark);
+            if (!$insertAttendanceStmt->execute()) {
+                throw new Exception("Failed to create attendance for the substitute teacher: " . $insertAttendanceStmt->error);
             }
             $createdAttendance++;
 
-            // mark original attendance record as 'substituted'
-            if ($markOrigStmt) {
-                $markOrigStmt->bind_param('i', $orig_attendance_id);
-                if (!$markOrigStmt->execute()) {
-                    // log but do not fail the whole transaction
-                    $messages[] = "Warning: failed to mark original attendance {$orig_attendance_id} as substituted: " . $markOrigStmt->error;
-                }
+            $markOrigStmt->bind_param('i', $origAttendanceId);
+            if (!$markOrigStmt->execute()) {
+                throw new Exception("Failed to mark the original teacher attendance as substituted: " . $markOrigStmt->error);
             }
+
+            if (!isset($originalTeacherScheduleCounts[$origUserId])) {
+                $originalTeacherScheduleCounts[$origUserId] = 0;
+            }
+            $originalTeacherScheduleCounts[$origUserId]++;
         }
 
-        // close helper statements
-        $schedQ->close();
-        $origAttQ->close();
-        $dupSubAttQ->close();
-        $conflictQ->close();
-        $copyAttStmt->close();
-        if ($markOrigStmt) $markOrigStmt->close();
-        $deptScopeStmt->close();
-
+        $attendanceStmt->close();
         $checkStmt->close();
+        $conflictStmt->close();
         $insertStmt->close();
+        $insertAttendanceStmt->close();
+        $markOrigStmt->close();
 
         // commit only after attendance creation
         $mysqli->commit();

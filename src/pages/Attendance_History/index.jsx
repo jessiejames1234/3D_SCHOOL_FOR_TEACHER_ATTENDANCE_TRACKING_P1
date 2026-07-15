@@ -71,7 +71,7 @@ export default function AttendanceHistory() {
   ), [user, storedUser]);
   const myUserId = getUserIdValue(effectiveUser);
   const effectiveRoleId = Number(effectiveUser?.role_id || 0);
-  const canRequestEdit = [2, 3, 4, 5].includes(Number(effectiveUser?.role_id));
+  const canRequestEdit = [2, 3, 4, 5, 6].includes(Number(effectiveUser?.role_id));
   const [records, setRecords] = React.useState([]);
   const [penalties, setPenalties] = React.useState([]);
   const [substitutions, setSubstitutions] = React.useState([]);
@@ -95,27 +95,29 @@ export default function AttendanceHistory() {
 
   // UPDATED MAP BASED ON YOUR DATABASE
   const flagMap = {
-    1: 'NA',
+    1: 'Upcoming',
     2: 'Present',
     3: 'Absent',
     4: 'Substituted',
     5: 'Late',
-    7: 'On Leave'
+    7: 'On Leave',
+    8: 'Pending'
   };
 
   // Normalize flag value based on actual DB IDs
   const getFlagId = (v) => {
-    if (v === undefined || v === null || v === '') return 1; // default NA
+    if (v === undefined || v === null || v === '') return 1; // default Upcoming
     const n = Number(v);
-    if (!isNaN(n) && [1, 2, 3, 4, 5, 7].includes(n)) return n;
+    if (!isNaN(n) && [1, 2, 3, 4, 5, 7, 8].includes(n)) return n;
     const s = String(v).toLowerCase().trim();
-    if (s === 'na' || s === 'n/a' || s === '1') return 1;
+    if (s === 'na' || s === 'n/a' || s === 'upcoming' || s === '1') return 1;
     if (s === 'present' || s === '2') return 2;
     if (s === 'absent' || s === '3') return 3;
     if (s === 'substituted' || s === '4') return 4;
     if (s === 'late' || s === '5') return 5;
     if (s === 'on leave' || s === '7') return 7;
-    return 1; // default to NA
+    if (s === 'pending' || s === '8') return 8;
+    return 1; // default to Upcoming
   };
 
   // --- NEW STRICT OVERALL STATUS LOGIC ---
@@ -134,14 +136,17 @@ export default function AttendanceHistory() {
     // 3. If ALL PRESENT (ID 2)
     if (flags.every(f => f === 2)) return 2;
 
-    // 4. If ALL NA (ID 1)
-    if (flags.every(f => f === 1)) return 1;
-
-    // 5. If ALL SUBSTITUTE (ID 4)
+    // 4. If ALL SUBSTITUTE (ID 4)
     if (flags.every(f => f === 4)) return 4;
 
-    // 6. If ALL ON LEAVE (ID 7)
+    // 5. If ALL ON LEAVE (ID 7)
     if (flags.every(f => f === 7)) return 7;
+
+    // 6. If any checkpoint is pending, keep the overall status pending.
+    if (flags.includes(8)) return 8;
+
+    // 7. If still waiting before class starts.
+    if (flags.every(f => f === 1)) return 1;
 
     return 1; 
   };
@@ -171,8 +176,8 @@ export default function AttendanceHistory() {
       if (attRows) setRecords(attRows.map(normalizeAttendanceRecord).filter((r) => r.date));
       else if (!silent) setRecords([]);
 
-      const canFetchSubstitutions = [2, 4].includes(effectiveRoleId);
-      const canFetchLeaves = [1, 2, 3, 4].includes(effectiveRoleId);
+      const canFetchSubstitutions = [2, 4, 5].includes(effectiveRoleId);
+      const canFetchLeaves = [1, 2, 3, 4, 5].includes(effectiveRoleId);
       const [penRows, subRows, leaveRows] = await Promise.all([
         readOptionalList('penalties', 'penalties'),
         readOptionalList('substitute', 'substitutions', canFetchSubstitutions),
@@ -224,19 +229,26 @@ export default function AttendanceHistory() {
   }, [fetchPendingAttendanceRequests]);
 
   React.useEffect(() => {
-    if (autoFocusedMonthRef.current || records.length === 0) return;
-    autoFocusedMonthRef.current = true;
+    if (autoFocusedMonthRef.current) return;
 
     const currentMonthKey = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`;
-    const recordDateKeys = records.map(getAttendanceDateKey).filter(Boolean).sort();
-    if (recordDateKeys.some((dateKey) => dateKey.startsWith(currentMonthKey))) return;
+    const activityDateKeys = [
+      ...records.map(getAttendanceDateKey),
+      ...penalties.map(p => normalizeDateKey(p.date)),
+      ...substitutions.map(s => normalizeDateKey(s.date)),
+      ...leaves.flatMap(l => [normalizeDateKey(l.date_from), normalizeDateKey(l.date_to)])
+    ].filter(Boolean).sort();
 
-    const latestKey = recordDateKeys[recordDateKeys.length - 1];
+    if (activityDateKeys.length === 0) return;
+    autoFocusedMonthRef.current = true;
+    if (activityDateKeys.some((dateKey) => dateKey.startsWith(currentMonthKey))) return;
+
+    const latestKey = activityDateKeys[activityDateKeys.length - 1];
     if (!latestKey) return;
     const [year, month] = latestKey.split('-').map(Number);
     if (year && month) setCurrentDate(new Date(year, month - 1, 1));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [records]);
+  }, [records, penalties, substitutions, leaves]);
 
   // LIVE CLOCK INTERVAL
   React.useEffect(() => {
@@ -264,6 +276,17 @@ export default function AttendanceHistory() {
       return targetDateStr >= fromDateOnly && targetDateStr <= toDateOnly;
   };
 
+  const isLeaveOverlappingMonth = (leaveFromStr, leaveToStr, monthDate) => {
+      const fromDateOnly = normalizeDateKey(leaveFromStr);
+      const toDateOnly = normalizeDateKey(leaveToStr);
+      if (!fromDateOnly || !toDateOnly) return false;
+      const year = monthDate.getFullYear();
+      const month = monthDate.getMonth();
+      const monthStart = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+      const monthEnd = toDateKeyFromDate(new Date(year, month + 1, 0));
+      return fromDateOnly <= monthEnd && toDateOnly >= monthStart;
+  };
+
   const myPenalties = penalties.filter(p => Number(p.user_id) === myUserId);
   const mySubs = substitutions.filter(s => Number(s.teacher_id) === myUserId || Number(s.substitute_id) === myUserId);
   const myLeaves = leaves.filter(l => {
@@ -278,11 +301,7 @@ export default function AttendanceHistory() {
   const visiblePenalties = myPenalties.filter(p => normalizeDateKey(p.date).startsWith(currentMonthStr));
   const visibleSubs = mySubs.filter(s => normalizeDateKey(s.date).startsWith(currentMonthStr));
   
-  const visibleLeaves = myLeaves.filter(l => {
-      const startMonth = normalizeDateKey(l.date_from).substring(0, 7);
-      const endMonth = normalizeDateKey(l.date_to).substring(0, 7);
-      return startMonth === currentMonthStr || endMonth === currentMonthStr;
-  });
+  const visibleLeaves = myLeaves.filter(l => isLeaveOverlappingMonth(l.date_from, l.date_to, currentDate));
 
   const totalClasses = visibleRecords.length;
   const presentCount = visibleRecords.filter(r => getOverallStatus(r) === 2).length;
@@ -431,7 +450,8 @@ export default function AttendanceHistory() {
       if(id === 3) return 'bg-red-500';     // Absent
       if(id === 4) return 'bg-blue-500';    // Substituted
       if(id === 7) return 'bg-purple-500';  // On leave
-      return 'bg-gray-400';                 // NA
+      if(id === 8) return 'bg-orange-500';  // Pending
+      return 'bg-slate-400';                // Upcoming
   };
   
   const getStatusTextColor = (id) => {
@@ -440,6 +460,7 @@ export default function AttendanceHistory() {
       if(id === 3) return 'text-red-600'; 
       if(id === 4) return 'text-blue-600';
       if(id === 7) return 'text-purple-600';
+      if(id === 8) return 'text-orange-600';
       return 'text-gray-500'; 
   };
 
@@ -809,7 +830,7 @@ export default function AttendanceHistory() {
                                     <div className="flex items-center justify-between text-xs">
                                         <span className="font-bold text-gray-400 uppercase tracking-widest w-14">IN:</span>
                                         {(() => { const fid = getFlagId(record.flag_in_id); return (<>
-                                          <span className={`font-bold ${getStatusTextColor(fid)} w-16 text-left`}>{flagMap[fid] || 'N/A'}</span>
+                                          <span className={`font-bold ${getStatusTextColor(fid)} min-w-[74px] text-left`}>{flagMap[fid] || 'Upcoming'}</span>
                                           {/* FIX: USING record.time_in INSTEAD OF record.checked_in_at */}
                                           <span className="font-mono text-gray-700 font-semibold">{record.time_in ? fmtTime(record.time_in) : '--:--'}</span>
                                         </>); })()}
@@ -817,7 +838,7 @@ export default function AttendanceHistory() {
                                     <div className="flex items-center justify-between text-xs">
                                         <span className="font-bold text-gray-400 uppercase tracking-widest w-14">CHECK:</span>
                                         {(() => { const fid = getFlagId(record.flag_check_id); return (<>
-                                          <span className={`font-bold ${getStatusTextColor(fid)} w-16 text-left`}>{flagMap[fid] || 'N/A'}</span>
+                                          <span className={`font-bold ${getStatusTextColor(fid)} min-w-[74px] text-left`}>{flagMap[fid] || 'Upcoming'}</span>
                                           {/* FIX: USING record.time_check INSTEAD OF record.checked_mid_at */}
                                           <span className="font-mono text-gray-700 font-semibold">{record.time_check ? fmtTime(record.time_check) : '--:--'}</span>
                                         </>); })()}
@@ -825,7 +846,7 @@ export default function AttendanceHistory() {
                                     <div className="flex items-center justify-between text-xs">
                                         <span className="font-bold text-gray-400 uppercase tracking-widest w-14">OUT:</span>
                                         {(() => { const fid = getFlagId(record.flag_out_id); return (<>
-                                          <span className={`font-bold ${getStatusTextColor(fid)} w-16 text-left`}>{flagMap[fid] || 'N/A'}</span>
+                                          <span className={`font-bold ${getStatusTextColor(fid)} min-w-[74px] text-left`}>{flagMap[fid] || 'Upcoming'}</span>
                                           {/* FIX: USING record.time_out INSTEAD OF record.checked_out_at */}
                                           <span className="font-mono text-gray-700 font-semibold">{record.time_out ? fmtTime(record.time_out) : '--:--'}</span>
                                         </>); })()}
@@ -866,10 +887,11 @@ export default function AttendanceHistory() {
                                          overallStatus === 3 ? 'bg-red-50 text-red-800 border-red-200' : 
                                          overallStatus === 4 ? 'bg-blue-50 text-blue-800 border-blue-200' :
                                          overallStatus === 7 ? 'bg-purple-50 text-purple-800 border-purple-200' :
-                                         'bg-gray-100 text-gray-700'
+                                         overallStatus === 8 ? 'bg-orange-50 text-orange-800 border-orange-200' :
+                                         'bg-slate-100 text-slate-700 border-slate-200'
                                      }`}>
                                         <span className={`w-2 h-2 rounded-full shadow-inner ${getStatusColor(overallStatus)}`}></span>
-                                        {flagMap[overallStatus] || 'N/A'}
+                                        {flagMap[overallStatus] || 'Upcoming'}
                                      </div>
                                      {canRequestEdit ? (
                                        <button
@@ -919,7 +941,7 @@ export default function AttendanceHistory() {
                 {selectedAttendanceForEdit.date} | {fmtScheduleTime(selectedAttendanceForEdit.start_time)} - {fmtScheduleTime(selectedAttendanceForEdit.end_time)}
               </div>
               <div className="text-xs text-gray-700">
-                Current status: <span className="font-bold">{flagMap[getOverallStatus(selectedAttendanceForEdit)] || 'N/A'}</span>
+                Current status: <span className="font-bold">{flagMap[getOverallStatus(selectedAttendanceForEdit)] || 'Upcoming'}</span>
               </div>
             </div>
 
@@ -937,7 +959,7 @@ export default function AttendanceHistory() {
                     <tr key={row.label}>
                       <td className="px-3 py-2 font-bold text-gray-700">{row.label}</td>
                       <td className={`px-3 py-2 font-semibold ${getStatusTextColor(row.flagId)}`}>
-                        {flagMap[row.flagId] || 'N/A'}
+                        {flagMap[row.flagId] || 'Upcoming'}
                       </td>
                       <td className="px-3 py-2 font-mono text-gray-700">
                         {row.time ? fmtTime(row.time) : '--:--'}

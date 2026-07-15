@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Table from '../../components/Table.jsx';
 import { apiGet } from '../../services/api.js';
+import { attendanceFlagLabel } from '../../utils/attendanceFlags.js';
 
 export default function AttendanceAuditPage() {
   const [rows, setRows] = useState([]);
@@ -56,6 +57,22 @@ export default function AttendanceAuditPage() {
     return () => { mounted = false; };
   }, []);
 
+  const isFlagField = (field) => String(field || '').toLowerCase().includes('flag');
+
+  const formatAuditFlagValue = (field, value) => {
+    if (!isFlagField(field)) return value;
+    if (value === null || value === undefined || value === '') return value;
+    const raw = String(value).trim();
+    if (/^\d+$/.test(raw)) return attendanceFlagLabel(Number(raw));
+    return attendanceFlagLabel(null, raw);
+  };
+
+  const formatAuditReason = (row) => {
+    const reason = row?.reason ?? '';
+    if (!isFlagField(row?.field) || !reason) return reason;
+    return String(reason).replace(/\bN\/A\b|\bNA\b/g, 'Upcoming');
+  };
+
   const actionsList = useMemo(() => {
     const s = new Set();
     rows.forEach(r => { if (r.action) s.add(String(r.action)); });
@@ -80,7 +97,17 @@ export default function AttendanceAuditPage() {
       }
       if (!ql) return true;
       // search across text fields
-      return [r.edit_session_id, r.teacher, r.action, r.field, r.old_value, r.new_value, r.reason, r.edited_by, r.date]
+      return [
+        r.edit_session_id,
+        r.teacher,
+        r.action,
+        r.field,
+        formatAuditFlagValue(r.field, r.old_value),
+        formatAuditFlagValue(r.field, r.new_value),
+        formatAuditReason(r),
+        r.edited_by,
+        r.date
+      ]
         .map(v => (v || '').toString().toLowerCase())
         .some(t => t.indexOf(ql) !== -1);
     });
@@ -91,9 +118,9 @@ export default function AttendanceAuditPage() {
     { key: 'teacher', label: 'Teacher', render: (r) => <div style={{ whiteSpace: 'normal' }}>{r.teacher}</div> },
     { key: 'action', label: 'Action' },
     { key: 'field', label: 'Field' },
-    { key: 'old_value', label: 'Old Value', render: (r) => <div style={{ whiteSpace: 'normal' }}>{r.old_value}</div> },
-    { key: 'new_value', label: 'New Value', render: (r) => <div style={{ whiteSpace: 'normal' }}>{r.new_value}</div> },
-    { key: 'reason', label: 'Reason', render: (r) => <div style={{ whiteSpace: 'normal' }}>{r.reason}</div> },
+    { key: 'old_value', label: 'Old Value', render: (r) => <div style={{ whiteSpace: 'normal' }}>{formatAuditFlagValue(r.field, r.old_value)}</div> },
+    { key: 'new_value', label: 'New Value', render: (r) => <div style={{ whiteSpace: 'normal' }}>{formatAuditFlagValue(r.field, r.new_value)}</div> },
+    { key: 'reason', label: 'Reason', render: (r) => <div style={{ whiteSpace: 'normal' }}>{formatAuditReason(r)}</div> },
     { key: 'edited_by', label: 'Edited By' },
     { key: 'date', label: 'Date', render: (r) => <div style={{ whiteSpace: 'normal' }}>{r.date}</div> },
   ];

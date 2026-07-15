@@ -87,9 +87,10 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
         case 'login':
         case 'forgot-password':
         case 'reset-password':
+        case 'first-login-password':
         case 'qrcode':
         case 'worker-bootstrap':
-            return null;
+            return $endpoint === 'first-login-password' ? '__authenticated' : null;
 
         case 'dashboard':
             if ($scope === 'self') {
@@ -132,6 +133,10 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
             }
             return 'locations';
 
+        case 'camera-positions.php':
+        case 'room-status.php':
+            return '3d_building';
+
         case 'school':
             if ($requestMethod === 'GET') {
                 return ['any_of' => ['settings', 'attendance', 'class_schedules', '3d_building']];
@@ -143,6 +148,9 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
 
         case 'users':
             if (is_numeric($param1) && strtolower(trim((string)$param2)) === 'module-access') {
+                return 'settings';
+            }
+            if (is_numeric($param1) && strtolower(trim((string)$param2)) === 'reset-default-password') {
                 return 'settings';
             }
             if ($requestMethod === 'GET') {
@@ -190,6 +198,9 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
             return 'academic_admin';
 
         case 'leaves':
+            if ($requestMethod === 'GET') {
+                return ['any_of' => ['leaves_file', 'leaves_approvals', 'attendance']];
+            }
             return ['any_of' => ['leaves_file', 'leaves_approvals']];
 
         case 'my-schedule':
@@ -197,6 +208,9 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
 
         case 'substitute':
         case 'substitutions':
+            if ($requestMethod === 'GET') {
+                return ['any_of' => ['substitutions', 'attendance']];
+            }
             return 'substitutions';
 
         case 'request-edit':
@@ -262,6 +276,12 @@ switch ($endpoint_root) {
     case 'school':
         require_once __DIR__ . '/api/locations.php';
         break;
+    case 'camera-positions.php':
+        require_once __DIR__ . '/api/camera-positions.php';
+        break;
+    case 'room-status.php':
+        require_once __DIR__ . '/api/room-status.php';
+        break;
     case 'login':
         require_once __DIR__ . '/api/login.php';
         break;
@@ -270,6 +290,9 @@ switch ($endpoint_root) {
         break;
     case 'reset-password':
         require_once __DIR__ . '/api/reset-password.php';
+        break;
+    case 'first-login-password':
+        require_once __DIR__ . '/api/first-login-password.php';
         break;
     case 'roles':
     case 'users':
@@ -315,6 +338,9 @@ switch ($endpoint_root) {
         break;
     case 'app-settings':
         require_once __DIR__ . '/api/app-settings.php';
+        break;
+    case 'login-monitor':
+        require_once __DIR__ . '/api/login-monitor.php';
         break;
     case 'worker-bootstrap':
         require_once __DIR__ . '/api/worker-bootstrap.php';

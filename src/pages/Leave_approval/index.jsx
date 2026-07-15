@@ -206,7 +206,7 @@ export default function LeavesFiles(){
 
         <div className="mt-6 flex justify-end gap-2">
           <button onClick={()=>setShowDetailModal(false)} className="px-4 py-2 rounded border">Close</button>
-          { detailItem && (['dean','program_head'].includes((user && user.role_name)||'') && detailItem.req_status === 'pending') && (<><button onClick={() => { handleDecision(detailItem, 'rejected'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-red-600 text-white">Reject</button><button onClick={() => { handleDecision(detailItem, 'approve'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-green-600 text-white">Approve</button></>)}
+          { detailItem && (['dean','program_head'].includes((user && (user.role_name || '').toLowerCase())||'') && detailItem.req_status === 'pending') && (<><button onClick={() => { handleDecision(detailItem, 'rejected'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-red-600 text-white">Reject</button><button onClick={() => { handleDecision(detailItem, 'approve'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-green-600 text-white">Approve</button></>)}
         </div>
       </div>
     </Modal>

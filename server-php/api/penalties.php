@@ -82,10 +82,16 @@ switch ($request_method){
             $row = $stmt->get_result()->fetch_assoc();
             
             // Authorization
-            if ($authUserRole !== 1 && $authUserDept !== null) {
+            if ((int)$authUserRole === 5) {
+                if (!$row || (int)($row['user_id'] ?? 0) !== (int)$authUserId) {
+                    json_response(['error'=>'forbidden'], 403);
+                }
+            } elseif ($authUserRole !== 1 && $authUserDept !== null) {
                 if ($row && isset($row['dept_id']) && (int)$row['dept_id'] !== $authUserDept) {
                     json_response(['error'=>'forbidden'], 403);
                 }
+            } elseif ($authUserRole !== 1 && $authUserDept === null) {
+                json_response(['error'=>'forbidden'], 403);
             }
             json_response($row);
         }
@@ -104,11 +110,17 @@ switch ($request_method){
         $types = "";
         $params = [];
 
-        // Department Filter
-        if ($authUserRole !== 1 && $authUserDept !== null) { 
+        // Role Filter
+        if ((int)$authUserRole === 5) {
+            $sql .= " AND p.user_id = ?";
+            $types .= "i";
+            $params[] = (int)$authUserId;
+        } elseif ($authUserRole !== 1 && $authUserDept !== null) {
             $sql .= " AND u.dept_id = ?";
             $types .= "i";
             $params[] = $authUserDept;
+        } elseif ($authUserRole !== 1 && $authUserDept === null) {
+            $sql .= " AND 1 = 0";
         }
 
         $sql .= " ORDER BY p.date DESC, p.sanction_id DESC";

@@ -20,7 +20,7 @@ function SectionIndex() {
   // Authentication & Role Check logic
   const user = (() => { try { return JSON.parse(localStorage.getItem('user') || 'null'); } catch(e) { return null; } })();
   const isAdmin = Number(user?.role_id) === 1;
-  const isDean = Number(user?.role_id) === 2;
+  const isDean = [2, 6].includes(Number(user?.role_id));
   const isProgramHead = Number(user?.role_id) === 3;
   const isSecretary = Number(user?.role_id) === 4;
   

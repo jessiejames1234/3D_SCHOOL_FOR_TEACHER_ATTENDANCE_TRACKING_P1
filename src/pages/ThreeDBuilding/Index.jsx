@@ -32,13 +32,32 @@ function ThreeDBuildingIndex() {
   };
 
   const serverRoot = resolveServerRoot();
-  const defaultModel = new URL('./3dbuilding/MWv1.1.glb', `${serverRoot}/`).href;
-  const fallbackModel = 'http://localhost/3D_SCHOOL_FOR_TEACHER_ATTENDANCE_TRACKING_P1/server-php/3dbuilding/MWv1.1.glb';
+  const defaultModel = new URL('./3dbuilding/campusview.glb', `${serverRoot}/`).href;
+  const fallbackModel = 'http://localhost/3D_SCHOOL_FOR_TEACHER_ATTENDANCE_TRACKING_P1/server-php/3dbuilding/campusview.glb';
+  const getBuildingModelSrc = (buildingName) => {
+    const normalized = String(buildingName || '').trim().toLowerCase();
+    if (!normalized) return defaultModel;
+    if (normalized.includes('main west') || normalized.includes('mainwest') || normalized.includes('main_west') || normalized.includes('mw')) {
+      return new URL('./3dbuilding/test1.1.glb', `${serverRoot}/`).href;
+    }
+    return defaultModel;
+  };
+  const defaultCameraPresets = {
+    Building_PhinmaHall: { position: [-22, 10, 22], target: [0, 3, 0] },
+    Building_MainSouth: { position: [22, 10, 16], target: [0, 3, 0] },
+    Building_MainNorth: { position: [-22, 10, -16], target: [0, 3, 0] },
+    Building_MainWest: { position: [22, 10, -16], target: [0, 3, 0] },
+    PhinmaHall: { position: [-22, 10, 22], target: [0, 3, 0] },
+    MainSouth: { position: [22, 10, 16], target: [0, 3, 0] },
+    MainNorth: { position: [-22, 10, -16], target: [0, 3, 0] },
+    MainWest: { position: [22, 10, -16], target: [0, 3, 0] }
+  };
 
   const [modelSrc, setModelSrc] = useState(defaultModel);
   const [status, setStatus] = useState('loading');
   const [message, setMessage] = useState('');
   const [markerData, setMarkerData] = useState(null);
+  const [markerDataList, setMarkerDataList] = useState([]);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [nowTime, setNowTime] = useState(new Date());
   const [catalog, setCatalog] = useState({ schools: [], buildings: [], floors: [], rooms: [] });
@@ -56,6 +75,21 @@ function ThreeDBuildingIndex() {
   const [pendingUpload, setPendingUpload] = useState(null);
   const [moveModeEnabled, setMoveModeEnabled] = useState(false);
   const [activeUploadTransform, setActiveUploadTransform] = useState(null);
+  const [teacherStatusModal, setTeacherStatusModal] = useState(null);
+  const [availableCameras, setAvailableCameras] = useState(null);
+  const [selectedRoom, setSelectedRoom] = useState(null);
+  const [hoveredRoom, setHoveredRoom] = useState(null);
+  const [tooltipPosition, setTooltipPosition] = useState(null);
+  const [roomListOpen, setRoomListOpen] = useState(true);
+  const [roomListFilter, setRoomListFilter] = useState('');
+  const [buildingExplorerOpen, setBuildingExplorerOpen] = useState(true);
+  const [buildingSearchText, setBuildingSearchText] = useState('');
+  const [navigatorBuilding, setNavigatorBuilding] = useState('');
+  const [navigatorFloor, setNavigatorFloor] = useState('');
+  const [navigatorRoom, setNavigatorRoom] = useState('');
+  const [cameraPresets, setCameraPresets] = useState(defaultCameraPresets);
+  const [roomStatuses, setRoomStatuses] = useState({});
+  const [modelHierarchy, setModelHierarchy] = useState({ buildings: [], floors: [], rooms: [] });
 
   const viewerWrapRef = useRef(null);
   const mountRef = useRef(null);
@@ -97,9 +131,23 @@ function ThreeDBuildingIndex() {
     offsetX: 0,
     offsetZ: 0
   });
+  const markerSpritesRef = useRef([]);
+  const namedCameraDataRef = useRef(null);
+  const roomStatusSpritesRef = useRef([]);
+  const modelCacheRef = useRef(new Map());
+  const cameraTweenTokenRef = useRef(0);
+  const roomSelectionTimerRef = useRef(null);
 
   const uniqueValues = (list) => Array.from(new Set((list || []).filter(Boolean)));
-  const nameEq = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+  const normalizeKey = (value) => String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/building[_\s-]*/gi, '')
+    .replace(/room[_\s-]*/gi, '')
+    .replace(/floor[_\s-]*/gi, '')
+    .replace(/[^a-z0-9]+/g, '');
+  const nameEq = (a, b) => normalizeKey(a) === normalizeKey(b);
+  const normalizeNavigator = (value, prefix) => normalizeKey(String(value || '').replace(new RegExp(`^${prefix}`, 'i'), ''));
   const toLocalYmd = (dateValue = new Date()) => {
     const d = dateValue instanceof Date ? dateValue : new Date(dateValue);
     const y = d.getFullYear();
@@ -116,6 +164,94 @@ function ThreeDBuildingIndex() {
       .toLowerCase()
       .replace(/\.\d+$/, '') // strip Blender suffix like .001
       .replace(/[\s._-]+/g, '');
+  };
+
+  const toDisplayName = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    return text.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  };
+
+  const buildModelHierarchy = (object) => {
+    if (!object) return { buildings: [], floors: [], rooms: [] };
+
+    const buildingMap = new Map();
+    const floorMap = new Map();
+    const roomMap = new Map();
+
+    const addBuilding = (name) => {
+      if (!name) return null;
+      const key = String(name).trim().toLowerCase();
+      if (!buildingMap.has(key)) {
+        const displayName = toDisplayName(name.replace(/^Building\s*/i, ''));
+        buildingMap.set(key, { name, displayName });
+      }
+      return buildingMap.get(key);
+    };
+
+    const addFloor = (buildingName, floorName) => {
+      if (!buildingName || !floorName) return null;
+      const key = `${String(buildingName).trim().toLowerCase()}::${String(floorName).trim().toLowerCase()}`;
+      if (!floorMap.has(key)) {
+        floorMap.set(key, { buildingName, floorName, displayName: toDisplayName(floorName) });
+      }
+      return floorMap.get(key);
+    };
+
+    const addRoom = (buildingName, floorName, roomName) => {
+      if (!roomName) return null;
+      const key = `${String(buildingName || '').trim().toLowerCase()}::${String(floorName || '').trim().toLowerCase()}::${String(roomName).trim().toLowerCase()}`;
+      if (!roomMap.has(key)) {
+        roomMap.set(key, { buildingName, floorName, roomName, displayName: toDisplayName(roomName) });
+      }
+      return roomMap.get(key);
+    };
+
+    const visit = (node, parentBuilding = '', parentFloor = '') => {
+      if (!node || !node.name) return;
+      const rawName = String(node.name).trim();
+      const cleaned = rawName.replace(/\.\d+$/, '');
+      const buildingMatch = cleaned.match(/Building[_\s-]+(.+)/i);
+      const floorMatch = cleaned.match(/Floor[_\s-]+(\d+)/i);
+      const roomMatch = cleaned.match(/Room[_\s-]+([^/]+)$/i);
+      const buildingName = buildingMatch?.[1] ? `Building_${buildingMatch[1]}` : parentBuilding;
+      const floorName = floorMatch?.[1] ? `Floor_${floorMatch[1]}` : parentFloor;
+      const roomName = roomMatch?.[1] ? `Room_${roomMatch[1]}`.trim() : '';
+
+      if (buildingName) {
+        const buildingEntry = addBuilding(buildingName);
+        if (floorName) addFloor(buildingEntry?.name || buildingName, floorName);
+        if (roomName && buildingEntry) addRoom(buildingEntry.name, floorName || '', roomName);
+      } else if (floorName) {
+        addFloor(parentBuilding || 'Campus', floorName);
+        if (roomName) addRoom(parentBuilding || 'Campus', floorName, roomName);
+      } else if (roomName) {
+        addRoom(parentBuilding || 'Campus', parentFloor || '', roomName);
+      }
+
+      (node.children || []).forEach((child) => visit(child, buildingName || parentBuilding, floorName || parentFloor));
+    };
+
+    visit(object);
+
+    return {
+      buildings: Array.from(buildingMap.values()),
+      floors: Array.from(floorMap.values()),
+      rooms: Array.from(roomMap.values())
+    };
+  };
+
+  const getPresetForTarget = (targetName) => {
+    const normalized = String(targetName || '').trim();
+    if (!normalized) return null;
+    const variants = [normalized, normalized.replace(/^Building_/i, ''), normalized.replace(/^Room_/i, 'Room_')];
+    for (const variant of variants) {
+      const direct = cameraPresets?.[variant];
+      const alt = cameraPresets?.[`Building_${variant}`];
+      if (direct) return direct;
+      if (alt) return alt;
+    }
+    return null;
   };
 
   useEffect(() => {
@@ -248,6 +384,32 @@ function ThreeDBuildingIndex() {
       }
     };
     camAnimRef.current = requestAnimationFrame(step);
+  };
+
+  const animateCameraToPreset = (targetName, onComplete) => {
+    const preset = getPresetForTarget(targetName);
+    if (!preset || !cameraRef.current) {
+      if (typeof onComplete === 'function') onComplete();
+      return false;
+    }
+
+    cameraTweenTokenRef.current += 1;
+    const token = cameraTweenTokenRef.current;
+    const position = new window.THREE.Vector3(...(preset.position || [0, 0, 0]));
+    const target = new window.THREE.Vector3(...(preset.target || [0, 0, 0]));
+    smoothCameraTo(position, target, 1300, () => {
+      if (token !== cameraTweenTokenRef.current) return;
+      if (typeof onComplete === 'function') onComplete();
+    });
+    return true;
+  };
+
+  const focusBuildingCamera = (buildingName, onDone) => {
+    if (!buildingName) return false;
+    const preset = getPresetForTarget(buildingName);
+    if (!preset) return false;
+    animateCameraToPreset(buildingName, onDone);
+    return true;
   };
 
   const updateViewButtonPosition = () => {
@@ -535,12 +697,29 @@ function ThreeDBuildingIndex() {
     });
   };
 
-  const rebuildMeshMap = (object) => {
+  const rebuildMeshMap = (object, catalogRooms = []) => {
     const nextMeshMap = {};
     object?.traverse((child) => {
       if (!child.isMesh) return;
       const normalized = normalizeMeshKey(child.name);
-      if (normalized) nextMeshMap[normalized] = child;
+      if (normalized) {
+        nextMeshMap[normalized] = child;
+
+        const matchedRoom = catalogRooms.find(r =>
+          normalizeMeshKey(r.room_name) === normalized
+        );
+        if (matchedRoom) {
+          child.userData = {
+            ...(child.userData || {}),
+            isClickable: true,
+            isRoom: true,
+            roomName: matchedRoom.room_name,
+            roomData: matchedRoom,
+            buildingId: matchedRoom.building_id,
+            floorId: matchedRoom.floor_id
+          };
+        }
+      }
     });
     meshMapRef.current = nextMeshMap;
   };
@@ -837,7 +1016,9 @@ function ThreeDBuildingIndex() {
       roomName: record.room_name || '',
       teacherName: record.teacher_name || '',
       color: markerColor,
-      statusText
+      statusText,
+      avatarUrl: record.avatar || '',
+      record: record
     };
   };
 
@@ -944,6 +1125,92 @@ function ThreeDBuildingIndex() {
     return [...roomOptions].sort((a, b) => String(a).localeCompare(String(b)));
   }, [roomOptions]);
 
+  const navigatorBuildings = useMemo(() => {
+    const fromModel = (modelHierarchy.buildings || []).map((entry) => ({
+      name: entry.name,
+      displayName: entry.displayName
+    }));
+    if (fromModel.length) {
+      return fromModel.sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+    }
+    return [...(catalog.buildings || [])]
+      .filter((building) => building.building_name)
+      .map((building) => ({
+        name: building.building_name,
+        displayName: toDisplayName(building.building_name)
+      }))
+      .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+  }, [modelHierarchy.buildings, catalog.buildings]);
+
+  const navigatorFloors = useMemo(() => {
+    if (!navigatorBuilding) return [];
+    const fromModel = [...(modelHierarchy.floors || [])]
+      .filter((floor) => nameEq(floor.buildingName, navigatorBuilding))
+      .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+    if (fromModel.length) return fromModel;
+    return [...(catalog.floors || [])]
+      .filter((floor) => nameEq(floor.building_name, navigatorBuilding))
+      .map((floor) => ({
+        buildingName: navigatorBuilding,
+        floorName: floor.floor_name,
+        displayName: toDisplayName(floor.floor_name)
+      }))
+      .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+  }, [modelHierarchy.floors, navigatorBuilding, catalog.floors]);
+
+  const navigatorRooms = useMemo(() => {
+    const search = String(buildingSearchText || '').trim().toLowerCase();
+    const baseRooms = (modelHierarchy.rooms && modelHierarchy.rooms.length > 0)
+      ? [...modelHierarchy.rooms]
+      : [...(catalog.rooms || [])].map((room) => {
+          const buildingEntry = (catalog.buildings || []).find((building) => String(building.building_id) === String(room.building_id));
+          const floorEntry = (catalog.floors || []).find((floor) => String(floor.floor_id) === String(room.floor_id));
+          return {
+            buildingName: buildingEntry?.building_name || room.building_name || '',
+            floorName: floorEntry?.floor_name || room.floor_name || '',
+            roomName: room.room_name || '',
+            displayName: toDisplayName(room.room_name || room.roomName)
+          };
+        });
+
+    return baseRooms
+      .filter((room) => {
+        if (navigatorBuilding && !nameEq(room.buildingName, navigatorBuilding)) return false;
+        if (navigatorFloor && !nameEq(room.floorName, navigatorFloor)) return false;
+        if (!search) return true;
+        return room.displayName.toLowerCase().includes(search)
+          || room.buildingName.toLowerCase().includes(search)
+          || room.floorName.toLowerCase().includes(search);
+      })
+      .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+  }, [modelHierarchy.rooms, navigatorBuilding, navigatorFloor, buildingSearchText, catalog.rooms, catalog.buildings, catalog.floors]);
+
+  const roomExplorerRooms = useMemo(() => {
+    const labelFilter = String(roomListFilter || '').trim().toLowerCase();
+    if (navigatorBuilding || navigatorFloor) {
+      const uniqueRooms = new Map();
+      navigatorRooms.forEach((room) => {
+        const exists = uniqueRooms.has(String(room.roomName || '').trim().toLowerCase());
+        if (exists) return;
+        if (labelFilter && !room.displayName.toLowerCase().includes(labelFilter)) return;
+        const catalogEntry = (catalog.rooms || []).find((r) => nameEq(r.room_name, room.roomName));
+        uniqueRooms.set(String(room.roomName || '').trim().toLowerCase(), catalogEntry || {
+          room_name: room.roomName,
+          building_id: null,
+          floor_id: null
+        });
+      });
+      return Array.from(uniqueRooms.values());
+    }
+
+    return (catalog.rooms || [])
+      .filter((room) => {
+        if (!labelFilter) return true;
+        return String(room.room_name || '').toLowerCase().includes(labelFilter);
+      })
+      .sort((a, b) => String(a.room_name || '').localeCompare(String(b.room_name || '')));
+  }, [catalog.rooms, navigatorRooms, navigatorBuilding, navigatorFloor, roomListFilter]);
+
   useEffect(() => {
     setPendingFilters(prev => ({
       campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
@@ -958,6 +1225,14 @@ function ThreeDBuildingIndex() {
       room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
     }));
   }, [campusOptions, buildingOptions, floorOptions, roomOptions]);
+
+  useEffect(() => {
+    const activeBuilding = pendingFilters.building || appliedFilters.building || navigatorBuilding;
+    const targetModel = getBuildingModelSrc(activeBuilding);
+    if (targetModel && targetModel !== modelSrc) {
+      setModelSrc(targetModel);
+    }
+  }, [pendingFilters.building, appliedFilters.building, navigatorBuilding]);
 
   const recordMatchesFilter = (record, filters) => {
     const eq = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
@@ -1107,20 +1382,8 @@ function ThreeDBuildingIndex() {
       return !!end && now <= end && hasAnyCheck;
     });
 
-    if (!candidates.length) {
-      setMarkerData(null);
-      return;
-    }
-
-    const picked = candidates.reduce((best, r) => {
-      const start = toDateTime(r.date, r.start_time);
-      if (!start) return best;
-      const diff = Math.abs(start.getTime() - now.getTime());
-      if (!best || diff < best.diff) return { rec: r, diff };
-      return best;
-    }, null);
-
-    setMarkerData(picked ? buildMarkerFromRecord(picked.rec, now) : null);
+    const markers = candidates.map(record => buildMarkerFromRecord(record, now));
+    setMarkerDataList(markers);
   }, [searchedRecords, nowTime]);
 
   useEffect(() => {
@@ -1167,14 +1430,84 @@ function ThreeDBuildingIndex() {
     };
 
     const handleViewerPointerDown = (event) => {
-      if (event.button !== 0 || !moveModeRef.current) return;
+      if (event.button !== 0) return;
       if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
-
-      const moveTarget = getMoveTargetObject();
-      if (!moveTarget) return;
 
       const pointer = getPointerNdc(event);
       if (!pointer) return;
+
+      raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+
+      const allObjects = [];
+      if (sceneRef.current) {
+        sceneRef.current.traverse((child) => {
+          if (child.userData && (child.userData.isClickable || child.userData.isMarker)) {
+            allObjects.push(child);
+          }
+        });
+      }
+
+      const markerHits = raycasterRef.current.intersectObjects(allObjects, false);
+      if (markerHits.length > 0) {
+        const hit = markerHits[0];
+        if (hit.object.userData && hit.object.userData.isClickable && hit.object.userData.record) {
+          const recordData = hit.object.userData.record;
+          setTeacherStatusModal({
+            record: recordData,
+            avatarUrl: recordData.avatar || '',
+            status: computeAttendanceStatus(recordData),
+            statusText: 'Attendance Status'
+          });
+          event.stopImmediatePropagation();
+          event.stopPropagation();
+          event.preventDefault();
+          return;
+        }
+      }
+
+      // Check for room clicks
+      const roomMeshes = [];
+      if (sceneRef.current) {
+        sceneRef.current.traverse((child) => {
+          if (child.userData?.isRoom) {
+            roomMeshes.push(child);
+          }
+        });
+      }
+
+      if (roomMeshes.length > 0) {
+        raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+        const roomHits = raycasterRef.current.intersectObjects(roomMeshes, false);
+
+        if (roomHits.length > 0) {
+          const roomMesh = roomHits[0].object;
+          const roomName = roomMesh.userData.roomName;
+
+          if (event.detail === 2) {
+            focusRoomCamera(roomName);
+            event.stopPropagation();
+            event.preventDefault();
+            return;
+          }
+
+          setSelectedRoom({
+            roomName,
+            roomData: roomMesh.userData.roomData,
+            buildingId: roomMesh.userData.buildingId,
+            floorId: roomMesh.userData.floorId,
+            meshObject: roomMesh
+          });
+
+          event.stopPropagation();
+          event.preventDefault();
+          return;
+        }
+      }
+
+      if (!moveModeRef.current) return;
+
+      const moveTarget = getMoveTargetObject();
+      if (!moveTarget) return;
 
       raycasterRef.current.setFromCamera(pointer, cameraRef.current);
       const hits = raycasterRef.current.intersectObject(moveTarget, true);
@@ -1208,11 +1541,45 @@ function ThreeDBuildingIndex() {
 
     const handleViewerPointerMove = (event) => {
       const dragState = dragStateRef.current;
-      if (!dragState.active || !dragState.object || !dragState.plane) return;
-      if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
-
       const pointer = getPointerNdc(event);
       if (!pointer) return;
+
+      // Handle room hover detection (when not dragging)
+      if (!dragState.active && !moveModeRef.current && cameraRef.current && raycasterRef.current && window.THREE) {
+        raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+        const roomMeshes = [];
+        if (sceneRef.current) {
+          sceneRef.current.traverse((child) => {
+            if (child.userData?.isRoom) {
+              roomMeshes.push(child);
+            }
+          });
+        }
+
+        if (roomMeshes.length > 0) {
+          const hits = raycasterRef.current.intersectObjects(roomMeshes, false);
+          if (hits.length > 0) {
+            const room = hits[0].object;
+            setHoveredRoom(room.userData.roomName);
+            setTooltipPosition({ x: event.clientX, y: event.clientY });
+            if (rendererRef.current) rendererRef.current.domElement.style.cursor = 'pointer';
+          } else {
+            setHoveredRoom(null);
+            setTooltipPosition(null);
+            if (rendererRef.current) rendererRef.current.domElement.style.cursor = '';
+          }
+        } else {
+          setHoveredRoom(null);
+          if (rendererRef.current) rendererRef.current.domElement.style.cursor = '';
+        }
+      } else if (dragState.active || moveModeRef.current) {
+        setHoveredRoom(null);
+        setTooltipPosition(null);
+      }
+
+      // Handle drag movement
+      if (!dragState.active || !dragState.object || !dragState.plane) return;
+      if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
 
       raycasterRef.current.setFromCamera(pointer, cameraRef.current);
       const planePoint = raycasterRef.current.ray.intersectPlane(dragState.plane, new window.THREE.Vector3());
@@ -1289,6 +1656,11 @@ function ThreeDBuildingIndex() {
   }, []);
 
   useEffect(() => {
+    if (!modelRef.current || !catalog.rooms?.length) return;
+    rebuildMeshMap(modelRef.current, catalog.rooms);
+  }, [catalog.rooms]);
+
+  useEffect(() => {
     if (!sceneRef.current || !window.THREE) return;
 
     clearPendingUploadPreview();
@@ -1314,11 +1686,23 @@ function ThreeDBuildingIndex() {
         }
 
         applyMeshDefaults(object);
-        rebuildMeshMap(object);
+        rebuildMeshMap(object, catalog.rooms || []);
+        const hierarchy = buildModelHierarchy(object);
+        setModelHierarchy(hierarchy);
+        if (hierarchy.buildings?.length) {
+          const buildingNames = hierarchy.buildings.map((entry) => entry.name);
+          setCameraPresets((prev) => ({ ...prev, ...defaultCameraPresets, ...Object.fromEntries(buildingNames.map((name) => [name, prev[name] || defaultCameraPresets[name] || defaultCameraPresets.Building_PhinmaHall])) }));
+        }
         centerObjectAtOrigin(object);
         updateUploadAnchorLayout(object);
+        const namedCam = extractNamedCameraFromGLTF(gltf);
+        if (namedCam) {
+          namedCameraDataRef.current = namedCam;
+          setAvailableCameras(namedCam);
+        }
         sceneRef.current.add(object);
         modelRef.current = object;
+        modelCacheRef.current.set(modelSrc, object);
         frameObjectInCamera(object);
         requestAnimationFrame(() => syncViewerSize());
         setStatus('ready');
@@ -1334,7 +1718,43 @@ function ThreeDBuildingIndex() {
         }
       }
     );
-  }, [modelSrc, fallbackModel]);
+  }, [modelSrc, fallbackModel, catalog.rooms]);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const payload = await apiGet('camera-positions.php').catch(() => null);
+        if (!active || !payload) return;
+        const presets = {};
+        Object.entries(payload || {}).forEach(([key, value]) => {
+          if (value && Array.isArray(value.position) && Array.isArray(value.target)) {
+            presets[key] = { position: value.position, target: value.target };
+          }
+        });
+        setCameraPresets((prev) => ({ ...defaultCameraPresets, ...prev, ...presets }));
+      } catch (error) {
+        console.warn('Camera presets unavailable:', error);
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!navigatorRoom) return;
+    const roomKey = String(navigatorRoom).trim();
+    const timer = window.setTimeout(() => {
+      (async () => {
+        try {
+          const payload = await apiGet(`room-status.php?room=${encodeURIComponent(roomKey)}`);
+          setRoomStatuses((prev) => ({ ...prev, [roomKey]: payload }));
+        } catch (error) {
+          console.warn('Room status request failed:', error);
+        }
+      })();
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [navigatorRoom]);
 
   const createTextLabel = (text) => {
     const canvas = document.createElement('canvas');
@@ -1361,48 +1781,124 @@ function ThreeDBuildingIndex() {
     return sprite;
   };
 
+  const createAvatarSprite = (avatarUrl, size = 2.5) => {
+    if (!window.THREE) return null;
+    const textureLoader = new window.THREE.TextureLoader();
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#d9d9d9';
+    ctx.fillRect(0, 0, 128, 128);
+
+    const texture = new window.THREE.CanvasTexture(canvas);
+    if (avatarUrl) {
+      textureLoader.load(
+        avatarUrl,
+        (loadedTexture) => {
+          texture.copy(loadedTexture);
+          texture.needsUpdate = true;
+        },
+        undefined,
+        (error) => {
+          console.warn('Avatar image failed to load:', error);
+        }
+      );
+    }
+
+    const material = new window.THREE.SpriteMaterial({ map: texture });
+    const sprite = new window.THREE.Sprite(material);
+    sprite.scale.set(size, size, 1);
+    return sprite;
+  };
+
+  const extractNamedCameraFromGLTF = (gltf) => {
+    if (!gltf || !gltf.scene || !window.THREE) return null;
+
+    let cameraNode = null;
+    gltf.scene.traverse((child) => {
+      if (child.isCamera && (child.name === 'CameraMW' || child.name === 'Camera.MW')) {
+        cameraNode = child;
+      }
+    });
+
+    if (!cameraNode) return null;
+
+    const position = new window.THREE.Vector3();
+    cameraNode.getWorldPosition(position);
+
+    const direction = new window.THREE.Vector3(0, 0, -1);
+    const quat = new window.THREE.Quaternion();
+    cameraNode.getWorldQuaternion(quat);
+    direction.applyQuaternion(quat);
+
+    const target = position.clone().add(direction.multiplyScalar(15));
+
+    return { position, target, name: cameraNode.name };
+  };
+
   useEffect(() => {
     if (!modelRef.current || !window.THREE || !sceneRef.current) return;
 
     if (pinRef.current) { removeSceneObject(pinRef.current); pinRef.current = null; }
     if (labelRef.current) { removeSceneObject(labelRef.current); labelRef.current = null; }
-    if (!markerData) return;
+    markerSpritesRef.current.forEach(sprite => removeSceneObject(sprite));
+    markerSpritesRef.current = [];
 
-    const normalizedTarget = normalizeMeshKey(markerData.roomName);
-    let targetMesh = meshMapRef.current[normalizedTarget] || null;
-    if (!targetMesh) {
-      modelRef.current.traverse((child) => {
-        if (child.isMesh && normalizeMeshKey(child.name) === normalizedTarget) {
-          targetMesh = child;
+    if (!markerDataList || markerDataList.length === 0) return;
+
+    markerDataList.forEach((markerData, markerIndex) => {
+      if (!markerData) return;
+
+      const normalizedTarget = normalizeMeshKey(markerData.roomName);
+      let targetMesh = meshMapRef.current[normalizedTarget] || null;
+      if (!targetMesh) {
+        modelRef.current.traverse((child) => {
+          if (child.isMesh && normalizeMeshKey(child.name) === normalizedTarget) {
+            targetMesh = child;
+          }
+        });
+      }
+
+      if (!targetMesh) {
+        return;
+      }
+
+      const box = new window.THREE.Box3().setFromObject(targetMesh);
+      const center = box.getCenter(new window.THREE.Vector3());
+      const size = box.getSize(new window.THREE.Vector3());
+      const colorHex = markerData.color === 'red' ? 0xff4d4f : markerData.color === 'orange' ? 0xffb020 : 0x22c55e;
+      const emissiveHex = markerData.color === 'red' ? 0x5a1212 : markerData.color === 'orange' ? 0x5a3b12 : 0x114922;
+
+      const geometry = new window.THREE.SphereGeometry(size.y * 0.4, 32, 32);
+      const material = new window.THREE.MeshStandardMaterial({ color: colorHex, emissive: emissiveHex, roughness: 0.25 });
+      const pin = new window.THREE.Mesh(geometry, material);
+      pin.position.copy(center);
+      pin.position.y += size.y + 1;
+      pin.userData = { isMarker: true, record: markerData };
+      sceneRef.current.add(pin);
+      markerSpritesRef.current.push(pin);
+
+      const sprite = createTextLabel(markerData.teacherName || 'Teacher');
+      sprite.position.copy(center);
+      sprite.position.y += size.y + 4;
+      sprite.userData = { isMarker: true, record: markerData };
+      sceneRef.current.add(sprite);
+      markerSpritesRef.current.push(sprite);
+
+      if (markerData.avatarUrl) {
+        const avatarSprite = createAvatarSprite(markerData.avatarUrl, 2);
+        if (avatarSprite) {
+          avatarSprite.position.copy(center);
+          avatarSprite.position.y += size.y + 2.5;
+          avatarSprite.position.x += 1.5;
+          avatarSprite.userData = { isMarker: true, isClickable: true, record: markerData };
+          sceneRef.current.add(avatarSprite);
+          markerSpritesRef.current.push(avatarSprite);
         }
-      });
-    }
-
-    if (!targetMesh) {
-      setMessage(`Room "${markerData.roomName}" was not found in the 3D model.`);
-      return;
-    }
-
-    const box = new window.THREE.Box3().setFromObject(targetMesh);
-    const center = box.getCenter(new window.THREE.Vector3());
-    const size = box.getSize(new window.THREE.Vector3());
-    const colorHex = markerData.color === 'red' ? 0xff4d4f : markerData.color === 'orange' ? 0xffb020 : 0x22c55e;
-    const emissiveHex = markerData.color === 'red' ? 0x5a1212 : markerData.color === 'orange' ? 0x5a3b12 : 0x114922;
-
-    const geometry = new window.THREE.SphereGeometry(size.y * 0.4, 32, 32);
-    const material = new window.THREE.MeshStandardMaterial({ color: colorHex, emissive: emissiveHex, roughness: 0.25 });
-    const pin = new window.THREE.Mesh(geometry, material);
-    pin.position.copy(center);
-    pin.position.y += size.y + 1;
-    sceneRef.current.add(pin);
-    pinRef.current = pin;
-
-    const sprite = createTextLabel(markerData.teacherName || 'Teacher');
-    sprite.position.copy(center);
-    sprite.position.y += size.y + 4;
-    sceneRef.current.add(sprite);
-    labelRef.current = sprite;
-  }, [markerData]);
+      }
+    });
+  }, [markerDataList]);
 
   const applyView = (view) => {
     if (!cameraRef.current) return;
@@ -1696,6 +2192,79 @@ function ThreeDBuildingIndex() {
     setRoomModal(getRoomMeta(roomName));
   };
 
+  const showRoomStatusModal = (roomName, source = 'navigator') => {
+    const roomKey = String(roomName || '').trim();
+    if (!roomKey) return;
+    setNavigatorRoom(roomKey);
+    setTeacherStatusModal({
+      record: {
+        teacher_name: roomStatuses?.[roomKey]?.teacher_name || 'Teacher',
+        room_name: roomKey,
+        subject: roomStatuses?.[roomKey]?.subject || '',
+        scheduled_time: roomStatuses?.[roomKey]?.scheduled_time || '',
+        status: roomStatuses?.[roomKey]?.status || 'NO_CLASS'
+      },
+      avatarUrl: roomStatuses?.[roomKey]?.photo || '',
+      status: roomStatuses?.[roomKey]?.status || 'NO_CLASS',
+      statusText: roomStatuses?.[roomKey]?.status || 'No class scheduled',
+      source
+    });
+  };
+
+  const handleNavigatorBuildingSelect = (buildingName) => {
+    const clean = String(buildingName || '').trim();
+    if (!clean) return;
+    setNavigatorBuilding(clean);
+    setNavigatorFloor('');
+    setNavigatorRoom('');
+    const mappedModel = getBuildingModelSrc(clean);
+    if (mappedModel !== modelSrc) {
+      setModelSrc(mappedModel);
+    }
+    focusBuildingCamera(clean, () => {
+      setBuildingExplorerOpen(false);
+      setRoomListOpen(true);
+    });
+  };
+
+  const handleNavigatorFloorSelect = (floorName) => {
+    const clean = String(floorName || '').trim();
+    if (!clean) return;
+    setNavigatorFloor(clean);
+    setNavigatorRoom('');
+  };
+
+  const handleNavigatorRoomSelect = (roomName) => {
+    const clean = String(roomName || '').trim();
+    if (!clean) return;
+
+    const roomCatalogEntry = (catalog.rooms || []).find((room) => nameEq(room.room_name, clean) || nameEq(room.roomName, clean));
+    const buildingMeta = roomCatalogEntry
+      ? (catalog.buildings || []).find((building) => String(building.building_id) === String(roomCatalogEntry.building_id))
+      : null;
+    const floorMeta = roomCatalogEntry
+      ? (catalog.floors || []).find((floor) => String(floor.floor_id) === String(roomCatalogEntry.floor_id))
+      : null;
+    const inferredBuilding = buildingMeta?.building_name || roomCatalogEntry?.building_name || roomCatalogEntry?.buildingName || '';
+    const inferredFloor = floorMeta?.floor_name || roomCatalogEntry?.floor_name || roomCatalogEntry?.floorName || '';
+
+    setNavigatorBuilding(inferredBuilding || navigatorBuilding || '');
+    setNavigatorFloor(inferredFloor || navigatorFloor || '');
+    setNavigatorRoom(clean);
+
+    const mappedModel = getBuildingModelSrc(inferredBuilding || navigatorBuilding || clean);
+    if (mappedModel !== modelSrc) {
+      setModelSrc(mappedModel);
+    }
+
+    if (focusRoomCamera(clean)) {
+      window.clearTimeout(roomSelectionTimerRef.current);
+      roomSelectionTimerRef.current = window.setTimeout(() => {
+        showRoomStatusModal(clean, 'navigation');
+      }, 3000);
+    }
+  };
+
   const handleRecentLogClick = async (log) => {
     const roomName = String(log?.roomName || '').trim();
     if (!roomName || roomName === '-') {
@@ -1754,6 +2323,17 @@ function ThreeDBuildingIndex() {
       });
       return;
     }
+
+    if (pendingFilters.building && namedCameraDataRef.current && cameraRef.current) {
+      const camData = namedCameraDataRef.current;
+      if (camData.position) {
+        const lookAtPos = camData.target || new window.THREE.Vector3(0, 0, 0);
+        smoothCameraTo(camData.position, lookAtPos, 800);
+        setFocusedRoom('');
+        return;
+      }
+    }
+
     if (pendingFilters.room) {
       const ok = focusRoomCamera(pendingFilters.room, () => setViewButtonVisible(true));
       setFocusedRoom(ok ? pendingFilters.room : '');
@@ -1816,91 +2396,6 @@ function ThreeDBuildingIndex() {
             </div>
           </div>
 
-          <div className="tdb-filter-row">
-            <div className="tdb-field">
-              <label>Search Teacher...</label>
-              <input
-                type="search"
-                className="form-control form-control-sm"
-                placeholder="Search Teacher..."
-                value={searchTeacher}
-                onChange={(e) => setSearchTeacher(e.target.value)}
-              />
-            </div>
-            <div className="tdb-field">
-              <label>Filter By Campus</label>
-              <select
-                className="form-select form-select-sm"
-                value={pendingFilters.campus}
-                onChange={(e) => {
-                  clearViewFocus();
-                  setPendingFilters(() => ({
-                    campus: e.target.value,
-                    building: '',
-                    floor: '',
-                    room: ''
-                  }));
-                }}
-              >
-                <option value="">All Campus</option>
-                {campusOptions.map((campus) => <option key={campus} value={campus}>{campus}</option>)}
-              </select>
-            </div>
-            <div className="tdb-field">
-              <label>Filter By Building</label>
-              <select
-                className="form-select form-select-sm"
-                value={pendingFilters.building}
-                onChange={(e) => {
-                  clearViewFocus();
-                  setPendingFilters((prev) => ({
-                    ...prev,
-                    building: e.target.value,
-                    floor: '',
-                    room: ''
-                  }));
-                }}
-              >
-                <option value="">All Building</option>
-                {buildingOptions.map((building) => <option key={building} value={building}>{building}</option>)}
-              </select>
-            </div>
-            <div className="tdb-field">
-              <label>Filter By Floor</label>
-              <select
-                className="form-select form-select-sm"
-                value={pendingFilters.floor}
-                onChange={(e) => {
-                  clearViewFocus();
-                  setPendingFilters((prev) => ({
-                    ...prev,
-                    floor: e.target.value,
-                    room: ''
-                  }));
-                }}
-              >
-                <option value="">All Floor</option>
-                {floorOptions.map((floor) => <option key={floor} value={floor}>{floor}</option>)}
-              </select>
-            </div>
-            <div className="tdb-field">
-              <label>Filter By Rooms</label>
-              <select
-                className="form-select form-select-sm"
-                value={pendingFilters.room}
-                onChange={(e) => {
-                  clearViewFocus();
-                  setPendingFilters((prev) => ({ ...prev, room: e.target.value }));
-                }}
-              >
-                <option value="">All Rooms</option>
-                {roomOptions.map((room) => <option key={room} value={room}>{room}</option>)}
-              </select>
-            </div>
-            <div className="tdb-view-button-wrap">
-              <button type="button" onClick={applyFilterView} className="btn btn-success btn-sm tdb-view-button">VIEW</button>
-            </div>
-          </div>
 
           <div
             className={`tdb-viewer-wrap${isFullscreen ? ' tdb-viewer-wrap--fullscreen' : ''}`}
@@ -1939,6 +2434,120 @@ function ThreeDBuildingIndex() {
             )}
 
             <div className="tdb-viewer" ref={mountRef} />
+
+            <button
+              type="button"
+              className="tdb-room-explorer-btn"
+              onClick={() => setRoomListOpen(!roomListOpen)}
+              aria-label="Toggle room explorer"
+              title="Toggle room explorer"
+            >
+              🏛️
+            </button>
+
+            {roomListOpen && (
+              <div className="tdb-room-explorer-panel">
+                <div className="tdb-room-explorer-header">
+                  <div className="tdb-room-explorer-title">Campus Navigator</div>
+                  <input
+                    type="text"
+                    className="tdb-room-explorer-search"
+                    placeholder="Search buildings, floors, rooms..."
+                    value={buildingSearchText}
+                    onChange={(e) => setBuildingSearchText(e.target.value)}
+                  />
+                </div>
+                <div className="tdb-navigator-section">
+                  <div className="tdb-navigator-title">Buildings</div>
+                  <div className="tdb-navigator-chips">
+                    {navigatorBuildings.length > 0 ? (
+                      navigatorBuildings.map((building) => (
+                        <button
+                          key={building.name}
+                          type="button"
+                          className={`tdb-navigator-chip ${nameEq(building.name, navigatorBuilding) ? 'tdb-navigator-chip--active' : ''}`}
+                          onClick={() => handleNavigatorBuildingSelect(building.name)}
+                        >
+                          {building.displayName}
+                        </button>
+                      ))
+                    ) : (
+                      <div className="tdb-navigator-empty">Loading building hierarchy...</div>
+                    )}
+                  </div>
+                </div>
+                {navigatorBuilding && (
+                  <div className="tdb-navigator-section">
+                    <div className="tdb-navigator-title">Floors</div>
+                    <div className="tdb-navigator-chips">
+                      {navigatorFloors.length > 0 ? (
+                        navigatorFloors.map((floor) => (
+                          <button
+                            key={`${floor.buildingName}-${floor.floorName}`}
+                            type="button"
+                            className={`tdb-navigator-chip ${nameEq(floor.floorName, navigatorFloor) ? 'tdb-navigator-chip--active' : ''}`}
+                            onClick={() => handleNavigatorFloorSelect(floor.floorName)}
+                          >
+                            {floor.displayName}
+                          </button>
+                        ))
+                      ) : (
+                        <div className="tdb-navigator-empty">No floors found for this building.</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="tdb-room-list">
+                  {roomExplorerRooms && roomExplorerRooms.length > 0 ? (
+                    roomExplorerRooms.map((room, idx) => {
+                      const roomName = room.room_name || room.roomName || `Room ${idx + 1}`;
+                      const teachersInRoom = searchedRecords.filter(rec =>
+                        nameEq(rec.room_name, roomName) && (rec.time_in || rec.time_check || rec.time_out)
+                      ).length;
+                      const building = catalog.buildings?.find(b => String(b.building_id) === String(room.building_id));
+                      return (
+                        <button
+                          key={`${roomName}-${idx}`}
+                          type="button"
+                          className={`tdb-room-list-item ${selectedRoom?.roomName === roomName ? 'tdb-room-list-item--selected' : ''}`}
+                          onClick={() => {
+                            setSelectedRoom({
+                              roomName,
+                              roomData: room,
+                              buildingId: room.building_id,
+                              floorId: room.floor_id
+                            });
+                            handleNavigatorRoomSelect(roomName);
+                          }}
+                        >
+                          <div className="tdb-room-list-item-name">{roomName}</div>
+                          <div className="tdb-room-list-item-meta">
+                            {building?.building_name || '-'}
+                            {teachersInRoom > 0 && (
+                              <span className="tdb-room-list-item-count">{teachersInRoom}</span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })
+                  ) : (
+                    <div className="tdb-navigator-empty">No rooms found.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {hoveredRoom && tooltipPosition && (
+              <div
+                className="tdb-tooltip"
+                style={{
+                  left: `${tooltipPosition.x + 10}px`,
+                  top: `${tooltipPosition.y + 10}px`
+                }}
+              >
+                {hoveredRoom}
+              </div>
+            )}
 
             {isFullscreen && uploadAnchorDefs.map((anchor) => (
               <button
@@ -2129,6 +2738,121 @@ function ThreeDBuildingIndex() {
                   </div>
                   <div className="tdb-modal-actions">
                     <button type="button" className="btn btn-success btn-sm" onClick={() => setRoomModal(null)}>Close</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {teacherStatusModal && (
+              <div className="tdb-teacher-status-backdrop" onClick={() => setTeacherStatusModal(null)}>
+                <div className="tdb-teacher-status-card" onClick={(e) => e.stopPropagation()}>
+                  <div className="tdb-teacher-status-header">
+                    <div className="tdb-teacher-status-avatar">
+                      <img
+                        src={teacherStatusModal.avatarUrl || defaultAvatarSrc}
+                        alt={teacherStatusModal.record?.teacher_name || 'Teacher'}
+                        onError={(e) => {
+                          if (e.currentTarget.src !== defaultAvatarSrc) {
+                            e.currentTarget.src = defaultAvatarSrc;
+                          }
+                        }}
+                      />
+                    </div>
+                    <div className="tdb-teacher-status-info">
+                      <div className="tdb-teacher-status-name">
+                        {teacherStatusModal.record?.teacher_name || 'Teacher'}
+                      </div>
+                      <div className="tdb-teacher-status-room">
+                        {teacherStatusModal.record?.room_name || '-'}
+                      </div>
+                      <div style={{ marginTop: '8px' }}>
+                        <span className={`tdb-teacher-status-badge tdb-teacher-status-badge--${
+                          teacherStatusModal.status === 'PRESENT' ? 'present' :
+                          teacherStatusModal.status === 'LATE' ? 'late' : 'absent'
+                        }`}>
+                          {teacherStatusModal.status}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="tdb-teacher-status-actions">
+                    <button
+                      type="button"
+                      className="btn btn-success btn-sm"
+                      onClick={() => setTeacherStatusModal(null)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {selectedRoom && (
+              <div className="tdb-room-info-modal" onClick={() => setSelectedRoom(null)}>
+                <div className="tdb-room-info-card" onClick={(e) => e.stopPropagation()}>
+                  <div className="tdb-room-info-header">
+                    <div className="tdb-room-info-title">{selectedRoom.roomName}</div>
+                    <div className="tdb-room-info-meta">
+                      {catalog.buildings?.find(b => String(b.building_id) === String(selectedRoom.buildingId))?.building_name || '-'}
+                      {' • '}
+                      {catalog.floors?.find(f => String(f.floor_id) === String(selectedRoom.floorId))?.floor_name || '-'}
+                    </div>
+                  </div>
+
+                  <div className="tdb-room-info-occupants">
+                    <div className="tdb-room-info-occupants-title">Currently in this room</div>
+                    {searchedRecords.filter(rec =>
+                      rec.room_name === selectedRoom.roomName && (rec.time_in || rec.time_check || rec.time_out)
+                    ).length > 0 ? (
+                      searchedRecords
+                        .filter(rec =>
+                          rec.room_name === selectedRoom.roomName && (rec.time_in || rec.time_check || rec.time_out)
+                        )
+                        .map((rec, idx) => (
+                          <div key={`${rec.user_id}-${idx}`} className="tdb-room-occupant">
+                            <div className="tdb-room-occupant-avatar">
+                              <img
+                                src={rec.avatar || defaultAvatarSrc}
+                                alt={rec.teacher_name || 'Teacher'}
+                                onError={(e) => {
+                                  if (e.currentTarget.src !== defaultAvatarSrc) {
+                                    e.currentTarget.src = defaultAvatarSrc;
+                                  }
+                                }}
+                              />
+                            </div>
+                            <div className="tdb-room-occupant-info">
+                              <div className="tdb-room-occupant-name">{rec.teacher_name || 'Teacher'}</div>
+                              <div className="tdb-room-occupant-status">
+                                {computeAttendanceStatus(rec)}
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                    ) : (
+                      <div className="tdb-room-info-empty">No one checked in</div>
+                    )}
+                  </div>
+
+                  <div className="tdb-room-info-actions">
+                    <button
+                      type="button"
+                      className="btn btn-outline-light btn-sm"
+                      onClick={() => setSelectedRoom(null)}
+                    >
+                      Close
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-success btn-sm"
+                      onClick={() => {
+                        focusRoomCamera(selectedRoom.roomName);
+                        setSelectedRoom(null);
+                      }}
+                    >
+                      Focus Camera
+                    </button>
                   </div>
                 </div>
               </div>

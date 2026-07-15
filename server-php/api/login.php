@@ -7,9 +7,11 @@ use Firebase\JWT\JWT;
 
 $permissionModeColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'permission_mode'");
 $modulePermissionsColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'module_permissions'");
+$firstLoginColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'is_first_login'");
 $hasPermissionModeCol = $permissionModeColCheck && $permissionModeColCheck->num_rows > 0;
 $hasModulePermissionsCol = $modulePermissionsColCheck && $modulePermissionsColCheck->num_rows > 0;
 $hasUserModulePermissions = $hasPermissionModeCol && $hasModulePermissionsCol;
+$hasFirstLoginCol = $firstLoginColCheck && $firstLoginColCheck->num_rows > 0;
 
 $decode_module_permissions = function($raw) {
     if ($raw === null || $raw === '') return ['allow' => [], 'deny' => []];
@@ -32,7 +34,9 @@ if ($request_method === 'POST') {
             json_response(['error' => 'Missing email / ID or password'], 400);
         }
 
-        // Create login lock table if it doesn't exist (tracks failed attempts and short lockouts)
+        $clientIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+
+        // Create login lock table and login attempts history table
         $mysqli->query("CREATE TABLE IF NOT EXISTS `tbl_login_locks` (
             `id` INT(11) NOT NULL AUTO_INCREMENT,
             `email` VARCHAR(255) NOT NULL,
@@ -40,6 +44,20 @@ if ($request_method === 'POST') {
             `lock_until` DATETIME DEFAULT NULL,
             PRIMARY KEY (`id`),
             UNIQUE KEY `email_unique` (`email`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        $mysqli->query("CREATE TABLE IF NOT EXISTS `tbl_login_attempts` (
+            `attempt_id` INT(11) NOT NULL AUTO_INCREMENT,
+            `email` VARCHAR(255) NOT NULL,
+            `user_id` INT(11) NULL DEFAULT NULL,
+            `attempt_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `status` ENUM('success', 'failed') NOT NULL DEFAULT 'failed',
+            `ip_address` VARCHAR(45) NULL DEFAULT NULL,
+            `details` VARCHAR(255) NULL DEFAULT NULL,
+            PRIMARY KEY (`attempt_id`),
+            KEY `email` (`email`),
+            KEY `user_id` (`user_id`),
+            KEY `attempt_time` (`attempt_time`),
+            KEY `status` (`status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
         // Check if this email is currently locked
@@ -70,7 +88,8 @@ if ($request_method === 'POST') {
         $permissionCols = $hasUserModulePermissions
             ? ", permission_mode, module_permissions"
             : ", NULL AS permission_mode, NULL AS module_permissions";
-        $stmt = $mysqli->prepare("SELECT user_id, role_id, dept_id, first_name, last_name, email, password_hash, status{$permissionCols} FROM tbl_users WHERE email = ? OR id_number = ? LIMIT 1");
+        $firstLoginCol = $hasFirstLoginCol ? ", is_first_login" : ", 0 AS is_first_login";
+        $stmt = $mysqli->prepare("SELECT user_id, role_id, dept_id, first_name, last_name, id_number, email, password_hash, status{$permissionCols}{$firstLoginCol} FROM tbl_users WHERE email = ? OR id_number = ? LIMIT 1");
         $stmt->bind_param("ss", $identifier, $identifier);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -88,6 +107,15 @@ if ($request_method === 'POST') {
         }
 
         if (!$user || !password_verify($password, $user['password_hash'])) {
+            // Log failed attempt
+            $failedUserId = $user ? (int)$user['user_id'] : null;
+            $logStmt = $mysqli->prepare("INSERT INTO tbl_login_attempts (email, user_id, status, ip_address, details) VALUES (?, ?, 'failed', ?, 'Invalid password')");
+            if ($logStmt) {
+                $logStmt->bind_param("sis", $identifier, $failedUserId, $clientIp);
+                $logStmt->execute();
+                $logStmt->close();
+            }
+
             // Handle failed attempt: increment counter and lock for 30s after 10 consecutive failures
             $failed = $lockFailedAttempts + 1;
             $lockSeconds = 0;
@@ -127,6 +155,15 @@ if ($request_method === 'POST') {
             }
         }
 
+        // Log successful login
+        $logSuccess = $mysqli->prepare("INSERT INTO tbl_login_attempts (email, user_id, status, ip_address, details) VALUES (?, ?, 'success', ?, 'Login successful')");
+        if ($logSuccess) {
+            $uid = (int)$user['user_id'];
+            $logSuccess->bind_param("sis", $identifier, $uid, $clientIp);
+            $logSuccess->execute();
+            $logSuccess->close();
+        }
+
         // Successful login: clear any lock state for this email
         $clear = $mysqli->prepare("DELETE FROM tbl_login_locks WHERE email = ?");
         if ($clear) {
@@ -154,9 +191,11 @@ if ($request_method === 'POST') {
                 'user_id' => $user['user_id'],
                 'first_name' => $user['first_name'],
                 'last_name' => $user['last_name'],
+                'id_number' => isset($user['id_number']) ? (string)$user['id_number'] : '',
                 'email' => $user['email'],
                 'role_id' => $user['role_id'],
                 'dept_id' => $user['dept_id'],
+                'is_first_login' => isset($user['is_first_login']) ? (int)$user['is_first_login'] : 0,
                 'permission_mode' => $hasUserModulePermissions ? ($user['permission_mode'] ?? 'default') : 'default',
                 'module_permissions' => $hasUserModulePermissions ? $decode_module_permissions($user['module_permissions'] ?? null) : ['allow' => [], 'deny' => []],
             ]

@@ -58,15 +58,34 @@ function AuthProvider({ children }) {
     } catch (e) {}
   }, []);
 
-  const logout = useCallback((options = {}) => {
+  const logout = useCallback(async (options = {}) => {
     setUser(null);
     clearSession();
+
+    const finishLogout = () => {
+      if (typeof window !== 'undefined') {
+        window.location.hash = '#/login';
+      }
+    };
+
     if (options.notice) {
-      try { window.alert(options.notice); } catch (e) {}
+      if (typeof window !== 'undefined' && window.Swal && typeof window.Swal.fire === 'function') {
+        try {
+          await window.Swal.fire({
+            title: 'Notice',
+            text: options.notice,
+            icon: 'info',
+            confirmButtonText: 'OK',
+            showCloseButton: true
+          });
+        } catch (e) {
+          try { window.alert(options.notice); } catch (err) {}
+        }
+      } else {
+        try { window.alert(options.notice); } catch (e) {}
+      }
     }
-    if (typeof window !== 'undefined') {
-      window.location.hash = '#/login';
-    }
+    finishLogout();
   }, [clearSession]);
 
   logoutRef.current = logout;
@@ -91,6 +110,13 @@ function AuthProvider({ children }) {
     }
     touchActivity(true);
   }, [touchActivity]);
+
+  const updateUser = useCallback((nextUser) => {
+    setUser(nextUser || null);
+    try {
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(nextUser || null));
+    } catch (e) {}
+  }, []);
 
   useEffect(() => {
     try {
@@ -154,7 +180,7 @@ function AuthProvider({ children }) {
   }, [user, touchActivity]);
 
   return (
-    <AuthContext.Provider value={{ user, login, logout, touchActivity }}>
+    <AuthContext.Provider value={{ user, login, logout, updateUser, touchActivity }}>
       {children}
     </AuthContext.Provider>
   );

@@ -3,6 +3,16 @@
 // Sends OTP email via SMTP (pure PHP, no Composer/PHPMailer needed).
 
 /**
+ * Validate that an email string is exactly one deliverable recipient.
+ */
+function mail_helper_is_single_recipient($email) {
+    $recipient = trim((string)$email);
+    if ($recipient === '') return false;
+    if (preg_match('/[\r\n,;]/', $recipient)) return false;
+    return (bool)filter_var($recipient, FILTER_VALIDATE_EMAIL);
+}
+
+/**
  * Send forgot-password OTP email.
  * Uses SMTP when configured in config/mail.php (smtp_user + smtp_pass), else PHP mail().
  *
@@ -13,6 +23,11 @@
  * @return bool True if mail was accepted for delivery
  */
 function send_forgot_password_email($to, $firstName, $lastName, $otp) {
+    if (!mail_helper_is_single_recipient($to)) {
+        error_log('[mail_helper] Refusing forgot-password email: invalid single recipient');
+        return false;
+    }
+
     $templatePath = __DIR__ . '/../templates/forgot_password_email.php';
     if (!is_file($templatePath)) {
         error_log('[mail_helper] Template not found: ' . $templatePath);
@@ -63,6 +78,11 @@ function send_forgot_password_email($to, $firstName, $lastName, $otp) {
  * @return bool True if mail was accepted for delivery
  */
 function send_new_account_email($to, $firstName, $lastName, $username) {
+    if (!mail_helper_is_single_recipient($to)) {
+        error_log('[mail_helper] Refusing new-account email: invalid single recipient');
+        return false;
+    }
+
     $templatePath = __DIR__ . '/../templates/new_account_email.php';
     if (!is_file($templatePath)) {
         error_log('[mail_helper] Template not found: ' . $templatePath);
@@ -104,10 +124,97 @@ function send_new_account_email($to, $firstName, $lastName, $username) {
 }
 
 /**
+ * Send a personal system notification email.
+ *
+ * The recipient must already be resolved from the triggering user's own profile.
+ */
+function send_personal_notification_email($to, $firstName, $notificationType, $briefDescription, $eventDetails, $eventDateTime = null) {
+    if (!mail_helper_is_single_recipient($to)) {
+        error_log('[mail_helper] Refusing personal notification email: invalid single recipient');
+        return false;
+    }
+
+    $recipient = trim((string)$to);
+    $name = trim((string)$firstName);
+    if ($name === '') $name = 'there';
+
+    $type = strtoupper(trim((string)$notificationType));
+    if ($type === '') $type = 'GENERAL';
+
+    $brief = trim((string)$briefDescription);
+    if ($brief === '') $brief = 'Account notification';
+
+    $details = trim((string)$eventDetails);
+    if ($details === '') $details = 'A system update was recorded for your account.';
+
+    try {
+        if ($eventDateTime instanceof DateTimeInterface) {
+            $dt = DateTime::createFromFormat('U', (string)$eventDateTime->getTimestamp());
+            if ($dt instanceof DateTime) $dt->setTimezone(new DateTimeZone(date_default_timezone_get()));
+        } elseif (is_string($eventDateTime) && trim($eventDateTime) !== '') {
+            $dt = new DateTime($eventDateTime);
+        } else {
+            $dt = new DateTime();
+        }
+    } catch (Throwable $_) {
+        $dt = new DateTime();
+    }
+    if (!isset($dt) || !($dt instanceof DateTimeInterface)) {
+        $dt = new DateTime();
+    }
+
+    $subject = '[' . $type . '] ' . $brief . ' · ' . $dt->format('Y-m-d');
+    $plainBody =
+        "Hi {$name},\n\n" .
+        "This is a personal notification for your account.\n\n" .
+        "Event     : {$type}\n" .
+        "Details   : {$details}\n" .
+        "Date/Time : " . $dt->format('Y-m-d  h:i A') . "\n\n" .
+        "If you did not expect this message, please contact\n" .
+        "your administrator.";
+
+    $htmlBody = '<pre style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.55; white-space: pre-wrap;">'
+        . htmlspecialchars($plainBody, ENT_QUOTES, 'UTF-8')
+        . '</pre>';
+
+    $from = 'noreply@' . ($_SERVER['SERVER_NAME'] ?? 'localhost');
+    if (is_file(__DIR__ . '/../config/security.php')) {
+        $sec = require __DIR__ . '/../config/security.php';
+        if (!empty($sec['mail_from'])) $from = $sec['mail_from'];
+    }
+    if (function_exists('getenv') && getenv('MAIL_FROM')) {
+        $from = getenv('MAIL_FROM');
+    }
+
+    $mailConfigPath = __DIR__ . '/../config/mail.php';
+    if (is_file($mailConfigPath)) {
+        $mailConfig = require $mailConfigPath;
+        $useSmtp = (!empty($mailConfig['smtp_host']) && !empty($mailConfig['smtp_user']) && (string)$mailConfig['smtp_pass'] !== '');
+        if ($useSmtp) {
+            return send_via_smtp_socket($recipient, $from, $subject, $htmlBody, $mailConfig);
+        }
+    }
+
+    $headers = [
+        'MIME-Version: 1.0',
+        'Content-Type: text/html; charset=UTF-8',
+        'From: ' . $from,
+        'X-Mailer: PHP/' . PHP_VERSION,
+    ];
+    return @mail($recipient, $subject, $htmlBody, implode("\r\n", $headers));
+}
+
+/**
  * Send email via SMTP using only PHP sockets (no PHPMailer).
  * Works with Gmail (smtp.gmail.com:587, STARTTLS).
  */
 function send_via_smtp_socket($to, $fromFallback, $subject, $htmlBody, $mailConfig) {
+    if (!mail_helper_is_single_recipient($to)) {
+        error_log('[mail_helper] SMTP send refused: invalid single recipient');
+        return false;
+    }
+    $to = trim((string)$to);
+
     $host = $mailConfig['smtp_host'];
     $port = (int)($mailConfig['smtp_port'] ?? 587);
     $user = $mailConfig['smtp_user'];

@@ -39,8 +39,6 @@ export default function Navbar() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileData, setProfileData] = useState(user || null);
   const [uploading, setUploading] = useState(false);
-  const [selectedAvatarFile, setSelectedAvatarFile] = useState(null);
-  const [selectedAvatarPreview, setSelectedAvatarPreview] = useState(null);
   const [profileForm, setProfileForm] = useState({ first_name: '', last_name: '', email: '', contact_no: '' });
   const [notificationAgeTick, setNotificationAgeTick] = useState(Date.now());
 
@@ -51,10 +49,9 @@ export default function Navbar() {
   const unreadNotifications = notifLoaded
     ? unreadCount
     : ((profileData && (profileData.unread_notifications || profileData.notifications_count || 0)) || 0);
-  const effectiveProfileRoleId = Number((profileData && profileData.role_id) || (user && user.role_id) || 0);
-  const effectiveProfileRoleName = String((profileData && profileData.role_name) || (user && user.role_name) || '').trim().toLowerCase();
-  const isProfileEditable = effectiveProfileRoleId === 1 || effectiveProfileRoleName === 'admin';
-  const notificationUserId = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
+  const profileUserId = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
+  const notificationUserId = profileUserId;
+  const canEditProfileContact = Boolean(profileUserId);
   const isOnNotificationRoute = String(currentHash || '').toLowerCase().includes('notification');
   const shouldAnimateNotificationBell = unreadNotifications > 0 && !notificationOpen && !isOnNotificationRoute;
   const filteredNotifications = notificationFilter === 'unread'
@@ -125,11 +122,12 @@ export default function Navbar() {
   };
 
   const resetProfileEditor = () => {
-    setSelectedAvatarFile(null);
-    if (selectedAvatarPreview) {
-      try { URL.revokeObjectURL(selectedAvatarPreview); } catch (e) {}
-    }
-    setSelectedAvatarPreview(null);
+    setProfileForm({
+      first_name: (profileData && profileData.first_name) || '',
+      last_name: (profileData && profileData.last_name) || '',
+      email: (profileData && profileData.email) || '',
+      contact_no: (profileData && profileData.contact_no) || '',
+    });
   };
 
   const applyProfileUpdate = (nextUser) => {
@@ -340,7 +338,7 @@ export default function Navbar() {
     { label: "Users", path: "/users", permission: 'users' },
 
     // --- MODIFIED: Faculty Portal (Formerly Attendance Logs) ---
-    // Permission 'attendance' allows: dean, program_head, secretary, teacher. (No Admin)
+    // Permission 'attendance' allows: Dean, Program Head, Secretary, Teacher. (No Admin)
     { label: "Faculty Portal", path: "/faculty-portal", permission: 'attendance', children: [
       { label: "My Dashboard", path: "/faculty-dashboard", permission: 'faculty_dashboard' },
       { label: "Attendance", path: "/attendance", permission: 'attendance' },
@@ -378,6 +376,7 @@ export default function Navbar() {
     // { label: "Penalties", path: "/penalties", permission: 'penalties' },
     { label: "Reports", path: "/reports", permission: 'reports' },
     { label: "Audit Trail", path: "/system-logs", permission: 'logs' },
+    { label: "Notification", path: "/notifications", permission: null },
     { label: 'General Settings', path: '/settings/system', permission: 'settings' },
 
   ];
@@ -480,6 +479,7 @@ export default function Navbar() {
     if (p.startsWith('/file_leave') || p.startsWith('/leave_approval')) return 'leave';
     if (p.startsWith('/substitute') || p.startsWith('/substitutions')) return 'substitute';
     if (p.startsWith('/reports')) return 'reports';
+    if (p.startsWith('/notifications')) return 'notification';
     if (p.startsWith('/settings') || p === '/school') return 'settings';
     if (p.startsWith('/penalties')) return 'warning';
     return 'default';
@@ -603,6 +603,12 @@ export default function Navbar() {
             <path d="M22 20H2" />
           </>
         )}
+        {iconKey === 'notification' && (
+          <>
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+            <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+          </>
+        )}
         {iconKey === 'logs' && (
           <>
             <path d="M7 3h8l4 4v14H7z" />
@@ -696,8 +702,8 @@ export default function Navbar() {
     const ok = await confirmNotificationAction(
       isAll ? 'Clear All Notifications?' : 'Clear Read Notifications?',
       isAll
-        ? 'This will permanently delete all your notifications.'
-        : 'This will permanently delete all read notifications.',
+        ? 'This will hide all notifications from the Navbar. They will still appear on the Notifications page.'
+        : 'This will hide read notifications from the Navbar. They will still appear on the Notifications page.',
       isAll ? 'Clear All' : 'Clear Read'
     );
     if (!ok) return;
@@ -725,7 +731,7 @@ export default function Navbar() {
             toast: true,
             position: 'top-end',
             icon: 'success',
-            title: isAll ? 'All notifications cleared' : 'Read notifications cleared',
+            title: isAll ? 'Notifications hidden from Navbar' : 'Read notifications hidden from Navbar',
             showConfirmButton: false,
             timer: 1200,
           });
@@ -807,34 +813,19 @@ export default function Navbar() {
   };
 
   const handleSaveProfile = async () => {
-    if (!isProfileEditable) {
-      return alert('Profile is view-only. Only Admin can update profile information.');
-    }
-    const uid = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
+    const uid = profileUserId;
     if (!uid) return alert('No user id');
-    const trimmedForm = {
-      first_name: String(profileForm.first_name || '').trim(),
-      last_name: String(profileForm.last_name || '').trim(),
-      email: String(profileForm.email || '').trim(),
-      contact_no: String(profileForm.contact_no || '').trim(),
-    };
-    const hasFieldChanges = ['first_name', 'last_name', 'email', 'contact_no'].some((key) => {
-      const currentValue = String((profileData && profileData[key]) || '').trim();
-      return trimmedForm[key] !== currentValue;
-    });
-    if (!selectedAvatarFile && !hasFieldChanges) {
+    const contactNo = String(profileForm.contact_no || '').replace(/\D/g, '').slice(0, 11);
+    const currentContactNo = String((profileData && profileData.contact_no) || '').replace(/\D/g, '').slice(0, 11);
+    if (contactNo === currentContactNo) {
       return alert('No changes to save');
     }
-    if (!trimmedForm.first_name || !trimmedForm.last_name || !trimmedForm.email) {
-      return alert('First name, last name, and email are required');
+    if (contactNo && (!/^09\d+$/.test(contactNo) || contactNo.length !== 11)) {
+      return alert('Contact number must be 11 digits and start with 09.');
     }
     const fd = new FormData();
     fd.append('user_id', String(uid));
-    fd.append('first_name', trimmedForm.first_name);
-    fd.append('last_name', trimmedForm.last_name);
-    fd.append('email', trimmedForm.email);
-    fd.append('contact_no', trimmedForm.contact_no);
-    if (selectedAvatarFile) fd.append('avatar', selectedAvatarFile);
+    fd.append('contact_no', contactNo);
     setUploading(true);
     try {
       const res = await fetch(buildServerPhpUrl('user_profile.php'), { method: 'POST', headers: getAuthHeaders(), body: fd });
@@ -848,15 +839,15 @@ export default function Navbar() {
               toast: true,
               position: 'top-end',
               icon: 'success',
-              title: 'Profile updated',
+              title: 'Contact number updated',
               showConfirmButton: false,
               timer: 1500,
               timerProgressBar: true
             });
           } else {
-            alert('Profile updated');
+            alert('Contact number updated');
           }
-        } catch (e) { try { alert('Profile updated'); } catch (e) {} }
+        } catch (e) { try { alert('Contact number updated'); } catch (e) {} }
         resetProfileEditor();
         setProfileOpen(false);
       } else { alert((j && (j.error || j.message)) || 'Profile update failed'); }
@@ -890,7 +881,6 @@ export default function Navbar() {
         {/* Center: Title */}
         <div className="flex-1 flex items-center justify-center pointer-events-none">
           <div className="text-center">
-            <div className="font-bold text-lg tracking-wide">3D School</div>
             <div className="text-xs text-white/80 mt-0.5"><span className="font-medium">{user?.role_name || 'Panel'}</span></div>
           </div>
         </div>
@@ -1201,7 +1191,7 @@ export default function Navbar() {
               <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6">
                 <div className="flex-shrink-0 relative">
                   <img
-                    src={selectedAvatarPreview || (profileData && profileData.avatar) || avatarSrc}
+                    src={(profileData && profileData.avatar) || avatarSrc}
                     alt="avatar"
                     className="w-28 h-28 rounded-full object-cover shadow-lg ring-2 ring-white transition-transform duration-200 hover:scale-105"
                     onError={(e) => {
@@ -1211,23 +1201,6 @@ export default function Navbar() {
                     }}
                   />
 
-                  {isProfileEditable ? (
-                    <label className="absolute bottom-0 right-0 transform translate-x-1 translate-y-1 bg-white rounded-full p-1 shadow-sm cursor-pointer">
-                      <input type="file" accept="image/*" className="hidden" onChange={(e) => {
-                        const f = e.target.files && e.target.files[0];
-                        if (f) {
-                          setSelectedAvatarFile(f);
-                          try { setSelectedAvatarPreview(URL.createObjectURL(f)); } catch (err) { setSelectedAvatarPreview(null); }
-                        }
-                      }} />
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M23 4v6h-6" />
-                        <path d="M1 20v-6h6" />
-                        <path d="M3.51 9a9 9 0 0114.13-3.36L21 7" />
-                        <path d="M20.49 15a9 9 0 01-14.13 3.36L3 17" />
-                      </svg>
-                    </label>
-                  ) : null}
                 </div>
 
                 <div className="flex-1 w-full">
@@ -1262,9 +1235,8 @@ export default function Navbar() {
                       <input
                         type="text"
                         value={profileForm.first_name}
-                        onChange={(e) => setProfileForm((prev) => ({ ...prev, first_name: e.target.value }))}
-                        disabled={!isProfileEditable}
-                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
+                        readOnly
+                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
                       />
                     </label>
 
@@ -1273,9 +1245,8 @@ export default function Navbar() {
                       <input
                         type="text"
                         value={profileForm.last_name}
-                        onChange={(e) => setProfileForm((prev) => ({ ...prev, last_name: e.target.value }))}
-                        disabled={!isProfileEditable}
-                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
+                        readOnly
+                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
                       />
                     </label>
 
@@ -1284,10 +1255,15 @@ export default function Navbar() {
                       <input
                         type="text"
                         value={profileForm.contact_no}
-                        onChange={(e) => setProfileForm((prev) => ({ ...prev, contact_no: e.target.value }))}
+                        onChange={(e) => {
+                          const digits = String(e.target.value || '').replace(/\D/g, '').slice(0, 11);
+                          setProfileForm((prev) => ({ ...prev, contact_no: digits }));
+                        }}
                         placeholder="Optional"
-                        disabled={!isProfileEditable}
-                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
+                        disabled={!canEditProfileContact}
+                        inputMode="numeric"
+                        maxLength={11}
+                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${canEditProfileContact ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
                       />
                     </label>
 
@@ -1296,22 +1272,19 @@ export default function Navbar() {
                       <input
                         type="email"
                         value={profileForm.email}
-                        onChange={(e) => setProfileForm((prev) => ({ ...prev, email: e.target.value }))}
-                        disabled={!isProfileEditable}
-                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${isProfileEditable ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
+                        readOnly
+                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
                       />
                     </label>
                   </div>
 
                   <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50/60 px-4 py-3 text-xs text-emerald-800">
-                    {isProfileEditable
-                      ? 'Admin can update avatar, name, email, and contact number here. Department, role, and ID number stay managed by the system.'
-                      : 'Profile is view-only for this account. Only Admin can update profile information.'}
+                    Only the contact number can be updated here. Name, email, avatar, department, role, and ID number stay managed by User Management.
                   </div>
 
                   <div className="mt-6 flex justify-end gap-3">
                     <button onClick={() => { resetProfileEditor(); setProfileOpen(false); }} className="px-4 py-2 rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50">Close</button>
-                    {isProfileEditable ? (
+                    {canEditProfileContact ? (
                       <button onClick={handleSaveProfile} disabled={uploading} className={`px-4 py-2 rounded-md text-white font-semibold ${uploading ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}>
                         {uploading ? (
                           <svg className="animate-spin h-5 w-5 mx-auto text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>

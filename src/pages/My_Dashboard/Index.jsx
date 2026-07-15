@@ -1,7 +1,7 @@
 import React from 'react';
 import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet } from '../../services/api.js';
-import { connectLiveUpdates } from '../../utils/liveUpdates.js';
+import { attendanceFlagKey, attendanceFlagLabel } from '../../utils/attendanceFlags.js';
 
 function formatRoleName(raw) {
   const role = String(raw || '').trim();
@@ -29,12 +29,14 @@ function formatDateLabel(value) {
 }
 
 function getStatusClass(raw) {
-  const val = String(raw || '').trim().toLowerCase();
+  const val = attendanceFlagKey(null, raw);
   if (val === 'present') return 'bg-emerald-100 text-emerald-700';
   if (val === 'late') return 'bg-amber-100 text-amber-700';
   if (val === 'absent') return 'bg-rose-100 text-rose-700';
-  if (val === 'on leave') return 'bg-sky-100 text-sky-700';
+  if (val === 'on_leave') return 'bg-sky-100 text-sky-700';
   if (val === 'substituted') return 'bg-indigo-100 text-indigo-700';
+  if (val === 'pending') return 'bg-orange-100 text-orange-700';
+  if (val === 'upcoming') return 'bg-slate-100 text-slate-700';
   return 'bg-slate-100 text-slate-700';
 }
 
@@ -49,19 +51,21 @@ function MyDashboardPage() {
   const [query, setQuery] = React.useState('');
   const [viewMode, setViewMode] = React.useState('table');
   const [refreshing, setRefreshing] = React.useState(false);
-  const [wsConnected, setWsConnected] = React.useState(false);
+  const [httpsPollingActive, setHttpsPollingActive] = React.useState(false);
 
   const roleLabel = formatRoleName(
     user?.role_name ||
     (Number(user?.role_id) === 2
       ? 'dean'
-      : Number(user?.role_id) === 3
-        ? 'program_head'
-        : Number(user?.role_id) === 4
-          ? 'secretary'
-          : Number(user?.role_id) === 5
-            ? 'teacher'
-            : '')
+      : Number(user?.role_id) === 6
+        ? 'department_admin'
+        : Number(user?.role_id) === 3
+          ? 'program_head'
+          : Number(user?.role_id) === 4
+            ? 'secretary'
+            : Number(user?.role_id) === 5
+              ? 'teacher'
+              : '')
   );
   const fullName = `${user?.first_name || ''} ${user?.last_name || ''}`.trim() || 'Faculty User';
 
@@ -85,81 +89,13 @@ function MyDashboardPage() {
   }, [loadData]);
 
   React.useEffect(() => {
-    let socket = null;
-    let closedByUs = false;
-    let pollTimer = null;
-    let reconnectTimer = null;
-    let reconnectMs = 1000;
-    const maxReconnect = 30000;
-
-    const startPolling = () => {
-      if (pollTimer) return;
-      pollTimer = setInterval(() => {
-        loadData({ silent: true });
-      }, 15000);
-    };
-
-    const stopPolling = () => {
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-    };
-
-    const scheduleReconnect = () => {
-      if (reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        reconnectMs = Math.min(maxReconnect, Math.floor(reconnectMs * 1.5));
-        connect();
-      }, reconnectMs);
-    };
-
-    const connect = () => {
-      try {
-        socket = connectLiveUpdates({
-          onConnect: () => {
-            setWsConnected(true);
-            reconnectMs = 1000;
-            stopPolling();
-          },
-          onRefresh: () => {
-            loadData({ silent: true });
-          },
-          onEntityUpdate: () => {
-            loadData({ silent: true });
-          },
-          onError: () => {
-            if (!closedByUs) {
-              startPolling();
-              scheduleReconnect();
-            }
-            try { if (socket) socket.close(); } catch (e) {}
-          },
-          onDisconnect: () => {
-            setWsConnected(false);
-            if (closedByUs) return;
-            startPolling();
-            scheduleReconnect();
-          },
-        });
-      } catch (e) {
-        setWsConnected(false);
-        startPolling();
-        scheduleReconnect();
-      }
-    };
-
-    connect();
+    setHttpsPollingActive(true);
+    const pollTimer = setInterval(() => {
+      loadData({ silent: true });
+    }, 15000);
 
     return () => {
-      closedByUs = true;
-      setWsConnected(false);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      try {
-        if (socket) socket.close();
-      } catch (e) {}
-      stopPolling();
+      clearInterval(pollTimer);
     };
   }, [loadData]);
 
@@ -188,11 +124,12 @@ function MyDashboardPage() {
   };
 
   const normalizedQuery = query.trim().toLowerCase();
+  const countRecentByStatus = (key) => myRecentRows.filter((row) => attendanceFlagKey(null, row.final_flag_name) === key).length;
   const filteredRows = myRecentRows.filter((row) => {
-    const status = String(row.final_flag_name || '').trim().toLowerCase();
+    const status = attendanceFlagKey(null, row.final_flag_name);
     if (statusFilter !== 'all' && status !== statusFilter) return false;
     if (!normalizedQuery) return true;
-    const haystack = `${row.date || ''} ${row.subject_code || ''} ${row.subject_name || ''} ${row.section_name || ''} ${row.final_flag_name || ''}`.toLowerCase();
+    const haystack = `${row.date || ''} ${row.subject_code || ''} ${row.subject_name || ''} ${row.section_name || ''} ${attendanceFlagLabel(null, row.final_flag_name)}`.toLowerCase();
     return haystack.includes(normalizedQuery);
   });
 
@@ -201,6 +138,8 @@ function MyDashboardPage() {
     { key: 'present', label: 'Present', value: Number(attendanceToday.present || 0), icon: 'bi bi-check-circle-fill' },
     { key: 'late', label: 'Late', value: Number(attendanceToday.late || 0), icon: 'bi bi-clock-fill' },
     { key: 'absent', label: 'Absent', value: Number(attendanceToday.absent || 0), icon: 'bi bi-x-circle-fill' },
+    { key: 'pending', label: 'Pending', value: Number(attendanceToday.pending || countRecentByStatus('pending')), icon: 'bi bi-hourglass-split' },
+    { key: 'upcoming', label: 'Upcoming', value: Number(attendanceToday.upcoming || countRecentByStatus('upcoming')), icon: 'bi bi-calendar-event' },
   ];
 
   const isFallbackSnapshot = Boolean(attendanceToday.is_fallback);
@@ -258,9 +197,9 @@ function MyDashboardPage() {
               <h1 className="mt-1 text-2xl font-black tracking-tight text-slate-900 md:text-4xl">My Dashboard</h1>
               <p className="mt-2 text-sm text-slate-500">{fullName}{roleLabel ? ` (${roleLabel})` : ''}</p>
               <div className="mt-3 flex flex-wrap items-center gap-3">
-                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${wsConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
-                  <span className={`h-2 w-2 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
-                  {wsConnected ? 'Live updates active' : 'Polling fallback mode'}
+                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${httpsPollingActive ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                  <span className={`h-2 w-2 rounded-full ${httpsPollingActive ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+                  {httpsPollingActive ? 'HTTPS polling active' : 'Starting HTTPS polling'}
                 </span>
                 <span className="text-xs font-medium text-slate-500">Snapshot date: {formatDateLabel(snapshotDate)}</span>
               </div>
@@ -341,7 +280,9 @@ function MyDashboardPage() {
                   <div className={`inline-flex h-12 w-12 items-center justify-center rounded-xl text-lg text-white shadow-sm ${
                     item.key === 'present' ? 'bg-emerald-600' :
                     item.key === 'late' ? 'bg-amber-500' :
-                    item.key === 'absent' ? 'bg-rose-600' : 'bg-slate-800'
+                    item.key === 'absent' ? 'bg-rose-600' :
+                    item.key === 'pending' ? 'bg-orange-500' :
+                    item.key === 'upcoming' ? 'bg-slate-500' : 'bg-slate-800'
                   }`}>
                     <i className={item.icon}></i>
                   </div>
@@ -435,8 +376,10 @@ function MyDashboardPage() {
                   <option value="present">Present</option>
                   <option value="late">Late</option>
                   <option value="absent">Absent</option>
-                  <option value="on leave">On Leave</option>
+                  <option value="on_leave">On Leave</option>
                   <option value="substituted">Substituted</option>
+                  <option value="pending">Pending</option>
+                  <option value="upcoming">Upcoming</option>
                 </select>
               </div>
             </div>
@@ -464,7 +407,7 @@ function MyDashboardPage() {
                         <td className="px-4 py-3 text-slate-600">{row.section_name || '-'}</td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${getStatusClass(row.final_flag_name)}`}>
-                            {row.final_flag_name || '-'}
+                            {attendanceFlagLabel(null, row.final_flag_name)}
                           </span>
                         </td>
                       </tr>
@@ -481,7 +424,7 @@ function MyDashboardPage() {
                     <div className="mb-1 flex items-center justify-between gap-2">
                       <h4 className="text-sm font-bold text-slate-800">{row.subject_code || row.subject_name || '-'}</h4>
                       <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${getStatusClass(row.final_flag_name)}`}>
-                        {row.final_flag_name || '-'}
+                        {attendanceFlagLabel(null, row.final_flag_name)}
                       </span>
                     </div>
                     <p className="text-xs text-slate-500">{row.section_name || '-'}</p>

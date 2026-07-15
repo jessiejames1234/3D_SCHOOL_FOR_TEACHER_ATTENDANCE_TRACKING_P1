@@ -21,17 +21,48 @@ function ProgramIndex(){
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
   };
 
-  React.useEffect(()=>{
-    (async ()=>{
-      try{
-        const [p, d, u] = await Promise.all([apiGet('programs'), apiGet('departments'), apiGet('users')]);
-        setPrograms(Array.isArray(p)? p.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
-        setDepartments(Array.isArray(d)? d: []);
-        const programHeads = Array.isArray(u) ? u.filter(x => String(x.role_name || '').toLowerCase().includes('program')) : [];
-        setHeads(programHeads);
-      }catch(e){ console.error(e); setError('Failed to load programs'); }
-    })();
+  const loadProgramData = React.useCallback(async ()=>{
+    try{
+      const [p, d, u] = await Promise.all([apiGet('programs'), apiGet('departments'), apiGet('users')]);
+      setPrograms(Array.isArray(p)? p.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      setDepartments(Array.isArray(d)? d: []);
+      const programHeads = Array.isArray(u) ? u.filter(x => Number(x.role_id) === 3 || String(x.role_name || '').toLowerCase().includes('program')) : [];
+      setHeads(programHeads);
+    }catch(e){ console.error(e); setError('Failed to load programs'); }
   }, []);
+
+  React.useEffect(()=>{
+    loadProgramData();
+  }, [loadProgramData]);
+
+  React.useEffect(()=>{
+    let cancelled = false;
+    let refreshing = false;
+
+    const refreshViaHttps = async ()=>{
+      if (cancelled || document.hidden || refreshing) return;
+      refreshing = true;
+      try {
+        await loadProgramData();
+      } catch(e) {
+        console.error('Failed to refresh programs via HTTPS', e);
+      } finally {
+        refreshing = false;
+      }
+    };
+
+    const intervalId = window.setInterval(refreshViaHttps, 3000);
+    const handleFocusRefresh = ()=> refreshViaHttps();
+    window.addEventListener('focus', handleFocusRefresh);
+    document.addEventListener('visibilitychange', handleFocusRefresh);
+
+    return ()=>{
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleFocusRefresh);
+      document.removeEventListener('visibilitychange', handleFocusRefresh);
+    };
+  }, [loadProgramData]);
 
   const openModal = (prog=null) => {
     setError('');
@@ -45,7 +76,7 @@ function ProgramIndex(){
     } else {
       setEditing(null);
       // Default to '' (None) instead of the first department
-      setForm({ program_name:'', dept_id: '', head_id: heads[0]?.user_id || '' });
+      setForm({ program_name:'', dept_id: '', head_id: '' });
     }
     setShowModal(true);
   };
@@ -62,13 +93,23 @@ function ProgramIndex(){
     const dup = programs.find(p => p.program_name && String(p.program_name).toLowerCase() === name.toLowerCase() && (!editing || Number(p.program_id) !== Number(editing.program_id)));
     if (dup) return 'A program with the same name already exists';
     
-    // Check if head is already assigned
-    if (form.head_id) {
-      const headUsed = programs.find(p => Number(p.head_id) === Number(form.head_id) && (!editing || Number(p.program_id) !== Number(editing.program_id)));
-      if (headUsed) return 'Selected program head is already assigned to another program';
-    }
     return null;
   };
+
+  const headOptions = React.useMemo(() => {
+    const selectedDeptId = form.dept_id ? String(form.dept_id) : '';
+
+    return (heads || []).filter(h => {
+      if (selectedDeptId && h.dept_id && String(h.dept_id) !== selectedDeptId) return false;
+      return true;
+    });
+  }, [heads, form.dept_id]);
+
+  React.useEffect(() => {
+    if (!form.head_id) return;
+    const valid = headOptions.some(h => String(h.user_id) === String(form.head_id));
+    if (!valid) setForm(prev => ({ ...prev, head_id: '' }));
+  }, [headOptions, form.head_id]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -81,7 +122,7 @@ function ProgramIndex(){
       const payload = { 
           program_name: form.program_name.trim(), 
           dept_id: form.dept_id ? Number(form.dept_id) : null, 
-          head_id: Number(form.head_id) 
+          head_id: form.head_id ? Number(form.head_id) : null
       };
 
       if (editing && editing.program_id) {
@@ -93,9 +134,7 @@ function ProgramIndex(){
         await apiPost('programs', payload);
       }
       
-      // Refresh list
-      const p = await apiGet('programs');
-      setPrograms(Array.isArray(p)? p.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      await loadProgramData();
       
       closeModal();
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: editing ? 'Program updated' : 'Program added', timer: 1400, showConfirmButton: false }); } catch(e){}
@@ -115,7 +154,7 @@ function ProgramIndex(){
         () => apiPut(`programs/${prog.program_id}`, { status: newStatus }),
         () => apiPost(`programs/${prog.program_id}/update`, { status: newStatus })
       );
-      const p = await apiGet('programs'); setPrograms(Array.isArray(p)? p.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      await loadProgramData();
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Status updated', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) { console.error(err); try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to update status' }); } catch(e){} }
   };
@@ -129,7 +168,7 @@ function ProgramIndex(){
         () => apiPut(`programs/${prog.program_id}`, { status: 'archive' }),
         () => apiPost(`programs/${prog.program_id}/update`, { status: 'archive' })
       );
-      const p = await apiGet('programs'); setPrograms(Array.isArray(p)? p.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      await loadProgramData();
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Archived', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) { console.error(err); try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to archive' }); } catch(e){} }
   };
@@ -194,9 +233,9 @@ function ProgramIndex(){
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Program Head</label>
-            <select name="head_id" value={form.head_id} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2">
-              <option value="">Select program head</option>
-              {heads.map(h => <option key={h.user_id} value={h.user_id}>{h.first_name} {h.last_name}</option>)}
+            <select name="head_id" value={form.head_id} onChange={handleChange} className="block w-full border border-gray-200 rounded px-3 py-2">
+              <option value="">No program head assigned</option>
+              {headOptions.map(h => <option key={h.user_id} value={h.user_id}>{h.first_name} {h.last_name}</option>)}
             </select>
           </div>
 

@@ -3,6 +3,7 @@ import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet, apiPut } from '../../services/api.js';
 import { MODULE_LABELS } from '../../utils/moduleAccess.js';
 import './Index.css';
+import LoginAttemptMonitor from './LoginAttemptMonitoring.jsx';
 
 const ALLOWED_TARGET_ROLES_FOR_DEAN = new Set([3, 4, 5]);
 const MODULE_CATEGORY_ORDER = ['Attendance', 'Academic', 'Facility', 'Faculty Portal', 'Reports', 'Administration', 'Other'];
@@ -39,18 +40,18 @@ const SETTINGS_LANDING_CARDS = [
     title: 'Change Password Account',
     description: 'Handle account password resets and forced password update policies.',
     tag: 'Security',
-    state: 'soon',
+    state: 'ready',
     initials: 'CP',
-    cta: 'Coming Soon',
+    cta: 'Open Password Reset',
   },
   {
     id: 'login_monitor',
     title: 'Login Attempt Monitor',
     description: 'Track suspicious login spikes and failed authentication trends.',
     tag: 'Monitoring',
-    state: 'soon',
+    state: 'ready',
     initials: 'LM',
-    cta: 'Coming Soon',
+    cta: 'Open Monitor',
   },
   {
     id: 'account_recovery',
@@ -72,7 +73,7 @@ const SETTINGS_LANDING_CARDS = [
   },
 ];
 
-const DEFAULT_HOME_TITLE = 'Time is Gold';
+const DEFAULT_HOME_TITLE = 'Welcome to COC Attendance WEB';
 const DEFAULT_HOME_TITLE_COLOR = '#c69500';
 const HOME_TITLE_COLOR_PRESETS = ['#c69500', '#0f5132', '#166534', '#0d6efd', '#7c3aed', '#dc2626'];
 
@@ -150,17 +151,28 @@ function getInitials(firstName, lastName) {
   return `${a}${b}`.trim() || 'U';
 }
 
+function getDepartmentLabel(user) {
+  const deptName = String(user?.dept_name || user?.department || '').trim();
+  if (deptName) return deptName;
+  const deptId = user?.dept_id;
+  return deptId !== null && deptId !== undefined && String(deptId) !== '' ? `Department #${deptId}` : 'No Department';
+}
+
 export default function GeneralSettingsIndex() {
   const { user } = React.useContext(AuthContext) || {};
   const roleId = Number(user?.role_id || 0);
   const isAdmin = roleId === 1;
   const isDean = roleId === 2;
-  const canManage = isAdmin || isDean;
+  const isDepartmentAdmin = roleId === 6;
+  const canManage = isAdmin || isDean || isDepartmentAdmin;
   const [routePath, setRoutePath] = React.useState(window.location.hash.slice(1) || '/settings/system');
 
   const [managedUsers, setManagedUsers] = React.useState([]);
   const [loadingUsers, setLoadingUsers] = React.useState(false);
   const [selectedUserId, setSelectedUserId] = React.useState('');
+  const [passwordResetUserId, setPasswordResetUserId] = React.useState('');
+  const [passwordResetDepartmentFilter, setPasswordResetDepartmentFilter] = React.useState('');
+  const [resettingPassword, setResettingPassword] = React.useState(false);
   const [loadingAccess, setLoadingAccess] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState('');
@@ -193,8 +205,12 @@ export default function GeneralSettingsIndex() {
     return raw.startsWith('/') ? raw : `/${raw}`;
   }, [routePath]);
 
-  const isModuleAccessView = normalizedRoute.startsWith('/settings/module-access');
+  // Dean and Department Admin can ONLY access Home Content
+  const isRestrictedToHomeContent = (isDean || isDepartmentAdmin) && !isAdmin;
+  const isModuleAccessView = normalizedRoute.startsWith('/settings/module-access') && !isRestrictedToHomeContent;
   const isHomeContentView = normalizedRoute.startsWith('/settings/home-content');
+  const isPasswordResetView = normalizedRoute.startsWith('/settings/change-password') && !isRestrictedToHomeContent;
+  const isLoginMonitorView = normalizedRoute.startsWith('/settings/login-monitor') && !isRestrictedToHomeContent;
 
   const openModuleAccessView = React.useCallback(() => {
     window.location.hash = '#/settings/module-access';
@@ -203,6 +219,17 @@ export default function GeneralSettingsIndex() {
   const openHomeContentView = React.useCallback(() => {
     window.location.hash = '#/settings/home-content';
   }, []);
+
+  const openPasswordResetView = React.useCallback(() => {
+    window.location.hash = '#/settings/change-password';
+  }, []);
+
+  // Redirect restricted users to home content if they're on a forbidden view
+  React.useEffect(() => {
+    if (isRestrictedToHomeContent && !isHomeContentView) {
+      openHomeContentView();
+    }
+  }, [isRestrictedToHomeContent, isHomeContentView, openHomeContentView]);
 
   const openSettingsHome = React.useCallback(() => {
     window.location.hash = '#/settings/system';
@@ -216,6 +243,27 @@ export default function GeneralSettingsIndex() {
     }
     if (card.id === 'home_content') {
       openHomeContentView();
+      return;
+    }
+    if (card.id === 'login_monitor') {
+      window.location.hash = '#/settings/login-monitor';
+      return;
+    }
+    if (card.id === 'change_password') {
+      if (!isAdmin) {
+        const message = 'Only Admin can reset account passwords to default.';
+        try {
+          if (window?.Swal) {
+            await window.Swal.fire({ icon: 'warning', title: 'Admin Only', text: message });
+            return;
+          }
+        } catch (swErr) {
+          console.warn('Settings admin-only popup failed', swErr);
+        }
+        if (typeof window !== 'undefined') window.alert(message);
+        return;
+      }
+      openPasswordResetView();
       return;
     }
 
@@ -236,7 +284,7 @@ export default function GeneralSettingsIndex() {
     if (typeof window !== 'undefined') {
       window.alert(message);
     }
-  }, [openModuleAccessView, openHomeContentView]);
+  }, [openModuleAccessView, openHomeContentView, openPasswordResetView, isAdmin]);
 
   const filteredManagedUsers = React.useMemo(() => {
     let list = Array.isArray(managedUsers) ? managedUsers.slice() : [];
@@ -257,7 +305,7 @@ export default function GeneralSettingsIndex() {
   }, [managedUsers, isAdmin, isDean]);
 
   React.useEffect(() => {
-    if (!canManage || !isModuleAccessView) return;
+    if (!canManage || (!isModuleAccessView && !isPasswordResetView)) return;
     let mounted = true;
     (async () => {
       setLoadingUsers(true);
@@ -277,7 +325,7 @@ export default function GeneralSettingsIndex() {
     return () => {
       mounted = false;
     };
-  }, [canManage, isModuleAccessView]);
+  }, [canManage, isModuleAccessView, isPasswordResetView]);
 
   React.useEffect(() => {
     if (!isModuleAccessView || !selectedUserId) return;
@@ -324,7 +372,9 @@ export default function GeneralSettingsIndex() {
       setError('');
       setSuccess('');
       try {
-        const data = await apiGet('app-settings/home');
+        const deptId = user?.dept_id;
+        const query = deptId ? `?dept_id=${deptId}` : '';
+        const data = await apiGet(`app-settings/home${query}`);
         if (!mounted) return;
         const title = String(data?.home_title || '').trim();
         const color = String(data?.home_title_color || '').trim();
@@ -341,7 +391,7 @@ export default function GeneralSettingsIndex() {
     return () => {
       mounted = false;
     };
-  }, [canManage, isHomeContentView]);
+  }, [canManage, isHomeContentView, user?.dept_id]);
 
   React.useEffect(() => {
     setModuleSearch('');
@@ -426,6 +476,51 @@ export default function GeneralSettingsIndex() {
     const fullName = `${matched?.first_name || ''} ${matched?.last_name || ''}`.trim();
     return fullName || matched?.email || `User #${matched?.user_id}`;
   }, [targetInfo, selectedUserId, filteredManagedUsers]);
+
+  const passwordResetTarget = React.useMemo(() => {
+    return filteredManagedUsers.find((item) => String(item?.user_id) === String(passwordResetUserId)) || null;
+  }, [filteredManagedUsers, passwordResetUserId]);
+
+  const passwordResetDepartmentOptions = React.useMemo(() => {
+    const map = new Map();
+    filteredManagedUsers.forEach((item) => {
+      const label = getDepartmentLabel(item);
+      const key = String(item?.dept_id ?? label).trim() || label;
+      if (!map.has(key)) map.set(key, label);
+    });
+    return Array.from(map.entries())
+      .map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [filteredManagedUsers]);
+
+  const filteredPasswordResetUsers = React.useMemo(() => {
+    const deptKey = String(passwordResetDepartmentFilter || '').trim();
+    if (!deptKey) return filteredManagedUsers;
+    return filteredManagedUsers.filter((item) => {
+      const key = String(item?.dept_id ?? getDepartmentLabel(item)).trim() || getDepartmentLabel(item);
+      return key === deptKey;
+    });
+  }, [filteredManagedUsers, passwordResetDepartmentFilter]);
+
+  React.useEffect(() => {
+    if (!passwordResetUserId) return;
+    const stillVisible = filteredPasswordResetUsers.some((item) => String(item?.user_id) === String(passwordResetUserId));
+    if (!stillVisible) setPasswordResetUserId('');
+  }, [filteredPasswordResetUsers, passwordResetUserId]);
+
+  const passwordResetStats = React.useMemo(() => {
+    return {
+      totalUsers: filteredManagedUsers.length,
+      visibleUsers: filteredPasswordResetUsers.length,
+      departments: passwordResetDepartmentOptions.length,
+    };
+  }, [filteredManagedUsers.length, filteredPasswordResetUsers.length, passwordResetDepartmentOptions.length]);
+
+  const passwordResetTargetLabel = React.useMemo(() => {
+    if (!passwordResetTarget) return 'Selected User';
+    const fullName = `${passwordResetTarget?.first_name || ''} ${passwordResetTarget?.last_name || ''}`.trim();
+    return fullName || passwordResetTarget?.email || `User #${passwordResetTarget?.user_id}`;
+  }, [passwordResetTarget]);
 
   const handleToggleModule = (moduleKey) => {
     setCheckedModules((prev) => {
@@ -521,10 +616,13 @@ export default function GeneralSettingsIndex() {
     setError('');
     setSuccess('');
     try {
-      const data = await apiPut('app-settings/home', {
+      const deptId = user?.dept_id;
+      const payload = {
         home_title: title,
         home_title_color: color,
-      });
+      };
+      if (deptId) payload.dept_id = deptId;
+      const data = await apiPut('app-settings/home', payload);
       const savedTitle = String(data?.home_title || title).trim() || DEFAULT_HOME_TITLE;
       const savedColor = /^#[0-9a-fA-F]{6}$/.test(String(data?.home_title_color || '').trim())
         ? String(data.home_title_color).trim()
@@ -559,10 +657,64 @@ export default function GeneralSettingsIndex() {
     }
   };
 
+  const resetPasswordToDefault = async () => {
+    if (!passwordResetUserId || !passwordResetTarget) return;
+    const confirmText = `Reset ${passwordResetTargetLabel}'s password to the default and require a password change on next login?`;
+    try {
+      if (window?.Swal) {
+        const confirm = await window.Swal.fire({
+          icon: 'warning',
+          title: 'Reset Password To Default?',
+          text: confirmText,
+          showCancelButton: true,
+          confirmButtonText: 'Reset Password',
+          cancelButtonText: 'Cancel',
+          confirmButtonColor: '#dc3545',
+        });
+        if (!confirm.isConfirmed) return;
+      } else if (!window.confirm(confirmText)) {
+        return;
+      }
+    } catch (swErr) {
+      console.warn('Password reset confirmation failed', swErr);
+      if (!window.confirm(confirmText)) return;
+    }
+
+    setResettingPassword(true);
+    setError('');
+    setSuccess('');
+    try {
+      const result = await apiPut(`users/${passwordResetUserId}/reset-default-password`, {});
+      const message = result?.message || 'Password reset to default. User must change password on next login.';
+      setSuccess(message);
+      try {
+        if (window?.Swal) {
+          await window.Swal.fire({
+            icon: 'success',
+            title: 'Password Reset',
+            text: message,
+          });
+        }
+      } catch (swErr) {
+        console.warn('Password reset success popup failed', swErr);
+      }
+    } catch (err) {
+      const message = err?.body?.message || err?.message || 'Failed to reset password.';
+      setError(message);
+      try {
+        if (window?.Swal) await window.Swal.fire({ icon: 'error', title: 'Reset Failed', text: message });
+      } catch (swErr) {
+        console.warn('Password reset error popup failed', swErr);
+      }
+    } finally {
+      setResettingPassword(false);
+    }
+  };
+
   if (!canManage) {
     return (
       <div className="container-fluid py-3 general-settings-page">
-        <div className="alert alert-danger mb-0">Only Admin and Dean can access General Settings module permissions.</div>
+      <div className="alert alert-danger mb-0">You do not have permission to access General Settings.</div>
       </div>
     );
   }
@@ -576,11 +728,13 @@ export default function GeneralSettingsIndex() {
             <p className="mb-0 text-muted">
               {isHomeContentView
                 ? 'Customize the Home page headline and preview it before publishing.'
-                : 'Configure module visibility per user while keeping role defaults intact.'}
+                : isPasswordResetView
+                  ? 'Reset an account password to the default and require a password change on next login.'
+                  : 'Configure module visibility per user while keeping role defaults intact.'}
             </p>
           </div>
           <div className="d-flex align-items-center gap-2">
-            {isModuleAccessView || isHomeContentView ? (
+            {isModuleAccessView || isHomeContentView || isPasswordResetView ? (
               <button type="button" className="btn btn-sm btn-outline-secondary" onClick={openSettingsHome}>
                 Back To Settings
               </button>
@@ -592,7 +746,9 @@ export default function GeneralSettingsIndex() {
         </div>
       </div>
 
-      {!isModuleAccessView && !isHomeContentView ? (
+      {isLoginMonitorView ? (
+        <LoginAttemptMonitor />
+      ) : !isModuleAccessView && !isHomeContentView && !isPasswordResetView ? (
         <div className="row g-3 gs-entry-grid">
           {SETTINGS_LANDING_CARDS.map((card) => (
             <div key={card.id} className="col-12 col-md-6 col-xl-4">
@@ -730,6 +886,186 @@ export default function GeneralSettingsIndex() {
               </div>
             </div>
           </div>
+        </>
+      ) : isPasswordResetView ? (
+        <>
+          {error ? <div className="alert alert-danger">{error}</div> : null}
+          {success ? <div className="alert alert-success">{success}</div> : null}
+
+          {!isAdmin ? (
+            <div className="alert alert-danger mb-0">Only Admin can reset account passwords to default.</div>
+          ) : (
+            <div className="gs-password-workspace">
+              <div className="gs-password-summary-grid mb-3">
+                <div className="gs-password-summary-card">
+                  <span className="gs-password-summary-icon is-users"><i className="bi bi-people-fill" aria-hidden="true"></i></span>
+                  <div>
+                    <div className="gs-stat-label">Available Accounts</div>
+                    <div className="gs-stat-value">{passwordResetStats.totalUsers}</div>
+                  </div>
+                </div>
+                <div className="gs-password-summary-card">
+                  <span className="gs-password-summary-icon is-dept"><i className="bi bi-building" aria-hidden="true"></i></span>
+                  <div>
+                    <div className="gs-stat-label">Departments</div>
+                    <div className="gs-stat-value">{passwordResetStats.departments}</div>
+                  </div>
+                </div>
+                <div className="gs-password-summary-card">
+                  <span className="gs-password-summary-icon is-filter"><i className="bi bi-funnel-fill" aria-hidden="true"></i></span>
+                  <div>
+                    <div className="gs-stat-label">Filtered Users</div>
+                    <div className="gs-stat-value">{passwordResetStats.visibleUsers}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="row g-3 align-items-stretch">
+                <div className="col-12 col-xl-5">
+                  <div className="gs-reset-command-panel h-100">
+                    <div className="gs-reset-command-head">
+                      <div className="gs-reset-command-icon">
+                        <i className="bi bi-shield-lock-fill" aria-hidden="true"></i>
+                      </div>
+                      <div>
+                        <div className="gs-reset-eyebrow">Emergency Tool</div>
+                        <h5 className="mb-1 fw-bold">Reset Account Password</h5>
+                        <p className="mb-0 text-muted small">
+                          Filter by department, choose a user, then force the first-login password change flow.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="gs-reset-warning">
+                      <i className="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
+                      <span>This action does not display the default password and does not write it to system logs.</span>
+                    </div>
+
+                    <div className="gs-reset-form-grid">
+                      <div>
+                        <label className="form-label fw-semibold">Department</label>
+                        <select
+                          className="form-select gs-user-select"
+                          value={passwordResetDepartmentFilter}
+                          disabled={loadingUsers || resettingPassword}
+                          onChange={(e) => {
+                            setPasswordResetDepartmentFilter(String(e.target.value || ''));
+                            setSuccess('');
+                            setError('');
+                          }}
+                        >
+                          <option value="">All departments</option>
+                          {passwordResetDepartmentOptions.map((dept) => (
+                            <option key={dept.key} value={dept.key}>{dept.label}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="form-label fw-semibold">User Account</label>
+                        <select
+                          className="form-select gs-user-select"
+                          value={passwordResetUserId}
+                          disabled={loadingUsers || resettingPassword}
+                          onChange={(e) => {
+                            setPasswordResetUserId(String(e.target.value || ''));
+                            setSuccess('');
+                            setError('');
+                          }}
+                        >
+                          <option value="">Select user</option>
+                          {filteredPasswordResetUsers.map((item) => {
+                            const fullName = `${item?.last_name || ''}, ${item?.first_name || ''}`.replace(/^,\s*/, '').trim();
+                            const labelName = fullName || item?.email || `User #${item?.user_id}`;
+                            const roleName = formatRoleName(item?.role_name || '');
+                            return (
+                              <option key={item.user_id} value={item.user_id}>
+                                {labelName} {roleName ? `(${roleName})` : ''}
+                              </option>
+                            );
+                          })}
+                        </select>
+                        {loadingUsers ? (
+                          <div className="form-text">Loading users...</div>
+                        ) : (
+                          <div className="form-text">Admin accounts are excluded from this emergency tool.</div>
+                        )}
+                      </div>
+                    </div>
+
+                    {passwordResetTarget ? (
+                      <div className="gs-reset-selected">
+                        <div className="gs-user-avatar" aria-hidden="true">
+                          {getInitials(passwordResetTarget?.first_name, passwordResetTarget?.last_name)}
+                        </div>
+                        <div className="gs-user-meta">
+                          <div className="fw-semibold">{passwordResetTargetLabel}</div>
+                          <div className="small text-muted">{passwordResetTarget?.email || 'No email'}</div>
+                          <div className="gs-reset-selected-tags">
+                            <span>{formatRoleName(passwordResetTarget?.role_name || '')}</span>
+                            <span>{getDepartmentLabel(passwordResetTarget)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <button
+                      type="button"
+                      className="btn btn-danger w-100 gs-reset-danger-btn"
+                      disabled={!passwordResetUserId || resettingPassword || loadingUsers}
+                      onClick={resetPasswordToDefault}
+                    >
+                      {resettingPassword ? 'Resetting...' : 'Reset Password To Default'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="col-12 col-xl-7">
+                  <div className="gs-password-reset-info h-100">
+                    <div className="gs-password-info-head">
+                      <div>
+                        <div className="gs-reset-eyebrow">Reset Flow</div>
+                        <h5 className="mb-1 fw-bold">What Happens After Reset</h5>
+                        <p className="mb-0 text-muted small">The account is restored without exposing the temporary password.</p>
+                      </div>
+                      <span className="gs-mini-chip">First-login required</span>
+                    </div>
+
+                    <div className="gs-reset-steps">
+                      <div className="gs-reset-step">
+                        <span className="gs-reset-step-num">1</span>
+                        <div>
+                          <div className="fw-semibold">Password returns to default</div>
+                          <div className="text-muted small">The default is based on the user's registered ID number.</div>
+                        </div>
+                      </div>
+                      <div className="gs-reset-step">
+                        <span className="gs-reset-step-num">2</span>
+                        <div>
+                          <div className="fw-semibold">First-login reset is required again</div>
+                          <div className="text-muted small">The system sets the account back to the forced password-change flow.</div>
+                        </div>
+                      </div>
+                      <div className="gs-reset-step">
+                        <span className="gs-reset-step-num">3</span>
+                        <div>
+                          <div className="fw-semibold">User is notified</div>
+                          <div className="text-muted small">A notification is sent without exposing the default password.</div>
+                        </div>
+                      </div>
+                      <div className="gs-reset-step">
+                        <span className="gs-reset-step-num">4</span>
+                        <div>
+                          <div className="fw-semibold">Audit log stays clean</div>
+                          <div className="text-muted small">The log records who was reset, not the password value.</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       ) : (
         <>

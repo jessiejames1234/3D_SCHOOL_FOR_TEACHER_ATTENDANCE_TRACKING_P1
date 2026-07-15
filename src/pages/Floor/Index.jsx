@@ -17,6 +17,7 @@ function FloorIndex(){
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
   const [lastAltitude, setLastAltitude] = React.useState(null);
+  const [selectedBuildingId, setSelectedBuildingId] = React.useState('');
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) {
@@ -38,6 +39,11 @@ function FloorIndex(){
   React.useEffect(() => {
     loadData();
   }, [loadData]);
+
+  const filteredFloors = React.useMemo(() => {
+    if (!selectedBuildingId) return floors;
+    return floors.filter(floor => String(floor.building_id) === String(selectedBuildingId));
+  }, [floors, selectedBuildingId]);
 
   React.useEffect(() => {
     let timer = null;
@@ -262,6 +268,27 @@ function FloorIndex(){
         </div>
       </div>
 
+      <div className="mb-4 flex flex-col gap-3 rounded-md border border-gray-200 bg-white p-3 sm:flex-row sm:items-end">
+        <div className="w-full sm:max-w-xs">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Building</label>
+          <select
+            value={selectedBuildingId}
+            onChange={(e) => setSelectedBuildingId(e.target.value)}
+            className="block w-full border border-gray-200 rounded px-3 py-2"
+          >
+            <option value="">All buildings</option>
+            {buildings.map(b => (
+              <option key={b.building_id} value={b.building_id}>{b.building_name || b.building_id}</option>
+            ))}
+          </select>
+        </div>
+        {selectedBuildingId && (
+          <button type="button" onClick={() => setSelectedBuildingId('')} className="px-3 py-2 rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50">
+            Clear
+          </button>
+        )}
+      </div>
+
       {error && <div className="mb-3 text-red-600">{error}</div>}
       {lastAltitude != null && (
         <div className="mb-3 text-sm text-gray-700">
@@ -269,7 +296,7 @@ function FloorIndex(){
         </div>
       )}
 
-      <Table columns={columns} data={floors} pageSize={10} />
+      <Table columns={columns} data={filteredFloors} pageSize={10} />
 
       <Modal show={showModal} title={editing ? 'Edit Floor' : 'Add Floor'} onClose={closeModal} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">

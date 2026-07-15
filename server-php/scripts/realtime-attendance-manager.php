@@ -24,6 +24,7 @@ if (!$result['ok']) {
 cw_log(
     '[RealTimeAttendanceManager] success'
     . ' generated_rows=' . (int)$result['generated_rows']
+    . ' pending_rows=' . (int)($result['pending_rows'] ?? 0)
     . ' auto_absent_rows=' . (int)$result['auto_absent_rows']
 );
 

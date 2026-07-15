@@ -2,6 +2,7 @@
 // server-php/api/attendance.php
 require_once __DIR__ . '/../helpers/socket_helper.php';
 require_once __DIR__ . '/../helpers/attendance-logs.php';
+require_once __DIR__ . '/../helpers/personal_notification_helper.php';
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 global $mysqli;
@@ -359,8 +360,8 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         // otherwise allow to continue and the later WHERE clause will filter by ar.user_id
     }
 
-    // Dean + secretary: restrict to their department
-    if (in_array($authRole, [2,4], true)) {
+    // Dean, department admin, and secretary: restrict to their department
+    if (in_array($authRole, [2,4,6], true)) {
         $deptId = $resolveUserDeptId($authUserId);
         error_log("attendance: resolved dept scope for user {$authUserId} role {$authRole} -> dept_id=" . var_export($deptId, true));
         if ($deptId !== null) {
@@ -406,7 +407,7 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
     if (!empty($_GET['date'])) { $where[] = 'ar.date = ?'; $params[] = $_GET['date']; $types .= 's'; }
     if (!empty($_GET['status'])) {
         // match status against any of the flag name aliases (in/check/out)
-        $where[] = '(ft_in.flag_name = ? OR ft_check.flag_name = ? OR ft_out.flag_name = ?)';
+        $where[] = '(LOWER(ft_in.flag_name) = LOWER(?) OR LOWER(ft_check.flag_name) = LOWER(?) OR LOWER(ft_out.flag_name) = LOWER(?))';
         $params[] = $_GET['status']; $params[] = $_GET['status']; $params[] = $_GET['status']; $types .= 'sss';
     }
     if (!empty($_GET['teacher_id'])) { $where[] = 'ar.user_id = ?'; $params[] = (int)$_GET['teacher_id']; $types .= 'i'; }
@@ -1033,6 +1034,17 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         }
     }
     
+    $personalEmailEvents = [];
+    $queuePersonalAttendanceEmail = function($notificationType, $briefDescription, $leadDetails, $dateTimeField = null, $eventDateTime = null) use (&$personalEmailEvents) {
+        $personalEmailEvents[] = [
+            'type' => $notificationType,
+            'brief' => $briefDescription,
+            'lead' => $leadDetails,
+            'datetime_field' => $dateTimeField,
+            'datetime' => $eventDateTime,
+        ];
+    };
+
     // --- Action based on check type ---
     $message = '';
     if ($param1 === 'check-in') {
@@ -1044,7 +1056,14 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         $params = array_merge([$finalAltitude, $latitude, $longitude, $flagIn], $groupAttendanceIds);
         safe_bind_params($stmt, "dddi" . $groupIdTypes, $params);
         $stmt->execute();
+        $scanAffected = (int)$stmt->affected_rows;
         $message = $flagIn === 2 ? 'checked_in_present' : 'checked_in_late';
+        if ($scanAffected > 0) {
+            $queuePersonalAttendanceEmail('CHECK-IN', 'Check-in scan recorded', 'Your check-in scan was recorded.', 'time_in');
+            if ($flagIn === 5) {
+                $queuePersonalAttendanceEmail('LATE ALERT', 'Check-in marked late', 'Your check-in status was set to Late.', 'time_in');
+            }
+        }
 
     } elseif ($param1 === 'mid-check') {
         $duration = $classEnd->getTimestamp() - $classStart->getTimestamp();
@@ -1057,9 +1076,14 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         // Catch-up for flag_in_id
         $inPresentWindowEnd = (clone $classStart)->modify('+15 minutes');
         if ($now > $inPresentWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id = 1");
-            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
-            $update_stmt->execute();
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id IN (1, 8)");
+            if ($update_stmt) {
+                safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
+                $update_stmt->execute();
+                if ((int)$update_stmt->affected_rows > 0) {
+                    $queuePersonalAttendanceEmail('LATE ALERT', 'Check-in marked late', 'Your check-in status was set to Late after the check-in window passed.', null, new DateTime());
+                }
+            }
         }
 
         $flagCheck = ($now >= $midStart && $now <= $midEnd) ? 2 : 5;
@@ -1067,7 +1091,14 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         $params = array_merge([$finalAltitude, $latitude, $longitude, $flagCheck], $groupAttendanceIds);
         safe_bind_params($stmt, "dddi" . $groupIdTypes, $params);
         $stmt->execute();
+        $scanAffected = (int)$stmt->affected_rows;
         $message = $flagCheck === 2 ? 'mid_check_present' : 'mid_check_late';
+        if ($scanAffected > 0) {
+            $queuePersonalAttendanceEmail('MIDDLE CHECK', 'Middle check scan recorded', 'Your middle check attendance scan was recorded.', 'time_check');
+            if ($flagCheck === 5) {
+                $queuePersonalAttendanceEmail('LATE ALERT', 'Middle check marked late', 'Your middle check status was set to Late.', 'time_check');
+            }
+        }
 
     } elseif ($param1 === 'check-out') {
         $outStart = (clone $classEnd)->modify('-15 minutes');
@@ -1077,9 +1108,14 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         // Catch-up for flag_in_id
         $inPresentWindowEnd = (clone $classStart)->modify('+15 minutes');
         if ($now > $inPresentWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id = 1");
-            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
-            $update_stmt->execute();
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_in_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_in_id IN (1, 8)");
+            if ($update_stmt) {
+                safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
+                $update_stmt->execute();
+                if ((int)$update_stmt->affected_rows > 0) {
+                    $queuePersonalAttendanceEmail('LATE ALERT', 'Check-in marked late', 'Your check-in status was set to Late after the check-in window passed.', null, new DateTime());
+                }
+            }
         }
         
         // Catch-up for flag_check_id
@@ -1087,16 +1123,25 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         $midPoint = (clone $classStart)->modify('+' . ($duration / 2) . ' seconds');
         $midWindowEnd = (clone $midPoint)->modify('+10 minutes');
         if ($now > $midWindowEnd) {
-            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_check_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_check_id = 1");
-            safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
-            $update_stmt->execute();
+            $update_stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET flag_check_id = 5 WHERE attendance_id IN ({$groupPlaceholders}) AND flag_check_id IN (1, 8)");
+            if ($update_stmt) {
+                safe_bind_params($update_stmt, $groupIdTypes, $groupAttendanceIds);
+                $update_stmt->execute();
+                if ((int)$update_stmt->affected_rows > 0) {
+                    $queuePersonalAttendanceEmail('LATE ALERT', 'Middle check marked late', 'Your middle check status was set to Late after the middle check window passed.', null, new DateTime());
+                }
+            }
         }
 
         $stmt = $mysqli->prepare("UPDATE tbl_attendance_records SET checked_out_at = NOW(), altitude_out = ?, latitude_out = ?, longitude_out = ?, flag_out_id = 2 WHERE attendance_id IN ({$groupPlaceholders}) AND checked_out_at IS NULL");
         $params = array_merge([$finalAltitude, $latitude, $longitude], $groupAttendanceIds);
         safe_bind_params($stmt, "ddd" . $groupIdTypes, $params);
         $stmt->execute();
+        $scanAffected = (int)$stmt->affected_rows;
         $message = 'checked_out';
+        if ($scanAffected > 0) {
+            $queuePersonalAttendanceEmail('CHECK-OUT', 'Check-out scan recorded', 'Your check-out scan was recorded.', 'time_out');
+        }
     }
 
     // Return the final updated records with joined fields (same projection as GET /api/attendance)
@@ -1165,6 +1210,24 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
      
     $finalRows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $final = $finalRows[0] ?? null;
+    $personalEmailResults = [];
+    if ($final && !empty($personalEmailEvents)) {
+        foreach ($personalEmailEvents as $emailEvent) {
+            $eventDateTime = $emailEvent['datetime'] ?? null;
+            $field = $emailEvent['datetime_field'] ?? null;
+            if ($field && !empty($final[$field])) {
+                $eventDateTime = $final[$field];
+            }
+            $personalEmailResults[] = personal_notif_send_attendance_event(
+                $mysqli,
+                $final,
+                $emailEvent['type'],
+                $emailEvent['brief'],
+                $emailEvent['lead'],
+                $eventDateTime
+            );
+        }
+    }
     json_response([
         'ok' => true,
         'message' => $message,
@@ -1178,7 +1241,12 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         'raw_altitude' => is_numeric($rawAltitude) ? (float)$rawAltitude : null,
         'normalized_altitude' => is_numeric($altitude) ? (float)$altitude : null,
         'altitude_offset' => is_numeric($altitudeOffset) ? (float)$altitudeOffset : null,
-        'altitude_source' => $altitudeSource
+        'altitude_source' => $altitudeSource,
+        'email_notifications' => [
+            'queued' => count($personalEmailEvents),
+            'sent' => count(array_filter($personalEmailResults, function($r) { return !empty($r['sent']); })),
+            'failed' => count(array_filter($personalEmailResults, function($r) { return empty($r['sent']); })),
+        ]
     ]);
 
 } else {

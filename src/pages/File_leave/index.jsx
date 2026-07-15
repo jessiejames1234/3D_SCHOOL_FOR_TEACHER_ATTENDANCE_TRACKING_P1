@@ -7,7 +7,7 @@ import { apiGet, apiPost, apiPut } from '../../services/api.js';
 export default function LeavesFiles() {
   const { user } = React.useContext(AuthContext);
   const currentRoleId = Number(user?.role_id || 0);
-  const canManageLeaves = currentRoleId === 2;
+  const canManageLeaves = [2, 6].includes(currentRoleId);
   
   // -- State --
   const [rows, setRows] = React.useState([]);
@@ -34,7 +34,7 @@ export default function LeavesFiles() {
   React.useEffect(() => {
     if (!user) return;
     const rid = Number(user.role_id);
-    if (![1, 2, 4].includes(rid)) { window.location.hash = '#/dashboard'; }
+    if (![1, 2, 4, 6].includes(rid)) { window.location.hash = '#/dashboard'; }
   }, [user]);
 
   const fetch = async () => {
@@ -63,7 +63,7 @@ export default function LeavesFiles() {
           status: String(u.status ?? 'active').toLowerCase(),
         }))
         .filter(u => u.user_id > 0)
-        .filter(u => [5, 2, 3, 4].includes(Number(u.role_id)))
+        .filter(u => [5, 2, 3, 4, 6].includes(Number(u.role_id)))
         .filter(u => u.status === '' || u.status === 'active' || u.status === '1' || u.status === 'true');
 
       setTeachers(activeRoleUsers);
@@ -110,9 +110,9 @@ export default function LeavesFiles() {
 
   const availableTeachersForForm = React.useMemo(() => {
     if (!user || !teachers) return [];
-    // include teachers (5), deans (2), program heads (3), and secretaries (4)
-    const allowedRoles = new Set([5, 2, 3, 4]);
-    const roleOrder = { 5: 1, 2: 2, 3: 3, 4: 4 };
+    // include teachers (5), deans (2), department admins (6), program heads (3), and secretaries (4)
+    const allowedRoles = new Set([5, 2, 6, 3, 4]);
+    const roleOrder = { 5: 1, 2: 2, 6: 3, 3: 4, 4: 5 };
     const source = Number(user.role_id) === 1
       ? teachers
       : teachers.filter(t => resolvedDeptId && String(t.dept_id) === String(resolvedDeptId));
@@ -134,6 +134,7 @@ export default function LeavesFiles() {
     const r = Number(roleId);
     if (r === 5) return 'Teacher';
     if (r === 2) return 'Dean';
+    if (r === 6) return 'Department Admin';
     if (r === 3) return 'Program Head';
     if (r === 4) return 'Secretary';
     return 'User';
@@ -182,11 +183,11 @@ export default function LeavesFiles() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      if (!canManageLeaves) throw new Error('Only dean can file or edit leave records.');
+      if (!canManageLeaves) throw new Error('Only dean and department admin can file or edit leave records.');
       const payloadTeacher = Number(form.teacher_id) || null;
       if (!payloadTeacher) throw new Error('Teacher is required');
       
-      if (currentRoleId === 2) {
+      if ([2, 6].includes(currentRoleId)) {
         const t = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
         if (!resolvedDeptId) throw new Error('Your department is not set on your account');
         if (!t || String(t.dept_id) !== String(resolvedDeptId)) throw new Error('Selected teacher is not in your department');
@@ -243,7 +244,7 @@ export default function LeavesFiles() {
       ) },
     { key: 'actions', label: 'Actions', actions: (row) => {
         const actions = [];
-        const isDean = currentRoleId === 2;
+        const isDean = [2, 6].includes(currentRoleId);
 
         actions.push({ label: 'View', onClick: () => openDetail(row) });
 
@@ -367,7 +368,7 @@ export default function LeavesFiles() {
                 type="text"
                 value={formTeacherFilter}
                 onChange={(e) => setFormTeacherFilter(e.target.value)}
-                placeholder="Filter teacher / dean / program head / secretary..."
+                placeholder="Filter teacher / dean / department admin / program head / secretary..."
                 className="form-control mb-2"
               />
               <select required value={form.teacher_id} onChange={(e) => setForm(s => ({ ...s, teacher_id: e.target.value }))} className="form-select">
