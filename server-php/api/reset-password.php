@@ -1,5 +1,6 @@
 <?php
 // server-php/api/reset-password.php — verify OTP and set new password
+require_once __DIR__ . '/../helpers/log_helper.php';
 global $mysqli;
 
 $request_method = $_SERVER['REQUEST_METHOD'];
@@ -53,6 +54,21 @@ if (!hash_equals($row['otp_code'], $otp)) {
     json_response(['error' => 'Invalid OTP'], 400);
 }
 
+// Get user info for logging before updating
+$userStmt = $mysqli->prepare("SELECT user_id, first_name, last_name, email FROM tbl_users WHERE email = ? LIMIT 1");
+$userIdForLog = null;
+$userNameForLog = '';
+if ($userStmt) {
+    $userStmt->bind_param("s", $email);
+    $userStmt->execute();
+    $uRow = $userStmt->get_result()->fetch_assoc();
+    if ($uRow) {
+        $userIdForLog = (int)$uRow['user_id'];
+        $userNameForLog = trim(($uRow['first_name'] ?? '') . ' ' . ($uRow['last_name'] ?? ''));
+    }
+    $userStmt->close();
+}
+
 $passwordHash = password_hash($newPassword, PASSWORD_BCRYPT);
 $firstLoginColCheck = $mysqli->query("SHOW COLUMNS FROM tbl_users LIKE 'is_first_login'");
 $hasFirstLoginCol = $firstLoginColCheck && $firstLoginColCheck->num_rows > 0;
@@ -69,5 +85,9 @@ $del = $mysqli->prepare("DELETE FROM tbl_password_reset_otps WHERE email = ?");
 $del->bind_param("s", $email);
 $del->execute();
 $del->close();
+
+// Log the password reset completion
+$logName = $userNameForLog ?: $email;
+log_system_action($mysqli, $userIdForLog ?: 0, 'complete_password_reset', "Password successfully reset for {$logName}");
 
 json_response(['message' => 'Password has been reset. You can sign in with your new password.'], 200);

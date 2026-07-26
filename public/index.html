@@ -210,7 +210,7 @@
             // handle CSS imports by creating a virtual module that injects a <link> to the CSS
             if (spec.endsWith('.css')) {
               const cssAbs = resolveUrl(spec, url);
-              const cssModuleCode = `const href = ${JSON.stringify(cssAbs)}; (function(){ if(!document.querySelector('link[data-injected-module-css="'+href+'"]')){ var l=document.createElement('link'); l.rel='stylesheet'; l.href=href; l.setAttribute('data-injected-module-css', href); document.head.appendChild(l);} })(); export default href;`;
+              const cssModuleCode = `const href = ${JSON.stringify(cssAbs)}; (function(){ if(!document.querySelector('link[data-injected-module-css="'+href+'"]')){ var l=document.createElement('link'); l.rel='stylesheet'; l.href=href+(href.includes('?')?'&':'?')+'_v='+Date.now(); l.setAttribute('data-injected-module-css', href); document.head.appendChild(l);} })(); export default href;`;
               const cssBlob = new Blob([cssModuleCode], { type: 'text/javascript' });
               const cssBlobUrl = URL.createObjectURL(cssBlob);
               // treat this dependency as processed and use its blob URL
@@ -251,7 +251,7 @@
         }
 
         // Start from the src entry relative to this HTML file
-        const entry = new URL('../src/index.jsx', window.location.href).href;
+        const entry = new URL('../src/index.jsx', document.baseURI || window.location.href).href;
         try {
           const entryBlob = await processModule(entry);
           await import(entryBlob);

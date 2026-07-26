@@ -707,6 +707,8 @@ function AttedanceManagement(){
     { key: 'day', label: 'Day', render: (r)=> formatDayLabel(r.day_of_week, r.date) },
     { key: 'teacher', label: 'Teacher', render: (r)=> `${r.last_name || ''}, ${r.first_name || ''}` },
     { key: 'subject', label: 'Subject / Section', render: (r)=> `${r.subject_code || ''} - ${r.section_name || ''}` },
+    { key: 'building', label: 'Building', render: (r)=> r.building_name || r.room_building_name || '-' },
+    { key: 'room', label: 'Room', render: (r)=> r.room_name || '-' },
     { key: 'class_time', label: 'Class Time', render: (r)=> `${formatTime12(r.start_time)||''} - ${formatTime12(r.end_time)||''}` },
     { key: 'time_in', label: 'Checked In', render: (r)=> renderTimeWithFlag(r.time_in, r.flag_in_id) },
     { key: 'time_check', label: 'Checked Mid', render: (r)=> renderTimeWithFlag(r.time_check, r.flag_check_id) },
@@ -1133,6 +1135,8 @@ function AttedanceManagement(){
                     { key: 'day', label: 'Day', render: (r)=> formatDayLabel(r.day_of_week, r.date) },
                     { key: 'teacher', label: 'Teacher', render: (r)=> `${r.last_name || ''}, ${r.first_name || ''}` },
                     { key: 'subject', label: 'Subject / Section', render: (r)=> `${r.subject_code || ''} - ${r.section_name || ''}` },
+                    { key: 'building', label: 'Building', render: (r) => <span className="text-xs">{r.building_name || r.room_building_name || 'N/A'}</span> },
+                    { key: 'room', label: 'Room', render: (r) => <span className="text-xs">{r.room_name || 'N/A'}</span> },
                     { key: 'class_time', label: 'Class Time', render: (r)=> `${formatTime12(r.start_time)||''} - ${formatTime12(r.end_time)||''}` },
                     {
                       key: 'semester_label',

@@ -1,5 +1,6 @@
 <?php
 // server-php/api/user_profile.php
+require_once __DIR__ . '/../helpers/log_helper.php';
 
 if (!isset($GLOBALS['mysqli']) || $GLOBALS['mysqli'] === null) {
     if (file_exists(__DIR__ . '/../config/database.php')) {
@@ -261,6 +262,11 @@ if ($request_method === 'GET') {
     } catch (mysqli_sql_exception $mse) {
         json_response(['ok' => false, 'error' => 'db_packet_too_large', 'message' => 'Image too large for database packet. Resize image or increase MySQL max_allowed_packet.'], 500);
     }
+
+    // Log profile update
+    $updatedFields = array_map(function($f) { return trim(explode('=', $f)[0]); }, $fields);
+    $profileName = trim(($currentUser['first_name'] ?? '') . ' ' . ($currentUser['last_name'] ?? '')) ?: 'User #' . $user_id;
+    log_system_action($mysqli, $authUserId, 'update_user_profile', "Updated profile ({$profileName}): " . implode(', ', $updatedFields));
 
     $row = $fetch_profile_row($user_id);
     if (!$row) json_response(['ok' => false, 'error' => 'user_not_found'], 404);

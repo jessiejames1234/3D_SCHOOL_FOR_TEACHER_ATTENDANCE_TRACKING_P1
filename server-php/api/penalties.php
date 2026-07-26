@@ -1,6 +1,7 @@
 <?php
 // server-php/api/penalties.php
 require_once __DIR__ . '/../helpers/socket_helper.php';
+require_once __DIR__ . '/../helpers/log_helper.php';
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 
@@ -159,6 +160,17 @@ switch ($request_method){
         $stmt->bind_param('iiiss', $issued_by, $user_id, $penal_type_id, $date, $reason);
         if (!$stmt->execute()) json_response(['error'=>'insert_failed','message'=>$stmt->error], 500);
         
+        // Get penalty type name for logging
+        $penaltyTypeName = '';
+        $ptStmt = $mysqli->prepare("SELECT type_name FROM tbl_penalties_type WHERE penal_type_id = ? LIMIT 1");
+        if ($ptStmt) { $ptStmt->bind_param('i', $penal_type_id); $ptStmt->execute(); $ptRow = $ptStmt->get_result()->fetch_assoc(); $penaltyTypeName = $ptRow['type_name'] ?? ''; $ptStmt->close(); }
+        // Get teacher name for logging
+        $teacherName = '';
+        $tnStmt = $mysqli->prepare("SELECT CONCAT_WS(' ', first_name, last_name) AS full_name FROM tbl_users WHERE user_id = ? LIMIT 1");
+        if ($tnStmt) { $tnStmt->bind_param('i', $user_id); $tnStmt->execute(); $tnRow = $tnStmt->get_result()->fetch_assoc(); $teacherName = $tnRow['full_name'] ?? ''; $tnStmt->close(); }
+        $logMsg = $penaltyTypeName ? "Issued {$penaltyTypeName} sanction to {$teacherName}" : "Issued sanction to {$teacherName}";
+        log_system_action($mysqli, $authUserId, 'create_penalty', $logMsg);
+
         $id = $stmt->insert_id;
         try { trigger_socket_update(['entity'=>'penalties','action'=>'create','sanction_id'=>$id]); } catch(Throwable $_){}
         json_response(['sanction_id'=>$id], 201);
@@ -174,7 +186,12 @@ switch ($request_method){
         if (isset($input['date'])){ $fields[]='date = ?'; $types.='s'; $vals[]=$input['date']; }
         if (isset($input['reason'])){ $fields[]='reason = ?'; $types.='s'; $vals[]=$input['reason']; }
         
-        if (empty($fields)) json_response(['message'=>'nothing_to_update'], 200);
+        if (empty($fields)) { json_response(['message'=>'nothing_to_update'], 200); exit; }
+
+        // Get existing penalty info for logging before updating
+        $oldPenalty = null;
+        $olStmt = $mysqli->prepare("SELECT p.reason, pt.type_name, CONCAT_WS(' ', u.first_name, u.last_name) AS teacher_name FROM tbl_penalties p LEFT JOIN tbl_penalties_type pt ON p.penal_type_id = pt.penal_type_id LEFT JOIN tbl_users u ON p.user_id = u.user_id WHERE p.sanction_id = ? LIMIT 1");
+        if ($olStmt) { $olStmt->bind_param('i', $id); $olStmt->execute(); $oldPenalty = $olStmt->get_result()->fetch_assoc(); $olStmt->close(); }
         
         $sql = "UPDATE tbl_penalties SET " . implode(', ', $fields) . " WHERE sanction_id = ?";
         $stmt = $mysqli->prepare($sql);
@@ -182,7 +199,12 @@ switch ($request_method){
         $stmt->bind_param($types, ...$vals);
         if (!$stmt->execute()) json_response(['error'=>'update_failed','message'=>$stmt->error], 500);
         
-        try { trigger_socket_update(['entity'=>'penalties','action'=>'update','sanction_id'=>$id]); } catch(Throwable $_){}
+        // Log penalty update
+        $logTeacher = $oldPenalty['teacher_name'] ?? 'Unknown';
+        $logType = $oldPenalty['type_name'] ?? 'Sanction';
+        log_system_action($mysqli, $authUserId, 'update_penalty', "Updated {$logType} details for {$logTeacher}");
+        
+        try { trigger_socket_update(['entity'=>'penalties','action'=>'update','sanction_id'=>$id]); } catch(Throwable $e){}
         json_response(['ok'=>true]);
         break;
 }

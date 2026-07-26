@@ -1,6 +1,7 @@
 <?php
 // server-php/api/forgot-password.php — request OTP and send email
 require_once __DIR__ . '/../helpers/mail_helper.php';
+require_once __DIR__ . '/../helpers/log_helper.php';
 global $mysqli;
 
 $request_method = $_SERVER['REQUEST_METHOD'];
@@ -63,6 +64,9 @@ $sent = send_forgot_password_email(
     $user['last_name'] ?? '',
     $otp
 );
+
+// Log the password reset request
+log_system_action($mysqli, (int)$user['user_id'], 'request_password_reset', "Password reset OTP requested for account {$user['email']}");
 
 // In all cases we return success; in local/dev we can also expose the OTP for easier testing.
 $response = $genericSuccess;

@@ -5,6 +5,14 @@ import Modal from "../../components/Modal.jsx";
 import QrModal from "../../components/QrModal.jsx";
 import { useLiveGeolocation } from '../../utils/useLiveGeolocation.js';
 
+const FLOOR_LEVELS = [
+  'Basement',
+  '1st Floor', '2nd Floor', '3rd Floor', '4th Floor',
+  '5th Floor', '6th Floor', '7th Floor', '8th Floor',
+  '9th Floor', '10th Floor', '11th Floor', '12th Floor',
+  '13th Floor', '14th Floor', '15th Floor'
+];
+
 function FloorIndex(){
   const [floors, setFloors] = React.useState([]);
   const [buildings, setBuildings] = React.useState([]);
@@ -14,6 +22,7 @@ function FloorIndex(){
   const [qrModalStatus, setQrModalStatus] = React.useState('inactive');
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ building_id:'', floor_name:'', baseline_altitude:'', floor_meter_vertical:'' });
+  const [selectedFloorLevel, setSelectedFloorLevel] = React.useState('');
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
   const [lastAltitude, setLastAltitude] = React.useState(null);
@@ -72,14 +81,25 @@ function FloorIndex(){
     };
   }, [loadData]);
 
+  const parseFloorLevel = (floorName) => {
+    if (!floorName) return '';
+    // If stored as "BuildingName-FloorLevel", extract the floor level part
+    const parts = String(floorName).split('-');
+    const level = parts.length > 1 ? parts.slice(1).join('-') : parts[0];
+    // Check if it matches one of our predefined levels
+    return FLOOR_LEVELS.find(l => l.toLowerCase() === level.trim().toLowerCase()) || level.trim();
+  };
+
   const openModal = (fl=null) => {
     setError('');
     if (fl) {
       setEditing(fl);
       setForm({ building_id: fl.building_id || '', floor_name: fl.floor_name || '', baseline_altitude: fl.baseline_altitude ?? '', floor_meter_vertical: fl.floor_meter_vertical ?? '' });
+      setSelectedFloorLevel(parseFloorLevel(fl.floor_name));
     } else {
       setEditing(null);
       setForm({ building_id: buildings[0]?.building_id || '', floor_name:'', baseline_altitude:'', floor_meter_vertical:'' });
+      setSelectedFloorLevel('');
     }
     setShowModal(true);
   };
@@ -89,6 +109,30 @@ function FloorIndex(){
     setShowModal(false);
   };
   const handleChange = (e)=> setForm(p=>({...p, [e.target.name]: e.target.value}));
+
+  const handleFloorLevelChange = (e) => {
+    const level = e.target.value;
+    setSelectedFloorLevel(level);
+    // Auto-generate floor_name as "BuildingName-FloorLevel"
+    const building = buildings.find(b => String(b.building_id) === String(form.building_id));
+    const buildingName = building?.building_name || '';
+    if (level && buildingName) {
+      setForm(p => ({ ...p, floor_name: `${buildingName}-${level}` }));
+    } else {
+      setForm(p => ({ ...p, floor_name: level }));
+    }
+  };
+
+  // When building changes, update floor_name if a floor level is already selected
+  const handleBuildingChange = (e) => {
+    const bId = e.target.value;
+    setForm(p => ({ ...p, building_id: bId }));
+    if (selectedFloorLevel) {
+      const building = buildings.find(b => String(b.building_id) === String(bId));
+      const buildingName = building?.building_name || '';
+      setForm(p => ({ ...p, floor_name: buildingName ? `${buildingName}-${selectedFloorLevel}` : selectedFloorLevel }));
+    }
+  };
 
   const updateLiveAltitude = (coords = {}) => {
     const alt = (typeof coords.altitude === 'number' && !isNaN(coords.altitude)) ? Number(coords.altitude) : null;
@@ -302,15 +346,24 @@ function FloorIndex(){
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Building</label>
-            <select name="building_id" value={form.building_id} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2">
+            <select name="building_id" value={form.building_id} onChange={handleBuildingChange} required className="block w-full border border-gray-200 rounded px-3 py-2">
               <option value="">Select building</option>
               {buildings.map(b => <option key={b.building_id} value={b.building_id}>{b.building_name}</option>)}
             </select>
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Floor Name</label>
-            <input name="floor_name" value={form.floor_name} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Floor Level</label>
+            <select value={selectedFloorLevel} onChange={handleFloorLevelChange} required className="block w-full border border-gray-200 rounded px-3 py-2">
+              <option value="">Select floor level</option>
+              {FLOOR_LEVELS.map(level => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
+            <input name="floor_name" value={form.floor_name} onChange={handleChange} type="hidden" />
+            {form.floor_name && (
+              <p className="mt-1 text-xs text-gray-500">Will be saved as: <strong>{form.floor_name}</strong></p>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">

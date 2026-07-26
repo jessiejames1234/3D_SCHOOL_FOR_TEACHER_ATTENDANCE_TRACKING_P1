@@ -73,6 +73,7 @@ const apiFetch = async (path, opts = {}) => {
       throw e;
     }
   } catch (err) {
+    if (err && err.name === 'AbortError') throw err;
     // Preserve API errors (status/body) so callers can show real backend messages.
     const hasApiMeta = !!(err && (typeof err.status !== 'undefined' || typeof err.body !== 'undefined'));
     if (hasApiMeta) throw err;
@@ -85,7 +86,7 @@ const apiFetch = async (path, opts = {}) => {
   }
 };
 
-const apiGet = (path) => apiFetch(path);
+const apiGet = (path, opts = {}) => apiFetch(path, opts);
 const apiPost = (path, payload) => apiFetch(path, { method: 'POST', body: JSON.stringify(payload) });
 const apiPut = (path, payload) => apiFetch(path, { method: 'PUT', body: JSON.stringify(payload) });
 const apiDelete = (path, payload) => apiFetch(path, { method: 'DELETE', body: payload ? JSON.stringify(payload) : undefined });

@@ -458,6 +458,11 @@ switch ($endpoint) {
             $stmt = $mysqli->prepare("UPDATE tbl_floors SET qr_token = ?, status = 'active' WHERE floor_id = ?");
             $stmt->bind_param("si", $newToken, $param1);
             $stmt->execute();
+            // Log QR regeneration
+            $qrFloorName = null;
+            $qrf = $mysqli->prepare("SELECT floor_name FROM tbl_floors WHERE floor_id = ? LIMIT 1");
+            if ($qrf) { $qrf->bind_param('i', $param1); $qrf->execute(); $qrfRow = $qrf->get_result()->fetch_assoc(); $qrFloorName = $qrfRow['floor_name'] ?? null; $qrf->close(); }
+            log_system_action($mysqli, $authUserId, 'regenerate_floor_qr', "Regenerated QR code for floor '{$qrFloorName}'");
             json_response(['ok' => true, 'floor_id' => (int)$param1, 'qr_token' => $newToken, 'status' => 'active']);
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'qr' && $param3 === 'toggle-active') {
             // Toggle floor status between active/inactive (use 'status' column)
@@ -465,19 +470,26 @@ switch ($endpoint) {
             $stmt = $mysqli->prepare("UPDATE tbl_floors SET status = ? WHERE floor_id = ?");
             $stmt->bind_param("si", $active, $param1);
             $stmt->execute();
+            // Log QR toggle
+            $qrToggleFloorName = null;
+            $qtf = $mysqli->prepare("SELECT floor_name FROM tbl_floors WHERE floor_id = ? LIMIT 1");
+            if ($qtf) { $qtf->bind_param('i', $param1); $qtf->execute(); $qtfRow = $qtf->get_result()->fetch_assoc(); $qrToggleFloorName = $qtfRow['floor_name'] ?? null; $qtf->close(); }
+            log_system_action($mysqli, $authUserId, 'toggle_floor_qr', "Set QR status to {$active} for floor '{$qrToggleFloorName}'");
             json_response(['ok' => true, 'floor_id' => (int)$param1, 'status' => $active]);
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'toggle') {
             // POST /floors/{id}/toggle - toggle active/inactive
             $id = (int)$param1;
-            // fetch current status
-            $cstmt = $mysqli->prepare("SELECT status FROM tbl_floors WHERE floor_id = ? LIMIT 1");
+            // fetch current status and floor name
+            $cstmt = $mysqli->prepare("SELECT status, floor_name FROM tbl_floors WHERE floor_id = ? LIMIT 1");
             if ($cstmt) {
                 $cstmt->bind_param('i', $id);
                 $cstmt->execute();
                 $cur = $cstmt->get_result()->fetch_assoc();
                 $curStatus = $cur['status'] ?? null;
+                $toggleFloorName = $cur['floor_name'] ?? null;
             } else {
                 $curStatus = null;
+                $toggleFloorName = null;
             }
             $newStatus = ($curStatus && strtolower($curStatus) === 'active') ? 'inactive' : 'active';
             // allow explicit status in payload
@@ -488,15 +500,23 @@ switch ($endpoint) {
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('si', $newStatus, $id);
             $ust->execute();
+            // Log floor toggle
+            log_system_action($mysqli, $authUserId, 'toggle_floor', "Changed status of floor '{$toggleFloorName}' to {$newStatus}");
             json_response(['ok' => true, 'floor_id' => $id, 'status' => $newStatus]);
 
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'archive') {
             // POST /floors/{id}/archive - mark as archived and deactivate QR
             $id = (int)$param1;
+            // Get floor name for logging
+            $archFloorName = null;
+            $af = $mysqli->prepare("SELECT floor_name FROM tbl_floors WHERE floor_id = ? LIMIT 1");
+            if ($af) { $af->bind_param('i', $id); $af->execute(); $afRow = $af->get_result()->fetch_assoc(); $archFloorName = $afRow['floor_name'] ?? null; $af->close(); }
             $ust = $mysqli->prepare("UPDATE tbl_floors SET status = 'archive' WHERE floor_id = ?");
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('i', $id);
             $ust->execute();
+            // Log floor archive
+            log_system_action($mysqli, $authUserId, 'archive_floor', "Archived floor '{$archFloorName}'");
             // ensure qr considered inactive by status field
             json_response(['ok' => true, 'floor_id' => $id, 'status' => 'archive']);
         }
@@ -690,14 +710,16 @@ switch ($endpoint) {
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'toggle') {
             // POST /rooms/{id}/toggle - toggle active/inactive on room
             $id = (int)$param1;
-            $cstmt = $mysqli->prepare("SELECT status FROM tbl_rooms WHERE room_id = ? LIMIT 1");
+            $cstmt = $mysqli->prepare("SELECT status, room_name FROM tbl_rooms WHERE room_id = ? LIMIT 1");
             if ($cstmt) {
                 $cstmt->bind_param('i', $id);
                 $cstmt->execute();
                 $cur = $cstmt->get_result()->fetch_assoc();
                 $curStatus = $cur['status'] ?? null;
+                $toggleRoomName = $cur['room_name'] ?? null;
             } else {
                 $curStatus = null;
+                $toggleRoomName = null;
             }
             $newStatus = ($curStatus && strtolower($curStatus) === 'active') ? 'inactive' : 'active';
             if (isset($input['status']) && in_array(strtolower($input['status']), ['active','inactive','archive'])) {
@@ -707,15 +729,23 @@ switch ($endpoint) {
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('si', $newStatus, $id);
             $ust->execute();
+            // Log room toggle
+            log_system_action($mysqli, $authUserId, 'toggle_room', "Changed status of room '{$toggleRoomName}' to {$newStatus}");
             json_response(['ok' => true, 'room_id' => $id, 'status' => $newStatus]);
 
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'archive') {
             // POST /rooms/{id}/archive - mark room archived
             $id = (int)$param1;
+            // Get room name for logging
+            $archRoomName = null;
+            $ar = $mysqli->prepare("SELECT room_name FROM tbl_rooms WHERE room_id = ? LIMIT 1");
+            if ($ar) { $ar->bind_param('i', $id); $ar->execute(); $arRow = $ar->get_result()->fetch_assoc(); $archRoomName = $arRow['room_name'] ?? null; $ar->close(); }
             $ust = $mysqli->prepare("UPDATE tbl_rooms SET status = 'archive' WHERE room_id = ?");
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('i', $id);
             $ust->execute();
+            // Log room archive
+            log_system_action($mysqli, $authUserId, 'archive_room', "Archived room '{$archRoomName}'");
             json_response(['ok' => true, 'room_id' => $id, 'status' => 'archive']);
         } elseif ($request_method === 'GET' && $param1 === 'qr' && $param2) {
              // Lookup by QR token — now stored on floors; find the room that belongs to that floor (if any)
@@ -869,14 +899,16 @@ switch ($endpoint) {
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'toggle') {
             // POST /school/{id}/toggle - toggle active/inactive
             $id = (int)$param1;
-            $cstmt = $mysqli->prepare("SELECT status FROM tbl_school WHERE school_id = ? LIMIT 1");
+            $cstmt = $mysqli->prepare("SELECT status, school_name FROM tbl_school WHERE school_id = ? LIMIT 1");
             if ($cstmt) {
                 $cstmt->bind_param('i', $id);
                 $cstmt->execute();
                 $cur = $cstmt->get_result()->fetch_assoc();
                 $curStatus = $cur['status'] ?? null;
+                $toggleSchoolName = $cur['school_name'] ?? null;
             } else {
                 $curStatus = null;
+                $toggleSchoolName = null;
             }
             $newStatus = ($curStatus && strtolower($curStatus) === 'active') ? 'inactive' : 'active';
             if (isset($input['status']) && in_array(strtolower($input['status']), ['active','inactive','archive'])) {
@@ -886,15 +918,23 @@ switch ($endpoint) {
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('si', $newStatus, $id);
             $ust->execute();
+            // Log school toggle
+            log_system_action($mysqli, $authUserId, 'toggle_school', "Changed status of school '{$toggleSchoolName}' to {$newStatus}");
             json_response(['ok' => true, 'school_id' => $id, 'status' => $newStatus]);
 
         } elseif ($request_method === 'POST' && is_numeric($param1) && $param2 === 'archive') {
             // POST /school/{id}/archive - mark as archived
             $id = (int)$param1;
+            // Get school name for logging
+            $archSchoolName = null;
+            $as = $mysqli->prepare("SELECT school_name FROM tbl_school WHERE school_id = ? LIMIT 1");
+            if ($as) { $as->bind_param('i', $id); $as->execute(); $asRow = $as->get_result()->fetch_assoc(); $archSchoolName = $asRow['school_name'] ?? null; $as->close(); }
             $ust = $mysqli->prepare("UPDATE tbl_school SET status = 'archive' WHERE school_id = ?");
             if (!$ust) json_response(['error' => 'db_prepare_failed', 'details' => $mysqli->error], 500);
             $ust->bind_param('i', $id);
             $ust->execute();
+            // Log school archive
+            log_system_action($mysqli, $authUserId, 'archive_school', "Archived school '{$archSchoolName}'");
             json_response(['ok' => true, 'school_id' => $id, 'status' => 'archive']);
         }
         break;

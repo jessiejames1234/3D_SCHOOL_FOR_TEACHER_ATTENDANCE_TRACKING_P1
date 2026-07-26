@@ -1,5 +1,6 @@
 <?php
 // server-php/api/app-settings.php
+require_once __DIR__ . '/../helpers/log_helper.php';
 global $mysqli, $authPayload;
 
 $request_method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -161,6 +162,10 @@ if ($request_method === 'PUT' || $request_method === 'POST') {
     $updatedBy = $authUserId;
     $save_setting('home', 'home_title', $title, 'text', $updatedBy, $save_dept_id);
     $save_setting('home', 'home_title_color', $color, 'color', $updatedBy, $save_dept_id);
+
+    // Log the settings update
+    $deptSuffix = $save_dept_id ? ' for the department' : ' globally';
+    log_system_action($mysqli, $authUserId, 'update_app_settings', "Updated home page settings (title and color){$deptSuffix}");
 
     json_response($get_home_settings());
 }

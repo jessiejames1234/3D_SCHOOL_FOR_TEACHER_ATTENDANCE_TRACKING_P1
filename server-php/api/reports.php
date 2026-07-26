@@ -513,7 +513,13 @@ if ($report === 'classroom_utilization') {
     $sysTime = choose_timestamp_column('tbl_system_logs', 'created_at') ?: 'created_at';
     $detailCol = find_column('tbl_system_logs', ['details','info','message']) ?: 'details';
     
-    $sql = "SELECT CONCAT_WS(' ', u.first_name, u.last_name) AS `User`, l.action AS action, l.`{$detailCol}` AS details, l.ip_address AS ip_address, l.`{$sysTime}` AS created_at 
+    // Helper to format action names: replace underscores with spaces, capitalize each word
+    $formatAction = function($action) {
+        if (!$action) return '';
+        return ucwords(str_replace('_', ' ', $action));
+    };
+    
+    $sql = "SELECT CONCAT_WS(' ', u.first_name, u.last_name) AS `User`, l.action AS action, l.`{$detailCol}` AS details, l.ip_address AS ip_address, DATE_FORMAT(l.`{$sysTime}`, '%M %d, %Y - %h:%i %p') AS created_at 
             FROM tbl_system_logs l 
             LEFT JOIN tbl_users u ON l.user_id = u.user_id 
             WHERE l.`{$sysTime}` BETWEEN ? AND ?";
@@ -582,7 +588,14 @@ if ($report === 'classroom_utilization') {
         
         $stmt->execute(); 
         $res = $stmt->get_result(); 
-        while ($r = $res->fetch_assoc()) $rows[] = $r; 
+        while ($r = $res->fetch_assoc()) {
+            $r['action'] = $formatAction($r['action']);
+            // Convert IPv6 loopback ::1 to 127.0.0.1 for readability
+            if (isset($r['ip_address']) && strtolower(trim($r['ip_address'])) === '::1') {
+                $r['ip_address'] = '127.0.0.1';
+            }
+            $rows[] = $r; 
+        }
         $stmt->close();
     }
 

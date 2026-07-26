@@ -31,11 +31,20 @@ $normalize = $security['normalize_origin'] ?? function ($origin) {
 
 $originHeader = $_SERVER['HTTP_ORIGIN'] ?? '';
 $origin = $normalize($originHeader);
+$allowDevTunnelOrigins = $security['allow_dev_tunnel_origins'] ?? true;
+
+$isAllowedDevTunnelOrigin = function ($origin) use ($allowDevTunnelOrigins) {
+    if (!$allowDevTunnelOrigins || empty($origin)) return false;
+    $host = parse_url($origin, PHP_URL_HOST);
+    if (!$host) return false;
+    $host = strtolower($host);
+    return $host === 'devtunnels.ms' || str_ends_with($host, '.devtunnels.ms');
+};
 
 // If wildcard allowed, allow all origins
 if (in_array('*', $allowed, true)) {
     header('Access-Control-Allow-Origin: *');
-} elseif ($origin && in_array($origin, $allowed, true)) {
+} elseif ($origin && (in_array($origin, $allowed, true) || $isAllowedDevTunnelOrigin($origin))) {
     // Reflect the exact origin for CORS
     header('Access-Control-Allow-Origin: ' . $origin);
     header('Vary: Origin');
@@ -90,6 +99,7 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
         case 'first-login-password':
         case 'qrcode':
         case 'worker-bootstrap':
+        case 'avatar-thumbnail.php':
             return $endpoint === 'first-login-password' ? '__authenticated' : null;
 
         case 'dashboard':
@@ -111,7 +121,7 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
             if ($requestMethod === 'GET' && $teacherId > 0 && $authUserId > 0 && $teacherId === $authUserId) {
                 return 'attendance';
             }
-            return ['any_of' => ['attendancemgmt', 'attendance']];
+            return ['any_of' => ['attendancemgmt', 'attendance', '3d_building']];
 
         case 'reports':
             if ($report === 'attendance_logs') {
@@ -135,6 +145,7 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
 
         case 'camera-positions.php':
         case 'room-status.php':
+        case '3d-room-presence.php':
             return '3d_building';
 
         case 'school':
@@ -164,7 +175,7 @@ function resolve_module_requirement($endpointRoot, $requestMethod, $param1, $par
 
         case 'class-schedules':
             if ($requestMethod === 'GET') {
-                return ['any_of' => ['class_schedules', 'attendance', 'substitutions', 'schedule_edits']];
+                return ['any_of' => ['class_schedules', 'attendance', 'substitutions', 'schedule_edits', '3d_building']];
             }
             return 'class_schedules';
 
@@ -281,6 +292,12 @@ switch ($endpoint_root) {
         break;
     case 'room-status.php':
         require_once __DIR__ . '/api/room-status.php';
+        break;
+    case '3d-room-presence.php':
+        require_once __DIR__ . '/api/3d-room-presence.php';
+        break;
+    case 'avatar-thumbnail.php':
+        require_once __DIR__ . '/api/avatar-thumbnail.php';
         break;
     case 'login':
         require_once __DIR__ . '/api/login.php';

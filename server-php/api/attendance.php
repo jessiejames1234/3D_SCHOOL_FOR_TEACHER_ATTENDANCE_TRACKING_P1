@@ -195,6 +195,7 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
         u.last_name,
         NULLIF(CAST(u.image AS CHAR), '') AS avatar,
         u.dept_id,
+        d.dept_name,
         cs.start_time,
         cs.end_time,
         r.room_name,
@@ -212,6 +213,7 @@ if ($request_method === 'GET' && $endpoint === 'attendance') {
 
       FROM tbl_attendance_records ar
       JOIN tbl_users u              ON ar.user_id = u.user_id
+      LEFT JOIN tbl_departments d   ON u.dept_id = d.dept_id
       JOIN tbl_class_schedules cs   ON ar.schedule_id = cs.schedule_id
       JOIN tbl_rooms r              ON ar.room_id = r.room_id
       LEFT JOIN tbl_floors f        ON ar.floor_id = f.floor_id

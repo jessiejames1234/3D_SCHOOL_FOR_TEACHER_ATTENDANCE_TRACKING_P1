@@ -82,14 +82,6 @@ function ThreeDBuildingIndex() {
   };
 
   const [modelSrc, setModelSrc] = useState(defaultModel);
-  const [graphicsMode, setGraphicsMode] = useState(() => {
-    try {
-      const savedMode = window.localStorage.getItem('tdb_graphics_mode');
-      return savedMode === 'high' ? 'high' : 'performance';
-    } catch (error) {
-      return 'performance';
-    }
-  });
   const [status, setStatus] = useState('loading');
   const [message, setMessage] = useState('');
   const [presenceMarkers, setPresenceMarkers] = useState([]);
@@ -107,7 +99,6 @@ function ThreeDBuildingIndex() {
   const [pendingFilters, setPendingFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [appliedFilters, setAppliedFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [logsPage, setLogsPage] = useState(1);
-  const [recentLogStatusFilter, setRecentLogStatusFilter] = useState('recent');
   const [hoveredLogGroup, setHoveredLogGroup] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [sceneBusyLabel, setSceneBusyLabel] = useState('Loading 3D model');
@@ -143,10 +134,6 @@ function ThreeDBuildingIndex() {
   const meshMapRef = useRef({});
   const meshNameCollisionsRef = useRef({});
   const requestRef = useRef(null);
-  const graphicsModeRef = useRef(graphicsMode);
-  const interactiveRenderingRef = useRef(false);
-  const graphicsRestoreTimerRef = useRef(null);
-  const lastSceneRenderAtRef = useRef(0);
   const camAnimRef = useRef(null);
   const fullscreenRef = useRef(false);
   const sceneBusyRef = useRef(true);
@@ -218,10 +205,6 @@ function ThreeDBuildingIndex() {
   };
 
   const [selectedScheduleDate, setSelectedScheduleDate] = useState(() => toLocalYmd());
-  const [modalScheduleDate, setModalScheduleDate] = useState(() => toLocalYmd());
-  const [modalAttendanceRecords, setModalAttendanceRecords] = useState([]);
-  const [modalRecordsLoading, setModalRecordsLoading] = useState(false);
-  const [modalRecordsError, setModalRecordsError] = useState('');
 
   const normalizeMeshKey = (name) => {
     return String(name || '')
@@ -426,7 +409,6 @@ function ThreeDBuildingIndex() {
   const smoothCameraTo = (targetPos, targetLookAt, duration = 700, onComplete) => {
     if (!cameraRef.current) return;
     if (camAnimRef.current) cancelAnimationFrame(camAnimRef.current);
-    beginInteractiveRendering();
     fittedViewRef.current.active = false;
 
     const cam = cameraRef.current;
@@ -453,12 +435,8 @@ function ThreeDBuildingIndex() {
       requestSceneRender();
       if (t < 1) {
         camAnimRef.current = requestAnimationFrame(step);
-      } else {
-        camAnimRef.current = null;
-        endInteractiveRendering();
-        if (onComplete) {
-          try { onComplete(); } catch (e) { /* ignore */ }
-        }
+      } else if (onComplete) {
+        try { onComplete(); } catch (e) { /* ignore */ }
       }
     };
     camAnimRef.current = requestAnimationFrame(step);
@@ -542,21 +520,6 @@ function ThreeDBuildingIndex() {
     const d = new Date(`${key}T00:00:00`);
     if (Number.isNaN(d.getTime())) return '';
     return d.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-  };
-  const modalDateParts = (dateValue) => {
-    const key = normalizeDateKey(dateValue) || toLocalYmd();
-    const date = new Date(`${key}T00:00:00`);
-    if (Number.isNaN(date.getTime())) {
-      return { day: 'Selected day', date: key };
-    }
-    return {
-      day: date.toLocaleDateString('en-US', { weekday: 'long' }),
-      date: date.toLocaleDateString('en-US', {
-        month: 'long',
-        day: 'numeric',
-        year: 'numeric'
-      })
-    };
   };
   const isDateWithinScheduleRange = (dateValue, startValue, endValue) => {
     const dateKey = normalizeDateKey(dateValue);
@@ -969,55 +932,12 @@ function ThreeDBuildingIndex() {
     updatePresenceMarkerPositions();
   };
 
-  const applyGraphicsResolution = (moving = interactiveRenderingRef.current) => {
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-    const mode = graphicsModeRef.current;
-    const pixelRatio = moving
-      ? (mode === 'performance' ? 0.5 : 0.75)
-      : (mode === 'performance' ? 0.75 : 1);
-    if (Math.abs(renderer.getPixelRatio() - pixelRatio) < 0.001) return;
-    renderer.setPixelRatio(pixelRatio);
-  };
-
-  const beginInteractiveRendering = () => {
-    if (graphicsRestoreTimerRef.current != null) {
-      window.clearTimeout(graphicsRestoreTimerRef.current);
-      graphicsRestoreTimerRef.current = null;
-    }
-    if (!interactiveRenderingRef.current) {
-      interactiveRenderingRef.current = true;
-      applyGraphicsResolution(true);
-    }
-    requestSceneRender();
-  };
-
-  const endInteractiveRendering = () => {
-    if (graphicsRestoreTimerRef.current != null) {
-      window.clearTimeout(graphicsRestoreTimerRef.current);
-    }
-    graphicsRestoreTimerRef.current = window.setTimeout(() => {
-      graphicsRestoreTimerRef.current = null;
-      interactiveRenderingRef.current = false;
-      applyGraphicsResolution(false);
-      requestSceneRender();
-    }, 160);
-  };
-
   const requestSceneRender = () => {
     if (requestRef.current != null) return;
-    const renderFrame = (now) => {
-      const capInteractiveFps = graphicsModeRef.current === 'performance' && interactiveRenderingRef.current;
-      const minimumFrameTime = capInteractiveFps ? (1000 / 30) : 0;
-      if (minimumFrameTime && (now - lastSceneRenderAtRef.current) < minimumFrameTime) {
-        requestRef.current = requestAnimationFrame(renderFrame);
-        return;
-      }
+    requestRef.current = requestAnimationFrame(() => {
       requestRef.current = null;
-      lastSceneRenderAtRef.current = now;
       renderScene();
-    };
-    requestRef.current = requestAnimationFrame(renderFrame);
+    });
   };
 
   const stopKeyboardNavigation = () => {
@@ -1027,7 +947,6 @@ function ThreeDBuildingIndex() {
       cancelAnimationFrame(keyboardAnimationRef.current);
       keyboardAnimationRef.current = null;
     }
-    endInteractiveRendering();
   };
 
   const cancelCameraMotion = () => {
@@ -1038,13 +957,6 @@ function ThreeDBuildingIndex() {
       camAnimRef.current = null;
     }
   };
-
-  useEffect(() => {
-    graphicsModeRef.current = graphicsMode;
-    try { window.localStorage.setItem('tdb_graphics_mode', graphicsMode); } catch (error) { /* storage unavailable */ }
-    applyGraphicsResolution(interactiveRenderingRef.current);
-    requestSceneRender();
-  }, [graphicsMode]);
 
   const applyCameraPreset = (preset) => {
     if (!cameraRef.current || !window.THREE) return false;
@@ -1493,6 +1405,13 @@ function ThreeDBuildingIndex() {
     [attendanceRecords, appliedFilters]
   );
 
+  const departmentOptions = useMemo(() => (
+    uniqueValues([
+      ...attendanceRecords.map((record) => record.department_name),
+      ...presenceMarkers.map((marker) => marker.department_name)
+    ])
+  ), [attendanceRecords, presenceMarkers]);
+
   const visiblePresenceMarkers = presenceMarkers;
   const searchedRecords = filteredRecords;
 
@@ -1546,7 +1465,7 @@ function ThreeDBuildingIndex() {
     return { label: '', kind: 'none' };
   };
 
-  const allRecentLogs = useMemo(() => {
+  const recentLogs = useMemo(() => {
     const checkpoints = [
       { key: 'in', label: 'CHECK IN' },
       { key: 'mid', label: 'CHECK MID' },
@@ -1597,16 +1516,6 @@ function ThreeDBuildingIndex() {
     });
   }, [searchedRecords]);
 
-  const recentLogs = useMemo(() => {
-    if (recentLogStatusFilter === 'recent') {
-      return allRecentLogs.filter((log) => ['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    if (recentLogStatusFilter === 'other') {
-      return allRecentLogs.filter((log) => !['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    return allRecentLogs.filter((log) => log.status === recentLogStatusFilter);
-  }, [allRecentLogs, recentLogStatusFilter]);
-
   const LOGS_PER_PAGE = 15;
   const totalLogPages = Math.max(1, Math.ceil(recentLogs.length / LOGS_PER_PAGE));
   const pagedLogs = useMemo(() => {
@@ -1629,7 +1538,7 @@ function ThreeDBuildingIndex() {
 
   useEffect(() => {
     setLogsPage(1);
-  }, [appliedFilters, selectedScheduleDate, recentLogStatusFilter]);
+  }, [appliedFilters, selectedScheduleDate]);
 
   useEffect(() => {
     const timer = setInterval(() => setNowTime(new Date()), 60000);
@@ -1718,55 +1627,6 @@ function ThreeDBuildingIndex() {
   }, [selectedScheduleDate]);
 
   useEffect(() => {
-    if (!teacherStatusModal) {
-      setModalAttendanceRecords([]);
-      setModalRecordsLoading(false);
-      setModalRecordsError('');
-      return undefined;
-    }
-
-    const modalDateKey = normalizeDateKey(modalScheduleDate) || toLocalYmd();
-    const pageDateKey = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
-    if (modalDateKey === pageDateKey) {
-      setModalAttendanceRecords([]);
-      setModalRecordsLoading(false);
-      setModalRecordsError('');
-      return undefined;
-    }
-
-    let cancelled = false;
-    setModalRecordsLoading(true);
-    setModalRecordsError('');
-    setModalAttendanceRecords([]);
-
-    (async () => {
-      try {
-        const [records, schedules] = await Promise.all([
-          apiGet(`attendance?date=${encodeURIComponent(modalDateKey)}`),
-          apiGet('class-schedules').catch((error) => {
-            console.warn('Modal schedule fetch failed for 3D viewer:', error);
-            return [];
-          })
-        ]);
-        if (cancelled) return;
-        const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
-        const scheduleRecords = buildScheduleRecordsForDate(Array.isArray(schedules) ? schedules : [], modalDateKey);
-        setModalAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, modalDateKey));
-      } catch (error) {
-        if (cancelled) return;
-        console.error('Modal attendance fetch failed:', error);
-        setModalRecordsError('Unable to load records for the selected modal date.');
-      } finally {
-        if (!cancelled) setModalRecordsLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [teacherStatusModal, modalScheduleDate, selectedScheduleDate]);
-
-  useEffect(() => {
     if (!window.THREE || !mountRef.current) return;
 
     const width = mountRef.current.clientWidth;
@@ -1781,7 +1641,7 @@ function ThreeDBuildingIndex() {
 
     const renderer = new window.THREE.WebGLRenderer({ antialias: false, alpha: true });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(graphicsModeRef.current === 'performance' ? 0.75 : 1);
+    renderer.setPixelRatio(1);
     renderer.shadowMap.enabled = false;
     renderer.outputEncoding = window.THREE.sRGBEncoding;
     raycasterRef.current = new window.THREE.Raycaster();
@@ -1800,11 +1660,8 @@ function ThreeDBuildingIndex() {
     controls.addEventListener('change', requestSceneRender);
     const handleControlsStart = () => {
       fittedViewRef.current.active = false;
-      beginInteractiveRendering();
     };
-    const handleControlsEnd = () => endInteractiveRendering();
     controls.addEventListener('start', handleControlsStart);
-    controls.addEventListener('end', handleControlsEnd);
     controlsRef.current = controls;
 
     const ambientLight = new window.THREE.AmbientLight(0xffffff, 0.78);
@@ -1887,7 +1744,6 @@ function ThreeDBuildingIndex() {
     const handleCameraKeyDown = (event) => {
       if (!supportedCameraKeys.has(event.code)) return;
       event.preventDefault();
-      if (!keyboardKeysRef.current.size) beginInteractiveRendering();
       keyboardKeysRef.current.add(event.code);
       fittedViewRef.current.active = false;
       cameraTweenTokenRef.current += 1;
@@ -1949,7 +1805,6 @@ function ThreeDBuildingIndex() {
       };
 
       if (controlsRef.current) controlsRef.current.enabled = false;
-      beginInteractiveRendering();
       if (typeof renderer.domElement.setPointerCapture === 'function' && event.pointerId != null) {
         try { renderer.domElement.setPointerCapture(event.pointerId); } catch (e) { /* ignore */ }
       }
@@ -1984,7 +1839,6 @@ function ThreeDBuildingIndex() {
       if (!dragStateRef.current.active) return;
       stopDraggingMoveTarget();
       syncActiveUploadTransform();
-      endInteractiveRendering();
     };
 
     requestSceneRender();
@@ -2031,13 +1885,7 @@ function ThreeDBuildingIndex() {
       if (mountRef.current) mountRef.current.innerHTML = '';
       controls.removeEventListener('change', requestSceneRender);
       controls.removeEventListener('start', handleControlsStart);
-      controls.removeEventListener('end', handleControlsEnd);
       stopKeyboardNavigation();
-      if (graphicsRestoreTimerRef.current != null) {
-        window.clearTimeout(graphicsRestoreTimerRef.current);
-        graphicsRestoreTimerRef.current = null;
-      }
-      interactiveRenderingRef.current = false;
       if (controlsRef.current?.dispose) controlsRef.current.dispose();
       if (requestRef.current != null) cancelAnimationFrame(requestRef.current);
       requestRef.current = null;
@@ -2813,7 +2661,6 @@ function ThreeDBuildingIndex() {
     const parallelSchedules = record.is_parallel
       ? (record.parallel_rooms || []).map((roomName) => ({ room_name: roomName }))
       : getParallelSchedules(record);
-    setModalScheduleDate(normalizeDateKey(record.date) || normalizeDateKey(selectedScheduleDate) || toLocalYmd());
     setSearchTeacher(record.teacher_name || '');
     setSelectedDepartment('');
     setTeacherStatusModal({
@@ -2857,7 +2704,6 @@ function ThreeDBuildingIndex() {
       openTeacherRecordDetails(activeRecord || roomRecords[0], source);
       return true;
     }
-    setModalScheduleDate(normalizeDateKey(selectedScheduleDate) || toLocalYmd());
     setSearchTeacher('');
     setSelectedDepartment('');
     setTeacherStatusModal({
@@ -2902,33 +2748,24 @@ function ThreeDBuildingIndex() {
     `${presenceFlagLabel(flagId)} - ${formatPresenceCheckpoint(time)}`
   );
 
-  const modalSourceRecords = (normalizeDateKey(modalScheduleDate) || toLocalYmd())
-    === (normalizeDateKey(selectedScheduleDate) || toLocalYmd())
-    ? attendanceRecords
-    : modalAttendanceRecords;
-
   const modalRoomSchedules = useMemo(() => {
     if (!teacherStatusModal) return [];
     const roomName = String(teacherStatusModal.record?.room_name || '').trim();
-    const dateKey = normalizeDateKey(modalScheduleDate) || toLocalYmd();
-    return modalSourceRecords
+    const dateKey = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
+    return attendanceRecords
       .filter((record) => normalizeDateKey(record.date) === dateKey)
       .filter((record) => !roomName || nameEq(record.room_name, roomName))
       .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
       .sort((left, right) => String(left.start_time || '').localeCompare(String(right.start_time || '')));
-  }, [teacherStatusModal, modalSourceRecords, modalScheduleDate, selectedDepartment, canSaveFrontView]);
+  }, [teacherStatusModal, attendanceRecords, selectedScheduleDate, selectedDepartment, canSaveFrontView]);
 
   const modalTeacherOptions = useMemo(() => uniqueValues(
-    modalSourceRecords
-      .filter((record) => normalizeDateKey(record.date) === (normalizeDateKey(modalScheduleDate) || toLocalYmd()))
+    attendanceRecords
+      .filter((record) => normalizeDateKey(record.date) === (normalizeDateKey(selectedScheduleDate) || toLocalYmd()))
       .filter((record) => !teacherStatusModal?.record?.room_name || nameEq(record.room_name, teacherStatusModal.record.room_name))
       .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
       .map((record) => record.teacher_name)
-  ), [modalSourceRecords, modalScheduleDate, selectedDepartment, teacherStatusModal, canSaveFrontView]);
-
-  const modalDepartmentOptions = useMemo(() => uniqueValues(
-    modalSourceRecords.map((record) => record.department_name)
-  ).sort(), [modalSourceRecords]);
+  ), [attendanceRecords, selectedScheduleDate, selectedDepartment, teacherStatusModal, canSaveFrontView]);
 
   const modalRecentAttendance = useMemo(() => {
     const teacherQuery = String(searchTeacher || '').trim().toLowerCase();
@@ -2946,8 +2783,6 @@ function ThreeDBuildingIndex() {
     return String(right.time).localeCompare(String(left.time));
       });
   }, [modalRoomSchedules, searchTeacher]);
-
-  const modalSelectedDate = modalDateParts(modalScheduleDate);
 
   return (
     <div className="tdb-page">
@@ -3195,17 +3030,6 @@ function ThreeDBuildingIndex() {
             ))}
 
             <div className="tdb-side-controls">
-              <label className="tdb-graphics-control">
-                <span>Graphics</span>
-                <select
-                  value={graphicsMode}
-                  onChange={(event) => setGraphicsMode(event.target.value === 'high' ? 'high' : 'performance')}
-                  aria-label="3D graphics quality"
-                >
-                  <option value="performance">Performance</option>
-                  <option value="high">High Detail</option>
-                </select>
-              </label>
               <button
                 type="button"
                 className="btn btn-sm tdb-default-view-btn"
@@ -3395,10 +3219,6 @@ function ThreeDBuildingIndex() {
                     <div className="tdb-teacher-modal-columns">
                       <div className="tdb-teacher-modal-column">
                         <h4>Room schedules</h4>
-                        <div className="tdb-modal-date-context" aria-label={`${modalSelectedDate.day}, ${modalSelectedDate.date}`}>
-                          <span className="tdb-modal-date-day">{modalSelectedDate.day}</span>
-                          <span className="tdb-modal-date-full">{modalSelectedDate.date}</span>
-                        </div>
                         <div className="tdb-teacher-modal-filters">
                           <div className="tdb-field">
                             <label htmlFor="tdb-modal-filter-date">Date</label>
@@ -3406,12 +3226,8 @@ function ThreeDBuildingIndex() {
                               id="tdb-modal-filter-date"
                               type="date"
                               className="form-control form-control-sm"
-                              value={modalScheduleDate}
-                              onChange={(event) => {
-                                setModalScheduleDate(event.target.value || toLocalYmd());
-                                setSelectedDepartment('');
-                                setSearchTeacher('');
-                              }}
+                              value={selectedScheduleDate}
+                              onChange={(event) => setSelectedScheduleDate(event.target.value || toLocalYmd())}
                             />
                           </div>
                           {canSaveFrontView && (
@@ -3424,7 +3240,7 @@ function ThreeDBuildingIndex() {
                                 onChange={(event) => setSelectedDepartment(event.target.value)}
                               >
                                 <option value="">All departments</option>
-                                {modalDepartmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
+                                {departmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
                               </select>
                             </div>
                           )}
@@ -3445,12 +3261,8 @@ function ThreeDBuildingIndex() {
                           </div>
                         </div>
                         <div className="tdb-teacher-schedule-list">
-                          {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading records for the selected date...</div>
-                          ) : modalRecordsError ? (
-                            <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
-                          ) : modalRoomSchedules.length > 0 ? modalRoomSchedules.map((schedule, index) => {
-                            const parallelRows = getParallelSchedules(schedule, modalSourceRecords);
+                          {modalRoomSchedules.length > 0 ? modalRoomSchedules.map((schedule, index) => {
+                            const parallelRows = getParallelSchedules(schedule);
                             return (
                               <div className="tdb-teacher-schedule-item" key={`${schedule.schedule_id || index}-${schedule.room_name}`}>
                                 <div>
@@ -3498,10 +3310,6 @@ function ThreeDBuildingIndex() {
                       </div>
                       <div className="tdb-teacher-modal-column">
                         <h4>Today/Recent attendance</h4>
-                        <div className="tdb-modal-date-context" aria-label={`${modalSelectedDate.day}, ${modalSelectedDate.date}`}>
-                          <span className="tdb-modal-date-day">{modalSelectedDate.day}</span>
-                          <span className="tdb-modal-date-full">{modalSelectedDate.date}</span>
-                        </div>
                         {!teacherStatusModal.record?.no_records ? (
                           <>
                             <div className="tdb-recent-teacher-profile">
@@ -3534,11 +3342,7 @@ function ThreeDBuildingIndex() {
                           </div>
                         )}
                         <div className="tdb-teacher-attendance-list">
-                          {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading attendance for the selected date...</div>
-                          ) : modalRecordsError ? (
-                            <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
-                          ) : modalRecentAttendance.length > 0 ? modalRecentAttendance.map((checkpoint) => (
+                          {modalRecentAttendance.length > 0 ? modalRecentAttendance.map((checkpoint) => (
                             <div className="tdb-teacher-attendance-item" key={checkpoint.key}>
                               <div>
                                 <strong>{checkpoint.label}</strong>
@@ -3643,28 +3447,6 @@ function ThreeDBuildingIndex() {
               value={selectedScheduleDate}
               onChange={(e) => setSelectedScheduleDate(e.target.value || toLocalYmd())}
             />
-          </div>
-          <div className="tdb-log-status-filters" aria-label="Recent log status filters">
-            <button
-              type="button"
-              className={`tdb-log-recent-filter${recentLogStatusFilter === 'recent' ? ' tdb-log-recent-filter--active' : ''}`}
-              onClick={() => setRecentLogStatusFilter('recent')}
-            >
-              Recent
-            </button>
-            <select
-              className="form-select form-select-sm tdb-log-other-filter"
-              aria-label="Filter Recent Logs by other status"
-              value={recentLogStatusFilter === 'recent' ? '' : recentLogStatusFilter}
-              onChange={(event) => setRecentLogStatusFilter(event.target.value || 'recent')}
-            >
-              <option value="">Other status</option>
-              <option value="other">All other statuses</option>
-              <option value="UPCOMING">Upcoming</option>
-              <option value="PENDING">Pending</option>
-              <option value="SUBSTITUTED">Substituted</option>
-              <option value="ON_LEAVE">On leave</option>
-            </select>
           </div>
           <div className="tdb-logs-title">Recent Logs</div>
 

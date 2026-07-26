@@ -16,8 +16,21 @@ function log_system_action($mysqli, $user_id, $action, $details) {
         return;
     }
 
-    // 2. Get IP Address
+    // 2. Get IP Address (check forwarded headers first for proxy/tunnel support)
     $ip = $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        // X-Forwarded-For can contain multiple IPs (comma-separated); take the first (original client)
+        $forwardedIps = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+        $forwardedIp = trim($forwardedIps[0]);
+        if (filter_var($forwardedIp, FILTER_VALIDATE_IP)) {
+            $ip = $forwardedIp;
+        }
+    } elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
+        $realIp = trim($_SERVER['HTTP_X_REAL_IP']);
+        if (filter_var($realIp, FILTER_VALIDATE_IP)) {
+            $ip = $realIp;
+        }
+    }
 
     // 3. Prepare Query
     // Note: 'timestamp' is usually handled by MySQL (CURRENT_TIMESTAMP), 

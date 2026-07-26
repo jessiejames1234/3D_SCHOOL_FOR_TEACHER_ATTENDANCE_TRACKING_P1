@@ -10,6 +10,7 @@ $security = [
         'https://pg7tj9bp-80.asse.devtunnels.ms',
         'https://pg7tj9bp-8070.asse.devtunnels.ms',
         'https://pg7tj9bp-8080.asse.devtunnels.ms',
+        'https://sjc8x44q-8070.asse.devtunnels.ms',
         'http://localhost:8080',
         'http://localhost:80',
         'http://localhost:8070',
@@ -21,9 +22,11 @@ $security = [
         // Note: origins must not include a path (e.g. '/3D1.2'). Paths are ignored when comparing origins.
     ],
 
+    'allow_dev_tunnel_origins' => getenv('ALLOW_DEV_TUNNEL_ORIGINS') === '0' ? false : true,
+
     'error_log' => __DIR__ . '/../logs/php-errors.log',
 
-    'socket_server_url' => getenv('SOCKET_SERVER_URL') ?: 'https://pg7tj9bp-8080.asse.devtunnels.ms/trigger-update',
+    'socket_server_url' => getenv('SOCKET_SERVER_URL') ?: 'http://localhost:8080/trigger-update',
 
     // Forgot-password email "From" address (optional). Set for better deliverability to Gmail.
     'mail_from' => getenv('MAIL_FROM') ?: null,

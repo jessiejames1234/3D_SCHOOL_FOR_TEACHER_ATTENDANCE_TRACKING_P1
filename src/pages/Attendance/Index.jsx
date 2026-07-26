@@ -535,6 +535,17 @@ export default function AttendanceIndex() {
     return todays.filter(r => isRecordActiveNow(r, now));
   }, [records]);
 
+  const isUpcomingWithinWindow = React.useCallback((record, windowMinutes = 30) => {
+    if (!record?.date || !record?.start_time) return false;
+    const now = new Date();
+    const todayStr = formatDateYMD(now);
+    if (record.date !== todayStr) return false;
+    const start = new Date(`${record.date}T${record.start_time}`);
+    const diffMs = start.getTime() - now.getTime();
+    const diffMinutes = diffMs / 60000;
+    return diffMinutes > 0 && diffMinutes <= windowMinutes;
+  }, []);
+
   const pickScheduleByLocation = React.useCallback((items) => {
     if (!Array.isArray(items) || !items.length) return null;
 
@@ -580,15 +591,50 @@ export default function AttendanceIndex() {
     return pickScheduleByLocation(getActiveSchedules());
   }, [getActiveSchedules, pickScheduleByLocation]);
 
+  // Get upcoming schedules that start within 30 minutes
+  const getUpcomingSchedules = React.useCallback(() => {
+    if (!Array.isArray(records)) return [];
+    const now = new Date();
+    const todayStr = formatDateYMD(now);
+    const todays = records.filter(r => r.date === todayStr);
+    return todays.filter(r => isUpcomingWithinWindow(r, 30));
+  }, [records, isUpcomingWithinWindow]);
+
+  // Find the best target schedule: active first, then upcoming within 30 min window
+  const findTargetSchedule = React.useCallback(() => {
+    const active = findActiveSchedule();
+    if (active) return active;
+    const upcoming = getUpcomingSchedules();
+    if (upcoming.length > 0) {
+      return pickScheduleByLocation(upcoming);
+    }
+    return null;
+  }, [findActiveSchedule, getUpcomingSchedules, pickScheduleByLocation]);
+
   const findMatchingScheduleGroup = React.useCallback((base) => {
     if (!base) return [];
     return getActiveSchedules().filter(r => isSameScheduleGroup(r, base));
   }, [getActiveSchedules]);
 
+  // Find matching group for upcoming schedules too (for QR validation)
+  const findTargetScheduleGroup = React.useCallback((base) => {
+    if (!base) return [];
+    const active = getActiveSchedules().filter(r => isSameScheduleGroup(r, base));
+    if (active.length > 0) return active;
+    const upcoming = getUpcomingSchedules().filter(r => isSameScheduleGroup(r, base));
+    return upcoming;
+  }, [getActiveSchedules, getUpcomingSchedules]);
+
   const activeSchedule = React.useMemo(() => findActiveSchedule(), [findActiveSchedule]);
   const activeScheduleGroup = React.useMemo(() => (
     activeSchedule ? findMatchingScheduleGroup(activeSchedule) : []
   ), [activeSchedule, findMatchingScheduleGroup]);
+
+  // targetSchedule = active OR upcoming within 30 min (for QR validation)
+  const targetSchedule = React.useMemo(() => findTargetSchedule(), [findTargetSchedule]);
+  const targetScheduleGroup = React.useMemo(() => (
+    targetSchedule ? findTargetScheduleGroup(targetSchedule) : []
+  ), [targetSchedule, findTargetScheduleGroup]);
 
   const getScheduleRoomName = React.useCallback((record) => {
     if (!record) return '';
@@ -1153,8 +1199,8 @@ export default function AttendanceIndex() {
   };
 
   const openScannerWithPermission = async () => {
-    const rec = findActiveSchedule();
-    if (!rec) return alert('No active schedule — scanning disabled');
+    const rec = findTargetSchedule();
+    if (!rec) return alert('No active or upcoming schedule within 30 minutes — scanning disabled');
     if (cameraPermission === 'denied') {
       setErrorMessage('Camera permission is denied — enable it in browser settings.');
       return;
@@ -1524,25 +1570,36 @@ export default function AttendanceIndex() {
               try { html5QrCode.clear(); } catch (e) {}
               if (!stopped) {
                 const matchedFloor = floors.find(f => f.qr_token === decodedText);
-                const active = findActiveSchedule ? findActiveSchedule() : null;
-                const activeGroup = active ? findMatchingScheduleGroup(active) : [];
+                const target = findTargetSchedule ? findTargetSchedule() : null;
+                const targetGroup = target ? findTargetScheduleGroup(target) : [];
                 const scheduledFloorIds = new Set();
                 try {
-                  for (const rec of activeGroup.length ? activeGroup : (active ? [active] : [])) {
+                  for (const rec of targetGroup.length ? targetGroup : (target ? [target] : [])) {
                     const rr = rooms.find(r => Number(r.room_id) === Number(rec.room_id));
                     if (rr?.floor_id !== undefined && rr.floor_id !== null) scheduledFloorIds.add(Number(rr.floor_id));
                   }
                 } catch(e) {}
 
-                if (!matchedFloor) {
+                // 1. CRITICAL SECURITY FIX: Reject if no target schedule exists
+                if (!target) {
+                   (async () => {
+                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'No active or upcoming class found', showConfirmButton:false, timer:3500 }); } catch (e) { alert('No active or upcoming class found'); }
+                   })();
+                } 
+                // 2. Reject if QR is invalid
+                else if (!matchedFloor) {
                   (async () => {
                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'Scanned QR is not recognized', showConfirmButton:false, timer:3000 }); } catch (e) { alert('Scanned QR is not recognized'); }
                   })();
-                } else if (scheduledFloorIds.size && !scheduledFloorIds.has(Number(matchedFloor.floor_id))) {
+                } 
+                // 3. Reject if floor mismatch
+                else if (scheduledFloorIds.size === 0 || !scheduledFloorIds.has(Number(matchedFloor.floor_id))) {
                   (async () => {
-                    try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'Scanned floor does not match your active class', showConfirmButton:false, timer:3500 }); } catch (e) { alert('Scanned floor does not match your active class'); }
+                    try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'Scanned floor does not match your class', showConfirmButton:false, timer:3500 }); } catch (e) { alert('Scanned floor does not match your class'); }
                   })();
-                } else {
+                } 
+                // 4. Accept
+                else {
                   (async () => {
                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'success', title: `Scanned: ${matchedFloor.floor_name || 'floor'}`, showConfirmButton:false, timer:2000 }); } catch (e) { /* ignore */ }
                   })();
@@ -1599,7 +1656,7 @@ export default function AttendanceIndex() {
         } catch (e) {}
       })();
     };
-  }, [isCameraVisible, floors, rooms, findActiveSchedule, findMatchingScheduleGroup]);
+  }, [isCameraVisible, floors, rooms, findTargetSchedule, findTargetScheduleGroup]);
 
   React.useEffect(() => {
     try {

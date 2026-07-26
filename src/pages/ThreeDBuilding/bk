@@ -1,12 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AuthContext } from '../../context/AuthContext.jsx';
-import { apiGet, apiPost } from '../../services/api.js';
+import { apiGet } from '../../services/api.js';
 import './Index.css';
 
 function ThreeDBuildingIndex() {
-  const auth = React.useContext(AuthContext) || {};
-  const currentUser = auth.user || null;
-  const canSaveFrontView = Number(currentUser?.role_id) === 1;
   const defaultAvatarSrc = (() => {
     try {
       if (typeof window === 'undefined') return '/src/assets/unknown.jpg';
@@ -36,14 +32,10 @@ function ThreeDBuildingIndex() {
   };
 
   const serverRoot = resolveServerRoot();
-  const resolveApiAssetUrl = (path) => {
-    const clean = String(path || '').replace(/^\/+/, '');
-    return new URL(`./index.php/api/${clean}`, `${serverRoot}/`).href;
-  };
   const defaultModel = new URL('./3dbuilding/MW.glb', `${serverRoot}/`).href;
   const getBuildingModelSrc = (buildingName) => {
     const normalized = String(buildingName || '').trim().toLowerCase();
-    if (!normalized) return null;
+    if (!normalized) return defaultModel;
     if (normalized.includes('main west') || normalized.includes('mainwest') || normalized.includes('main_west') || normalized === 'mw') {
       return new URL('./3dbuilding/MW.glb', `${serverRoot}/`).href;
     }
@@ -56,7 +48,7 @@ function ThreeDBuildingIndex() {
     if (normalized.includes('main north') || normalized.includes('mainnorth') || normalized.includes('main_north') || normalized === 'mn') {
       return new URL('./3dbuilding/MN.glb', `${serverRoot}/`).href;
     }
-    return null;
+    return defaultModel;
   };
   const defaultCameraPresets = {
     Building_PhinmaHall: { position: [-22, 10, 22], target: [0, 3, 0] },
@@ -68,49 +60,25 @@ function ThreeDBuildingIndex() {
     MainNorth: { position: [-22, 10, -16], target: [0, 3, 0] },
     MainWest: { position: [22, 10, -16], target: [0, 3, 0] }
   };
-  const cameraModelDefinitions = {
-    MW: { code: 'MW', cameraKey: 'Building_MainWest', aliasKey: 'MainWest', filename: 'MW.glb' },
-    MN: { code: 'MN', cameraKey: 'Building_MainNorth', aliasKey: 'MainNorth', filename: 'MN.glb' },
-    MS: { code: 'MS', cameraKey: 'Building_MainSouth', aliasKey: 'MainSouth', filename: 'MS.glb' },
-    PH: { code: 'PH', cameraKey: 'Building_PhinmaHall', aliasKey: 'PhinmaHall', filename: 'PH.glb' }
-  };
-  const getCameraModelDefinition = (source = modelSrcRef.current) => {
-    let pathname = String(source || '');
-    try { pathname = new URL(source, window.location.href).pathname; } catch (e) { /* use raw source */ }
-    const filename = decodeURIComponent(pathname).split('/').pop()?.toLowerCase() || '';
-    return Object.values(cameraModelDefinitions).find((entry) => entry.filename.toLowerCase() === filename) || null;
-  };
 
   const [modelSrc, setModelSrc] = useState(defaultModel);
-  const [graphicsMode, setGraphicsMode] = useState(() => {
-    try {
-      const savedMode = window.localStorage.getItem('tdb_graphics_mode');
-      return savedMode === 'high' ? 'high' : 'performance';
-    } catch (error) {
-      return 'performance';
-    }
-  });
   const [status, setStatus] = useState('loading');
   const [message, setMessage] = useState('');
-  const [presenceMarkers, setPresenceMarkers] = useState([]);
-  const [presenceMarkersVisible, setPresenceMarkersVisible] = useState(true);
-  const [presenceLastUpdated, setPresenceLastUpdated] = useState('');
-  const [presenceError, setPresenceError] = useState('');
-  const [presenceDiagnostics, setPresenceDiagnostics] = useState({ unmatched: [], duplicates: [] });
-  const [presenceRefreshToken, setPresenceRefreshToken] = useState(0);
+  const [markerData, setMarkerData] = useState(null);
+  const [markerDataList, setMarkerDataList] = useState([]);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [nowTime, setNowTime] = useState(new Date());
   const [catalog, setCatalog] = useState({ schools: [], buildings: [], floors: [], rooms: [] });
 
   const [searchTeacher, setSearchTeacher] = useState('');
-  const [selectedDepartment, setSelectedDepartment] = useState('');
   const [pendingFilters, setPendingFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [appliedFilters, setAppliedFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [logsPage, setLogsPage] = useState(1);
-  const [recentLogStatusFilter, setRecentLogStatusFilter] = useState('recent');
-  const [hoveredLogGroup, setHoveredLogGroup] = useState('');
+  const [roomModal, setRoomModal] = useState(null);
+  const [focusedRoom, setFocusedRoom] = useState('');
+  const [viewButtonVisible, setViewButtonVisible] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [sceneBusyLabel, setSceneBusyLabel] = useState('Loading 3D model');
+  const [sceneBusyLabel, setSceneBusyLabel] = useState('Loading 3D model...');
   const [isUploadBusy, setIsUploadBusy] = useState(false);
   const [pendingUpload, setPendingUpload] = useState(null);
   const [moveModeEnabled, setMoveModeEnabled] = useState(false);
@@ -126,13 +94,11 @@ function ThreeDBuildingIndex() {
   const [navigatorFloor, setNavigatorFloor] = useState('');
   const [navigatorRoom, setNavigatorRoom] = useState('');
   const [cameraPresets, setCameraPresets] = useState(defaultCameraPresets);
-  const [isSavingFrontView, setIsSavingFrontView] = useState(false);
+  const [roomStatuses, setRoomStatuses] = useState({});
   const [modelHierarchy, setModelHierarchy] = useState({ buildings: [], floors: [], rooms: [] });
 
   const viewerWrapRef = useRef(null);
   const mountRef = useRef(null);
-  const mainPanelRef = useRef(null);
-  const logsPanelRef = useRef(null);
   const fileInputRef = useRef(null);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
@@ -140,14 +106,15 @@ function ThreeDBuildingIndex() {
   const controlsRef = useRef(null);
   const modelRef = useRef(null);
   const uploadedObjectsRef = useRef([]);
+  const pinRef = useRef(null);
+  const labelRef = useRef(null);
   const meshMapRef = useRef({});
-  const meshNameCollisionsRef = useRef({});
   const requestRef = useRef(null);
-  const graphicsModeRef = useRef(graphicsMode);
-  const interactiveRenderingRef = useRef(false);
-  const graphicsRestoreTimerRef = useRef(null);
-  const lastSceneRenderAtRef = useRef(0);
   const camAnimRef = useRef(null);
+  const viewBtnRef = useRef(null);
+  const focusedRoomCenterRef = useRef(null);
+  const focusedRoomRef = useRef('');
+  const viewButtonVisibleRef = useRef(false);
   const fullscreenRef = useRef(false);
   const sceneBusyRef = useRef(true);
   const nativeFullscreenRef = useRef(false);
@@ -170,34 +137,10 @@ function ThreeDBuildingIndex() {
     offsetX: 0,
     offsetZ: 0
   });
-  const presenceMarkerRefs = useRef({});
-  const presenceAnchorsRef = useRef({});
-  const presenceVersionRef = useRef('');
-  const presenceMarkersVisibleRef = useRef(true);
+  const markerSpritesRef = useRef([]);
   const namedCameraDataRef = useRef(null);
   const cameraTweenTokenRef = useRef(0);
-  const pendingNavigatorRoomRef = useRef(null);
-  const keyboardKeysRef = useRef(new Set());
-  const keyboardAnimationRef = useRef(null);
-  const keyboardLastFrameRef = useRef(0);
-  const cameraMoveSpeedRef = useRef(4);
-  const fittedViewRef = useRef({ active: false, direction: [1, 0.45, 1] });
-  const cameraPresetsRef = useRef(defaultCameraPresets);
-  const modelSrcRef = useRef(defaultModel);
-  const modelLoadMeterRef = useRef(null);
-  const modelLoadFillRef = useRef(null);
-  const modelLoadValueRef = useRef(null);
-
-  const updateModelLoadProgress = (value) => {
-    const percentage = Math.min(100, Math.max(0, Math.round(Number(value) || 0)));
-    modelLoadMeterRef.current?.setAttribute('aria-valuenow', String(percentage));
-    if (modelLoadFillRef.current) {
-      modelLoadFillRef.current.style.strokeDashoffset = String(100 - percentage);
-    }
-    if (modelLoadValueRef.current) {
-      modelLoadValueRef.current.textContent = String(percentage);
-    }
-  };
+  const roomSelectionTimerRef = useRef(null);
 
   const uniqueValues = (list) => Array.from(new Set((list || []).filter(Boolean)));
   const normalizeKey = (value) => String(value || '')
@@ -218,10 +161,6 @@ function ThreeDBuildingIndex() {
   };
 
   const [selectedScheduleDate, setSelectedScheduleDate] = useState(() => toLocalYmd());
-  const [modalScheduleDate, setModalScheduleDate] = useState(() => toLocalYmd());
-  const [modalAttendanceRecords, setModalAttendanceRecords] = useState([]);
-  const [modalRecordsLoading, setModalRecordsLoading] = useState(false);
-  const [modalRecordsError, setModalRecordsError] = useState('');
 
   const normalizeMeshKey = (name) => {
     return String(name || '')
@@ -320,25 +259,21 @@ function ThreeDBuildingIndex() {
   };
 
   useEffect(() => {
+    focusedRoomRef.current = focusedRoom;
+    if (!focusedRoom) focusedRoomCenterRef.current = null;
+  }, [focusedRoom]);
+
+  useEffect(() => {
+    viewButtonVisibleRef.current = viewButtonVisible;
+  }, [viewButtonVisible]);
+
+  useEffect(() => {
     fullscreenRef.current = isFullscreen;
   }, [isFullscreen]);
 
   useEffect(() => {
-    cameraPresetsRef.current = cameraPresets;
-  }, [cameraPresets]);
-
-  useEffect(() => {
-    modelSrcRef.current = modelSrc;
-  }, [modelSrc]);
-
-  useEffect(() => {
     sceneBusyRef.current = status === 'loading' || isUploadBusy;
   }, [status, isUploadBusy]);
-
-  useEffect(() => {
-    presenceMarkersVisibleRef.current = presenceMarkersVisible;
-    requestSceneRender();
-  }, [presenceMarkersVisible]);
 
   useEffect(() => {
     const originalOverflow = document.body.style.overflow;
@@ -426,12 +361,8 @@ function ThreeDBuildingIndex() {
   const smoothCameraTo = (targetPos, targetLookAt, duration = 700, onComplete) => {
     if (!cameraRef.current) return;
     if (camAnimRef.current) cancelAnimationFrame(camAnimRef.current);
-    beginInteractiveRendering();
-    fittedViewRef.current.active = false;
 
     const cam = cameraRef.current;
-    cam.zoom = 1;
-    cam.updateProjectionMatrix();
     const startPos = cam.position.clone();
     const startTarget = controlsRef.current?.target ? controlsRef.current.target.clone() : new window.THREE.Vector3(0, 0, 0);
     const endPos = targetPos.clone();
@@ -453,12 +384,8 @@ function ThreeDBuildingIndex() {
       requestSceneRender();
       if (t < 1) {
         camAnimRef.current = requestAnimationFrame(step);
-      } else {
-        camAnimRef.current = null;
-        endInteractiveRendering();
-        if (onComplete) {
-          try { onComplete(); } catch (e) { /* ignore */ }
-        }
+      } else if (onComplete) {
+        try { onComplete(); } catch (e) { /* ignore */ }
       }
     };
     camAnimRef.current = requestAnimationFrame(step);
@@ -490,6 +417,30 @@ function ThreeDBuildingIndex() {
     return true;
   };
 
+  const updateViewButtonPosition = () => {
+    const btn = viewBtnRef.current;
+    if (!btn) return;
+    if (!mountRef.current || !cameraRef.current) return;
+    if (!focusedRoomRef.current || !viewButtonVisibleRef.current || !focusedRoomCenterRef.current) {
+      btn.style.display = 'none';
+      return;
+    }
+    const rect = mountRef.current.getBoundingClientRect();
+    const point = focusedRoomCenterRef.current.clone().project(cameraRef.current);
+    if (point.z < -1 || point.z > 1) {
+      btn.style.display = 'none';
+      return;
+    }
+    const x = (point.x * 0.5 + 0.5) * rect.width;
+    const y = (-point.y * 0.5 + 0.5) * rect.height;
+    if (x < -40 || x > rect.width + 40 || y < -40 || y > rect.height + 40) {
+      btn.style.display = 'none';
+      return;
+    }
+    btn.style.display = 'inline-flex';
+    btn.style.left = `${x}px`;
+    btn.style.top = `${y}px`;
+  };
   const extractTimeText = (value) => {
     const txt = String(value || '').trim();
     if (!txt) return '';
@@ -531,6 +482,20 @@ function ThreeDBuildingIndex() {
     const dt = new Date(`${d}T${t}`);
     return Number.isNaN(dt.getTime()) ? null : dt;
   };
+  const timeTextFromDate = (dateValue) => {
+    if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return '';
+    return [
+      String(dateValue.getHours()).padStart(2, '0'),
+      String(dateValue.getMinutes()).padStart(2, '0'),
+      String(dateValue.getSeconds()).padStart(2, '0')
+    ].join(':');
+  };
+  const getMidpointTime = (record) => {
+    const start = toDateTime(record?.date, record?.start_time);
+    const end = toDateTime(record?.date, record?.end_time);
+    if (!start || !end) return record?.start_time || '';
+    return timeTextFromDate(new Date(start.getTime() + ((end.getTime() - start.getTime()) / 2)));
+  };
   const normalizeDateKey = (value) => {
     const raw = String(value || '').trim();
     const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -542,21 +507,6 @@ function ThreeDBuildingIndex() {
     const d = new Date(`${key}T00:00:00`);
     if (Number.isNaN(d.getTime())) return '';
     return d.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-  };
-  const modalDateParts = (dateValue) => {
-    const key = normalizeDateKey(dateValue) || toLocalYmd();
-    const date = new Date(`${key}T00:00:00`);
-    if (Number.isNaN(date.getTime())) {
-      return { day: 'Selected day', date: key };
-    }
-    return {
-      day: date.toLocaleDateString('en-US', { weekday: 'long' }),
-      date: date.toLocaleDateString('en-US', {
-        month: 'long',
-        day: 'numeric',
-        year: 'numeric'
-      })
-    };
   };
   const isDateWithinScheduleRange = (dateValue, startValue, endValue) => {
     const dateKey = normalizeDateKey(dateValue);
@@ -750,23 +700,14 @@ function ThreeDBuildingIndex() {
 
   const rebuildMeshMap = (object) => {
     const nextMeshMap = {};
-    const collisions = {};
     object?.traverse((child) => {
       if (!child.isMesh) return;
       const normalized = normalizeMeshKey(child.name);
       if (normalized) {
-        if (nextMeshMap[normalized]) {
-          collisions[normalized] = [
-            ...(collisions[normalized] || [nextMeshMap[normalized].name]),
-            child.name
-          ];
-        } else {
-          nextMeshMap[normalized] = child;
-        }
+        nextMeshMap[normalized] = child;
       }
     });
     meshMapRef.current = nextMeshMap;
-    meshNameCollisionsRef.current = collisions;
   };
 
   const centerObjectAtOrigin = (object) => {
@@ -783,62 +724,20 @@ function ThreeDBuildingIndex() {
     object.position.y += groundY - box.min.y;
   };
 
-  const frameObjectInCamera = (
-    object,
-    directionValues = [1, 0.45, 1],
-    rememberView = true
-  ) => {
+  const frameObjectInCamera = (object) => {
     if (!object || !cameraRef.current || !window.THREE) return;
-    object.updateWorldMatrix?.(true, true);
     const box = new window.THREE.Box3().setFromObject(object);
     if (box.isEmpty()) return;
-    const camera = cameraRef.current;
-    const center = box.getCenter(new window.THREE.Vector3());
     const size = box.getSize(new window.THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
-    const direction = new window.THREE.Vector3(...directionValues);
-    if (direction.lengthSq() === 0) direction.set(1, 0.45, 1);
-    direction.normalize();
-
-    camera.position.copy(center).add(direction);
-    camera.lookAt(center);
-    camera.updateMatrixWorld(true);
-
-    const inverseCameraRotation = camera.quaternion.clone().invert();
-    const verticalFov = window.THREE.MathUtils.degToRad(camera.fov);
-    const tanVertical = Math.tan(verticalFov / 2);
-    const tanHorizontal = tanVertical * Math.max(camera.aspect, 0.01);
-    let fitDistance = 0;
-
-    [box.min.x, box.max.x].forEach((x) => {
-      [box.min.y, box.max.y].forEach((y) => {
-        [box.min.z, box.max.z].forEach((z) => {
-          const localCorner = new window.THREE.Vector3(x, y, z)
-            .sub(center)
-            .applyQuaternion(inverseCameraRotation);
-          fitDistance = Math.max(
-            fitDistance,
-            localCorner.z + Math.abs(localCorner.x) / tanHorizontal,
-            localCorner.z + Math.abs(localCorner.y) / tanVertical
-          );
-        });
-      });
-    });
-
-    fitDistance = Math.max(fitDistance * 1.05, maxDim * 0.55, camera.near * 4);
-    camera.position.copy(center).add(direction.multiplyScalar(fitDistance));
-    camera.lookAt(center);
-    camera.zoom = 1;
-    camera.updateProjectionMatrix();
+    const fov = cameraRef.current.fov * (Math.PI / 180);
+    const cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 0.82;
+    cameraRef.current.position.set(cameraZ, cameraZ * 0.45, cameraZ);
+    cameraRef.current.lookAt(0, 0, 0);
     if (controlsRef.current) {
-      controlsRef.current.target.copy(center);
+      controlsRef.current.target.set(0, 0, 0);
       controlsRef.current.update();
     }
-    cameraMoveSpeedRef.current = Math.max(maxDim * 0.12, 1);
-    if (rememberView) {
-      fittedViewRef.current = { active: true, direction: [...directionValues] };
-    }
-    requestSceneRender();
   };
 
   const syncViewerSize = () => {
@@ -849,14 +748,6 @@ function ThreeDBuildingIndex() {
     cameraRef.current.aspect = width / height;
     cameraRef.current.updateProjectionMatrix();
     rendererRef.current.setSize(width, height);
-    if (fittedViewRef.current.active && modelRef.current) {
-      frameObjectInCamera(
-        modelRef.current,
-        fittedViewRef.current.direction,
-        false
-      );
-      return;
-    }
     requestSceneRender();
   };
 
@@ -926,157 +817,20 @@ function ThreeDBuildingIndex() {
     });
   };
 
-  const updatePresenceMarkerPositions = () => {
-    const camera = cameraRef.current;
-    const mount = mountRef.current;
-    const wrap = viewerWrapRef.current;
-    const visible = presenceMarkersVisibleRef.current && !sceneBusyRef.current;
-    if (!camera || !mount || !wrap || !window.THREE || !visible) {
-      Object.values(presenceMarkerRefs.current).forEach((node) => {
-        if (node) node.style.display = 'none';
-      });
-      return;
-    }
-
-    const mountRect = mount.getBoundingClientRect();
-    const wrapRect = wrap.getBoundingClientRect();
-    Object.entries(presenceMarkerRefs.current).forEach(([roomId, node]) => {
-      if (!node) return;
-      const anchor = presenceAnchorsRef.current[roomId];
-      if (!anchor) {
-        node.style.display = 'none';
-        return;
-      }
-
-      const projected = anchor.clone().project(camera);
-      if (projected.z < -1 || projected.z > 1 || Math.abs(projected.x) > 1.08 || Math.abs(projected.y) > 1.08) {
-        node.style.display = 'none';
-        return;
-      }
-
-      const x = (mountRect.left - wrapRect.left) + ((projected.x * 0.5 + 0.5) * mountRect.width);
-      const y = (mountRect.top - wrapRect.top) + ((-projected.y * 0.5 + 0.5) * mountRect.height);
-      node.style.display = 'inline-flex';
-      node.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0) translate(-50%, -100%)`;
-    });
-  };
-
   const renderScene = () => {
+    updateViewButtonPosition();
+    updateUploadAnchorButtons();
     if (rendererRef.current && sceneRef.current && cameraRef.current) {
       rendererRef.current.render(sceneRef.current, cameraRef.current);
     }
-    updateUploadAnchorButtons();
-    updatePresenceMarkerPositions();
-  };
-
-  const applyGraphicsResolution = (moving = interactiveRenderingRef.current) => {
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-    const mode = graphicsModeRef.current;
-    const pixelRatio = moving
-      ? (mode === 'performance' ? 0.5 : 0.75)
-      : (mode === 'performance' ? 0.75 : 1);
-    if (Math.abs(renderer.getPixelRatio() - pixelRatio) < 0.001) return;
-    renderer.setPixelRatio(pixelRatio);
-  };
-
-  const beginInteractiveRendering = () => {
-    if (graphicsRestoreTimerRef.current != null) {
-      window.clearTimeout(graphicsRestoreTimerRef.current);
-      graphicsRestoreTimerRef.current = null;
-    }
-    if (!interactiveRenderingRef.current) {
-      interactiveRenderingRef.current = true;
-      applyGraphicsResolution(true);
-    }
-    requestSceneRender();
-  };
-
-  const endInteractiveRendering = () => {
-    if (graphicsRestoreTimerRef.current != null) {
-      window.clearTimeout(graphicsRestoreTimerRef.current);
-    }
-    graphicsRestoreTimerRef.current = window.setTimeout(() => {
-      graphicsRestoreTimerRef.current = null;
-      interactiveRenderingRef.current = false;
-      applyGraphicsResolution(false);
-      requestSceneRender();
-    }, 160);
   };
 
   const requestSceneRender = () => {
     if (requestRef.current != null) return;
-    const renderFrame = (now) => {
-      const capInteractiveFps = graphicsModeRef.current === 'performance' && interactiveRenderingRef.current;
-      const minimumFrameTime = capInteractiveFps ? (1000 / 30) : 0;
-      if (minimumFrameTime && (now - lastSceneRenderAtRef.current) < minimumFrameTime) {
-        requestRef.current = requestAnimationFrame(renderFrame);
-        return;
-      }
+    requestRef.current = requestAnimationFrame(() => {
       requestRef.current = null;
-      lastSceneRenderAtRef.current = now;
       renderScene();
-    };
-    requestRef.current = requestAnimationFrame(renderFrame);
-  };
-
-  const stopKeyboardNavigation = () => {
-    keyboardKeysRef.current.clear();
-    keyboardLastFrameRef.current = 0;
-    if (keyboardAnimationRef.current != null) {
-      cancelAnimationFrame(keyboardAnimationRef.current);
-      keyboardAnimationRef.current = null;
-    }
-    endInteractiveRendering();
-  };
-
-  const cancelCameraMotion = () => {
-    stopKeyboardNavigation();
-    cameraTweenTokenRef.current += 1;
-    if (camAnimRef.current != null) {
-      cancelAnimationFrame(camAnimRef.current);
-      camAnimRef.current = null;
-    }
-  };
-
-  useEffect(() => {
-    graphicsModeRef.current = graphicsMode;
-    try { window.localStorage.setItem('tdb_graphics_mode', graphicsMode); } catch (error) { /* storage unavailable */ }
-    applyGraphicsResolution(interactiveRenderingRef.current);
-    requestSceneRender();
-  }, [graphicsMode]);
-
-  const applyCameraPreset = (preset) => {
-    if (!cameraRef.current || !window.THREE) return false;
-    if (!Array.isArray(preset?.position) || !Array.isArray(preset?.target)) return false;
-    if (preset.position.length !== 3 || preset.target.length !== 3) return false;
-    const values = [...preset.position, ...preset.target].map(Number);
-    if (!values.every(Number.isFinite)) return false;
-
-    cancelCameraMotion();
-    cameraRef.current.position.set(...values.slice(0, 3));
-    cameraRef.current.zoom = 1;
-    cameraRef.current.updateProjectionMatrix();
-    if (controlsRef.current) {
-      controlsRef.current.target.set(...values.slice(3, 6));
-      controlsRef.current.update();
-    } else {
-      cameraRef.current.lookAt(new window.THREE.Vector3(...values.slice(3, 6)));
-    }
-    fittedViewRef.current.active = false;
-    requestSceneRender();
-    return true;
-  };
-
-  const applyCurrentBuildingFrontView = (source = modelSrcRef.current) => {
-    const definition = getCameraModelDefinition(source);
-    if (!definition) return false;
-    const presets = cameraPresetsRef.current || defaultCameraPresets;
-    const preset = presets[definition.cameraKey]
-      || presets[definition.aliasKey]
-      || defaultCameraPresets[definition.cameraKey]
-      || defaultCameraPresets[definition.aliasKey];
-    return applyCameraPreset(preset);
+    });
   };
 
   const getFileExtension = (filename) => {
@@ -1114,13 +868,6 @@ function ThreeDBuildingIndex() {
       campus_name: raw?.campus_name || raw?.school_name || '',
       building_name: buildingName,
       floor_name: floorName,
-      department_id: raw?.department_id || raw?.dept_id || raw?.teacher_dept_id || '',
-      department_name: raw?.department_name || raw?.dept_name || '',
-      subject_id: raw?.subject_id || '',
-      subject_code: raw?.subject_code || '',
-      subject_name: raw?.subject_name || raw?.subject || '',
-      section_name: raw?.section_name || '',
-      semester_id: raw?.semester_id || '',
       start_time: raw?.start_time || '',
       end_time: raw?.end_time || '',
       time_in: raw?.time_in || '',
@@ -1141,10 +888,7 @@ function ThreeDBuildingIndex() {
     const flagName = String(flagNameValue || '').trim().toLowerCase();
     if (flagId === 5 || flagName === 'late') return 'LATE';
     if (flagId === 3 || flagName === 'absent') return 'ABSENT';
-    if (flagId === 2 || flagName === 'present') return 'PRESENT';
-    if (flagId === 4 || flagName === 'substituted') return 'SUBSTITUTED';
-    if (flagId === 7 || flagName === 'on leave' || flagName === 'on_leave') return 'ON_LEAVE';
-    if (flagId === 1 || flagId === 8 || flagName === 'upcoming' || flagName === 'pending') return 'PENDING';
+    if (flagId === 2 || flagName === 'present' || flagId === 4 || flagName === 'substituted') return 'PRESENT';
     return '';
   };
 
@@ -1153,7 +897,7 @@ function ThreeDBuildingIndex() {
     if (flagStatus) return flagStatus;
 
     const hasIn = !!String(record?.time_in || '').trim();
-    if (!hasIn) return 'PENDING';
+    if (!hasIn) return 'ABSENT';
     const inMins = toMinutes(record?.time_in);
     const startMins = toMinutes(record?.start_time);
     if (inMins !== null && startMins !== null && inMins > (startMins + 5)) return 'LATE';
@@ -1179,13 +923,13 @@ function ThreeDBuildingIndex() {
         flagNameKey: 'flag_out_name'
       }
     }[checkpoint];
-    if (!config) return 'PENDING';
+    if (!config) return 'ABSENT';
 
     const flagStatus = statusFromFlag(record?.[config.flagIdKey], record?.[config.flagNameKey]);
     if (flagStatus) return flagStatus;
 
     const timeValue = String(record?.[config.timeKey] || '').trim();
-    if (!timeValue) return 'PENDING';
+    if (!timeValue) return 'ABSENT';
     if (checkpoint === 'in') {
       const inMins = toMinutes(timeValue);
       const startMins = toMinutes(record?.[config.compareTimeKey]);
@@ -1235,45 +979,50 @@ function ThreeDBuildingIndex() {
     return Array.from(merged.values());
   };
 
-  const scheduleSubjectKey = (record) => {
-    if (record?.subject_id !== undefined && record?.subject_id !== null && String(record.subject_id) !== '') {
-      return `id:${record.subject_id}`;
+  const buildMarkerFromRecord = (record, now) => {
+    if (!record) return null;
+    const start = toDateTime(record.date, record.start_time);
+    const end = toDateTime(record.date, record.end_time);
+    const hasIn = !!String(record.time_in || '').trim();
+    const hasMid = !!String(record.time_check || '').trim();
+    const hasOut = !!String(record.time_out || '').trim();
+
+    let markerColor = 'green';
+    let statusText = 'Checked In';
+
+    if (hasOut) {
+      markerColor = 'green';
+      statusText = 'Checked Out';
+    } else if (hasMid) {
+      markerColor = 'green';
+      statusText = 'Mid Check OK';
+    } else if (hasIn && start && end) {
+      const durationMs = end.getTime() - start.getTime();
+      const midPoint = new Date(start.getTime() + durationMs / 2);
+      const midStart = new Date(midPoint.getTime() - (10 * 60 * 1000));
+      const midEnd = new Date(midPoint.getTime() + (10 * 60 * 1000));
+      const outStart = new Date(end.getTime() - (15 * 60 * 1000));
+
+      if (now >= outStart) {
+        markerColor = 'red';
+        statusText = 'Missed Check-Out';
+      } else if (now >= midStart && now <= midEnd && !hasMid) {
+        markerColor = 'red';
+        statusText = 'Missed Mid-Check';
+      }
+    } else if (!hasIn) {
+      markerColor = 'orange';
+      statusText = 'No Check-In Yet';
     }
-    return `text:${String(record?.subject_code || record?.subject_name || record?.subject || '').trim().toLowerCase()}`;
-  };
-  const scheduleTeacherKey = (record) => String(
-    record?.user_id || record?.teacher_id || record?.teacher_name || ''
-  ).trim().toLowerCase();
-  const parallelScheduleGroupKey = (record) => [
-    scheduleTeacherKey(record),
-    normalizeDateKey(record?.date),
-    String(record?.start_time || '').slice(0, 5),
-    String(record?.end_time || '').slice(0, 5),
-    scheduleSubjectKey(record)
-  ].join('|');
-  const isParallelSchedule = (left, right) => {
-    if (!left || !right) return false;
-    const leftTeacher = scheduleTeacherKey(left);
-    const rightTeacher = scheduleTeacherKey(right);
-    const leftDate = normalizeDateKey(left.date);
-    const rightDate = normalizeDateKey(right.date);
-    const leftStart = String(left.start_time || '').slice(0, 5);
-    const rightStart = String(right.start_time || '').slice(0, 5);
-    const leftEnd = String(left.end_time || '').slice(0, 5);
-    const rightEnd = String(right.end_time || '').slice(0, 5);
-    const leftSubject = scheduleSubjectKey(left);
-    const rightSubject = scheduleSubjectKey(right);
-    if (!leftTeacher || !rightTeacher || !leftDate || !rightDate || !leftStart || !rightStart || !leftEnd || !rightEnd) return false;
-    if (leftSubject === 'text:' || rightSubject === 'text:') return false;
-    return leftTeacher === rightTeacher
-      && leftDate === rightDate
-      && leftStart === rightStart
-      && leftEnd === rightEnd
-      && leftSubject === rightSubject;
-  };
-  const getParallelSchedules = (record, records = attendanceRecords) => {
-    const matches = (records || []).filter((candidate) => isParallelSchedule(candidate, record));
-    return matches.length > 1 ? matches : [];
+
+    return {
+      roomName: record.room_name || '',
+      teacherName: record.teacher_name || '',
+      color: markerColor,
+      statusText,
+      avatarUrl: record.avatar || '',
+      record: record
+    };
   };
 
   const attendanceCampusOptions = useMemo(() => {
@@ -1479,6 +1228,14 @@ function ThreeDBuildingIndex() {
     }));
   }, [campusOptions, buildingOptions, floorOptions, roomOptions]);
 
+  useEffect(() => {
+    const activeBuilding = pendingFilters.building || appliedFilters.building || navigatorBuilding;
+    const targetModel = getBuildingModelSrc(activeBuilding);
+    if (targetModel && targetModel !== modelSrc) {
+      setModelSrc(targetModel);
+    }
+  }, [pendingFilters.building, appliedFilters.building, navigatorBuilding]);
+
   const recordMatchesFilter = (record, filters) => {
     const eq = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
     if (filters.campus && !eq(record.campus_name, filters.campus)) return false;
@@ -1493,135 +1250,62 @@ function ThreeDBuildingIndex() {
     [attendanceRecords, appliedFilters]
   );
 
-  const visiblePresenceMarkers = presenceMarkers;
-  const searchedRecords = filteredRecords;
+  const searchedRecords = useMemo(() => {
+    const q = String(searchTeacher || '').trim().toLowerCase();
+    if (!q) return filteredRecords;
+    return filteredRecords.filter((r) => {
+      const hay = `${r.teacher_name || ''} ${r.room_name || ''}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [filteredRecords, searchTeacher]);
 
   const stats = useMemo(() => {
     let totalPresent = 0;
-    let totalOther = 0;
     let totalLate = 0;
     let totalAbsent = 0;
     searchedRecords.forEach((rec) => {
-      ['in', 'mid', 'out'].forEach((checkpoint) => {
-        const statusTag = computeCheckpointStatus(rec, checkpoint);
-        if (statusTag === 'PRESENT') totalPresent += 1;
-        else if (statusTag === 'LATE') totalLate += 1;
-        else if (statusTag === 'ABSENT') totalAbsent += 1;
-        else totalOther += 1;
-      });
+      const statusTag = computeAttendanceStatus(rec);
+      if (statusTag === 'PRESENT') totalPresent += 1;
+      else if (statusTag === 'LATE') totalLate += 1;
+      else totalAbsent += 1;
     });
-    return { totalPresent, totalOther, totalLate, totalAbsent };
-  }, [searchedRecords]);
-
-  const computeRecentLogStatus = (record, checkpoint) => {
-    const flagConfig = {
-      in: ['flag_in_id', 'flag_in_name'],
-      mid: ['flag_check_id', 'flag_check_name'],
-      out: ['flag_out_id', 'flag_out_name']
-    }[checkpoint];
-    if (!flagConfig) return 'PENDING';
-    const flagId = Number(record?.[flagConfig[0]] || 0);
-    const flagName = String(record?.[flagConfig[1]] || '').trim().toLowerCase();
-    if (flagId === 1 || flagName === 'upcoming') return 'UPCOMING';
-    if (flagId === 8 || flagName === 'pending') return 'PENDING';
-    return computeCheckpointStatus(record, checkpoint);
-  };
-
-  const getRecentLogTimeDisplay = (record, checkpoint, status) => {
-    const timeKey = { in: 'time_in', mid: 'time_check', out: 'time_out' }[checkpoint];
-    const actualTime = timeKey ? record?.[timeKey] : '';
-    if (status === 'ABSENT') {
-      return record?.end_time ? { label: formatClock(record.end_time), kind: 'single' } : { label: '', kind: 'none' };
-    }
-    if (status === 'UPCOMING' || status === 'PENDING') {
-      if (!record?.start_time || !record?.end_time) return { label: '', kind: 'none' };
-      return {
-        label: `${formatClock(record.start_time)} - ${formatClock(record.end_time)}`,
-        kind: 'range'
-      };
-    }
-    if (status === 'PRESENT' || status === 'LATE') {
-      return actualTime ? { label: formatClock(actualTime), kind: 'single' } : { label: '', kind: 'none' };
-    }
-    return { label: '', kind: 'none' };
-  };
-
-  const allRecentLogs = useMemo(() => {
-    const checkpoints = [
-      { key: 'in', label: 'CHECK IN' },
-      { key: 'mid', label: 'CHECK MID' },
-      { key: 'out', label: 'CHECK OUT' }
-    ];
-    const orderedRecords = [...searchedRecords].sort((left, right) => {
-      const leftTime = left.time_out || left.time_check || left.time_in || left.end_time || left.start_time || '';
-      const rightTime = right.time_out || right.time_check || right.time_in || right.end_time || right.start_time || '';
-      const leftDate = toDateTime(left.date, leftTime) || new Date(0);
-      const rightDate = toDateTime(right.date, rightTime) || new Date(0);
-      return rightDate.getTime() - leftDate.getTime();
-    });
-    return orderedRecords.flatMap((rec, idx) => {
-      const parallelSchedules = getParallelSchedules(rec, searchedRecords);
-      const parallelGroupKey = parallelSchedules.length > 1 ? parallelScheduleGroupKey(rec) : '';
-      const attendanceGroupKey = rec.attendance_id || [
-        rec.schedule_id || idx,
-        scheduleTeacherKey(rec),
-        normalizeDateKey(rec.date),
-        rec.room_name || ''
-      ].join('|');
-      const highlightGroupKey = parallelGroupKey
-        ? `parallel:${parallelGroupKey}`
-        : `attendance:${attendanceGroupKey}`;
-      return checkpoints.map((checkpoint) => {
-        const status = computeRecentLogStatus(rec, checkpoint.key);
-        const timeDisplay = getRecentLogTimeDisplay(rec, checkpoint.key, status);
-        return {
-          id: `${rec.attendance_id || rec.schedule_id || idx}-${rec.teacher_name}-${rec.room_name}-${checkpoint.key}`,
-          teacherName: rec.teacher_name || 'Teacher',
-          roomName: rec.room_name || '-',
-          campusName: rec.campus_name || '',
-          buildingName: rec.building_name || '',
-          floorName: rec.floor_name || '',
-          avatar: rec.avatar || '',
-          subjectLabel: `${rec.subject_code || ''} ${rec.subject_name || ''}`.trim() || 'Subject not specified',
-          sectionName: rec.section_name || 'Section not specified',
-          type: checkpoint.label,
-          status,
-          isParallel: !!parallelGroupKey,
-          parallelGroupKey,
-          highlightGroupKey,
-          timeLabel: timeDisplay.label,
-          timeKind: timeDisplay.kind,
-          record: rec
-        };
-      });
-    });
+    return { totalPresent, totalLate, totalAbsent };
   }, [searchedRecords]);
 
   const recentLogs = useMemo(() => {
-    if (recentLogStatusFilter === 'recent') {
-      return allRecentLogs.filter((log) => ['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    if (recentLogStatusFilter === 'other') {
-      return allRecentLogs.filter((log) => !['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    return allRecentLogs.filter((log) => log.status === recentLogStatusFilter);
-  }, [allRecentLogs, recentLogStatusFilter]);
+    const checkpoints = [
+      { key: 'in', label: 'CHECK IN', timeKey: 'time_in', fallback: (rec) => rec.start_time || '' },
+      { key: 'mid', label: 'CHECK MID', timeKey: 'time_check', fallback: (rec) => getMidpointTime(rec) },
+      { key: 'out', label: 'CHECK OUT', timeKey: 'time_out', fallback: (rec) => rec.end_time || '' }
+    ];
+    const items = searchedRecords.flatMap((rec, idx) => checkpoints.map((checkpoint) => {
+      const eventTime = rec[checkpoint.timeKey] || checkpoint.fallback(rec) || rec.start_time || '';
+      const sortDate = toDateTime(rec.date, eventTime) || toDateTime(rec.date, rec.start_time) || new Date(0);
+      return {
+        id: `${rec.attendance_id || rec.schedule_id || idx}-${rec.teacher_name}-${rec.room_name}-${checkpoint.key}`,
+        teacherName: rec.teacher_name || 'Teacher',
+        roomName: rec.room_name || '-',
+        campusName: rec.campus_name || '',
+        buildingName: rec.building_name || '',
+        floorName: rec.floor_name || '',
+        avatar: rec.avatar || '',
+        type: checkpoint.label,
+        status: computeCheckpointStatus(rec, checkpoint.key),
+        eventTime,
+        sortDate,
+        record: rec
+      };
+    }));
+    items.sort((a, b) => b.sortDate.getTime() - a.sortDate.getTime());
+    return items;
+  }, [searchedRecords]);
 
-  const LOGS_PER_PAGE = 15;
+  const LOGS_PER_PAGE = 8;
   const totalLogPages = Math.max(1, Math.ceil(recentLogs.length / LOGS_PER_PAGE));
   const pagedLogs = useMemo(() => {
     const start = (logsPage - 1) * LOGS_PER_PAGE;
     return recentLogs.slice(start, start + LOGS_PER_PAGE);
   }, [recentLogs, logsPage]);
-  const visibleLogPages = useMemo(() => {
-    const buttonCount = Math.min(5, totalLogPages);
-    const maximumStart = Math.max(1, totalLogPages - buttonCount + 1);
-    const startPage = Math.min(
-      Math.max(1, logsPage - Math.floor(buttonCount / 2)),
-      maximumStart
-    );
-    return Array.from({ length: buttonCount }, (_, index) => startPage + index);
-  }, [logsPage, totalLogPages]);
 
   useEffect(() => {
     if (logsPage > totalLogPages) setLogsPage(totalLogPages);
@@ -1629,34 +1313,11 @@ function ThreeDBuildingIndex() {
 
   useEffect(() => {
     setLogsPage(1);
-  }, [appliedFilters, selectedScheduleDate, recentLogStatusFilter]);
+  }, [searchTeacher, appliedFilters, selectedScheduleDate]);
 
   useEffect(() => {
-    const timer = setInterval(() => setNowTime(new Date()), 60000);
+    const timer = setInterval(() => setNowTime(new Date()), 1000);
     return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    const mainPanel = mainPanelRef.current;
-    const logsPanel = logsPanelRef.current;
-    if (!mainPanel || !logsPanel) return undefined;
-
-    const syncLogsPanelHeight = () => {
-      const height = Math.ceil(mainPanel.getBoundingClientRect().height);
-      if (height > 0) logsPanel.style.height = `${height}px`;
-    };
-
-    syncLogsPanelHeight();
-    const observer = typeof ResizeObserver !== 'undefined'
-      ? new ResizeObserver(syncLogsPanelHeight)
-      : null;
-    observer?.observe(mainPanel);
-    window.addEventListener('resize', syncLogsPanelHeight);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener('resize', syncLogsPanelHeight);
-      logsPanel.style.height = '';
-    };
   }, []);
 
   useEffect(() => {
@@ -1711,60 +1372,21 @@ function ThreeDBuildingIndex() {
     };
 
     fetchTeacherLocation();
-    // Live markers use their own compact 30-second feed. Keep the much larger
-    // attendance/history refresh infrequent so it does not interrupt the viewer.
-    const interval = setInterval(fetchTeacherLocation, 300000);
+    const interval = setInterval(fetchTeacherLocation, 5000);
     return () => clearInterval(interval);
   }, [selectedScheduleDate]);
 
   useEffect(() => {
-    if (!teacherStatusModal) {
-      setModalAttendanceRecords([]);
-      setModalRecordsLoading(false);
-      setModalRecordsError('');
-      return undefined;
-    }
+    const now = nowTime;
+    const candidates = searchedRecords.filter((r) => {
+      const end = toDateTime(r.date, r.end_time);
+      const hasAnyCheck = !!r.time_in || !!r.time_check || !!r.time_out;
+      return !!end && now <= end && hasAnyCheck;
+    });
 
-    const modalDateKey = normalizeDateKey(modalScheduleDate) || toLocalYmd();
-    const pageDateKey = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
-    if (modalDateKey === pageDateKey) {
-      setModalAttendanceRecords([]);
-      setModalRecordsLoading(false);
-      setModalRecordsError('');
-      return undefined;
-    }
-
-    let cancelled = false;
-    setModalRecordsLoading(true);
-    setModalRecordsError('');
-    setModalAttendanceRecords([]);
-
-    (async () => {
-      try {
-        const [records, schedules] = await Promise.all([
-          apiGet(`attendance?date=${encodeURIComponent(modalDateKey)}`),
-          apiGet('class-schedules').catch((error) => {
-            console.warn('Modal schedule fetch failed for 3D viewer:', error);
-            return [];
-          })
-        ]);
-        if (cancelled) return;
-        const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
-        const scheduleRecords = buildScheduleRecordsForDate(Array.isArray(schedules) ? schedules : [], modalDateKey);
-        setModalAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, modalDateKey));
-      } catch (error) {
-        if (cancelled) return;
-        console.error('Modal attendance fetch failed:', error);
-        setModalRecordsError('Unable to load records for the selected modal date.');
-      } finally {
-        if (!cancelled) setModalRecordsLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [teacherStatusModal, modalScheduleDate, selectedScheduleDate]);
+    const markers = candidates.map(record => buildMarkerFromRecord(record, now));
+    setMarkerDataList(markers);
+  }, [searchedRecords, nowTime]);
 
   useEffect(() => {
     if (!window.THREE || !mountRef.current) return;
@@ -1781,30 +1403,18 @@ function ThreeDBuildingIndex() {
 
     const renderer = new window.THREE.WebGLRenderer({ antialias: false, alpha: true });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(graphicsModeRef.current === 'performance' ? 0.75 : 1);
+    renderer.setPixelRatio(1);
     renderer.shadowMap.enabled = false;
     renderer.outputEncoding = window.THREE.sRGBEncoding;
     raycasterRef.current = new window.THREE.Raycaster();
 
     mountRef.current.innerHTML = '';
     mountRef.current.appendChild(renderer.domElement);
-    renderer.domElement.tabIndex = 0;
-    renderer.domElement.setAttribute('aria-label', 'Interactive 3D building viewer. Use WASD or arrow keys to move, Q to move down, and E to move up.');
     rendererRef.current = renderer;
 
     const controls = new window.THREE.OrbitControls(camera, renderer.domElement);
     controls.enableDamping = false;
-    controls.rotateSpeed = 0.025;
-    controls.zoomSpeed = 0.15;
-    controls.panSpeed = 0.015;
     controls.addEventListener('change', requestSceneRender);
-    const handleControlsStart = () => {
-      fittedViewRef.current.active = false;
-      beginInteractiveRendering();
-    };
-    const handleControlsEnd = () => endInteractiveRendering();
-    controls.addEventListener('start', handleControlsStart);
-    controls.addEventListener('end', handleControlsEnd);
     controlsRef.current = controls;
 
     const ambientLight = new window.THREE.AmbientLight(0xffffff, 0.78);
@@ -1822,106 +1432,33 @@ function ThreeDBuildingIndex() {
       );
     };
 
-    const supportedCameraKeys = new Set([
-      'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE',
-      'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'
-    ]);
-    const keyboardSpeedScale = 0.75;
-
-    const runKeyboardNavigation = (now) => {
-      const keys = keyboardKeysRef.current;
-      if (!keys.size) {
-        keyboardAnimationRef.current = null;
-        keyboardLastFrameRef.current = 0;
-        return;
-      }
-
-      const lastTime = keyboardLastFrameRef.current || now;
-      const deltaSeconds = Math.min((now - lastTime) / 1000, 0.05);
-      keyboardLastFrameRef.current = now;
-
-      if (cameraRef.current && controlsRef.current?.enabled && window.THREE) {
-        const activeCamera = cameraRef.current;
-        const activeControls = controlsRef.current;
-        const viewDirection = activeControls.target.clone().sub(activeCamera.position);
-        if (viewDirection.lengthSq() < 0.000001) viewDirection.set(0, 0, -1);
-
-        const turnLeft = keys.has('KeyA') || keys.has('ArrowLeft');
-        const turnRight = keys.has('KeyD') || keys.has('ArrowRight');
-        const turnInput = Number(turnLeft) - Number(turnRight);
-        if (turnInput) {
-          const turnRadians = window.THREE.MathUtils.degToRad(75 * keyboardSpeedScale) * deltaSeconds * turnInput;
-          viewDirection.applyAxisAngle(new window.THREE.Vector3(0, 1, 0), turnRadians);
-          activeControls.target.copy(activeCamera.position).add(viewDirection);
-        }
-
-        const moveForward = keys.has('KeyW') || keys.has('ArrowUp');
-        const moveBackward = keys.has('KeyS') || keys.has('ArrowDown');
-        const moveInput = Number(moveForward) - Number(moveBackward);
-        if (moveInput) {
-          const groundDirection = viewDirection.clone();
-          groundDirection.y = 0;
-          if (groundDirection.lengthSq() > 0.000001) {
-            groundDirection.normalize().multiplyScalar(cameraMoveSpeedRef.current * keyboardSpeedScale * deltaSeconds * moveInput);
-            activeCamera.position.add(groundDirection);
-            activeControls.target.add(groundDirection);
-          }
-        }
-
-        const moveUp = keys.has('KeyE');
-        const moveDown = keys.has('KeyQ');
-        const verticalInput = Number(moveUp) - Number(moveDown);
-        if (verticalInput) {
-          const verticalDistance = cameraMoveSpeedRef.current * keyboardSpeedScale * deltaSeconds * verticalInput;
-          activeCamera.position.y += verticalDistance;
-          activeControls.target.y += verticalDistance;
-        }
-
-        activeControls.update();
-        requestSceneRender();
-      }
-
-      keyboardAnimationRef.current = requestAnimationFrame(runKeyboardNavigation);
-    };
-
-    const handleCameraKeyDown = (event) => {
-      if (!supportedCameraKeys.has(event.code)) return;
-      event.preventDefault();
-      if (!keyboardKeysRef.current.size) beginInteractiveRendering();
-      keyboardKeysRef.current.add(event.code);
-      fittedViewRef.current.active = false;
-      cameraTweenTokenRef.current += 1;
-      if (camAnimRef.current != null) {
-        cancelAnimationFrame(camAnimRef.current);
-        camAnimRef.current = null;
-      }
-      if (keyboardAnimationRef.current == null) {
-        keyboardLastFrameRef.current = performance.now();
-        keyboardAnimationRef.current = requestAnimationFrame(runKeyboardNavigation);
-      }
-    };
-
-    const handleCameraKeyUp = (event) => {
-      if (!supportedCameraKeys.has(event.code)) return;
-      event.preventDefault();
-      keyboardKeysRef.current.delete(event.code);
-      if (!keyboardKeysRef.current.size) stopKeyboardNavigation();
-    };
-
-    const handleCameraBlur = () => stopKeyboardNavigation();
-    renderer.domElement.addEventListener('keydown', handleCameraKeyDown);
-    renderer.domElement.addEventListener('keyup', handleCameraKeyUp);
-    renderer.domElement.addEventListener('blur', handleCameraBlur);
-
     const handleViewerPointerDown = (event) => {
       if (event.button !== 0) return;
-      try { renderer.domElement.focus({ preventScroll: true }); } catch (e) { renderer.domElement.focus(); }
       if (!cameraRef.current || !raycasterRef.current || !window.THREE) return;
 
       const pointer = getPointerNdc(event);
       if (!pointer) return;
 
       raycasterRef.current.setFromCamera(pointer, cameraRef.current);
+
+      const clickableMarkers = markerSpritesRef.current.filter((child) => child?.userData?.isClickable);
+      const markerHits = raycasterRef.current.intersectObjects(clickableMarkers, false);
+      if (markerHits.length > 0) {
+        const hit = markerHits[0];
+        if (hit.object.userData && hit.object.userData.isClickable && hit.object.userData.record) {
+          const recordData = hit.object.userData.record;
+          setTeacherStatusModal({
+            record: recordData,
+            avatarUrl: recordData.avatar || '',
+            status: computeAttendanceStatus(recordData),
+            statusText: 'Attendance Status'
+          });
+          event.stopImmediatePropagation();
+          event.stopPropagation();
+          event.preventDefault();
+          return;
+        }
+      }
 
       if (!moveModeRef.current) return;
 
@@ -1949,7 +1486,6 @@ function ThreeDBuildingIndex() {
       };
 
       if (controlsRef.current) controlsRef.current.enabled = false;
-      beginInteractiveRendering();
       if (typeof renderer.domElement.setPointerCapture === 'function' && event.pointerId != null) {
         try { renderer.domElement.setPointerCapture(event.pointerId); } catch (e) { /* ignore */ }
       }
@@ -1984,7 +1520,6 @@ function ThreeDBuildingIndex() {
       if (!dragStateRef.current.active) return;
       stopDraggingMoveTarget();
       syncActiveUploadTransform();
-      endInteractiveRendering();
     };
 
     requestSceneRender();
@@ -2011,9 +1546,6 @@ function ThreeDBuildingIndex() {
       window.removeEventListener('pointerup', handleViewerPointerUp);
       window.removeEventListener('pointercancel', handleViewerPointerUp);
       renderer.domElement.removeEventListener('pointerdown', handleViewerPointerDown, true);
-      renderer.domElement.removeEventListener('keydown', handleCameraKeyDown);
-      renderer.domElement.removeEventListener('keyup', handleCameraKeyUp);
-      renderer.domElement.removeEventListener('blur', handleCameraBlur);
       resizeObserver?.disconnect();
       if (requestRef.current != null) cancelAnimationFrame(requestRef.current);
       requestRef.current = null;
@@ -2023,21 +1555,12 @@ function ThreeDBuildingIndex() {
       removeSceneObject(modelRef.current);
       modelRef.current = null;
       renderer.renderLists?.dispose?.();
+      if (pinRef.current) { removeSceneObject(pinRef.current); pinRef.current = null; }
+      if (labelRef.current) { removeSceneObject(labelRef.current); labelRef.current = null; }
       hideUploadAnchorButtons();
       meshMapRef.current = {};
-      meshNameCollisionsRef.current = {};
-      presenceAnchorsRef.current = {};
-      presenceMarkerRefs.current = {};
       if (mountRef.current) mountRef.current.innerHTML = '';
       controls.removeEventListener('change', requestSceneRender);
-      controls.removeEventListener('start', handleControlsStart);
-      controls.removeEventListener('end', handleControlsEnd);
-      stopKeyboardNavigation();
-      if (graphicsRestoreTimerRef.current != null) {
-        window.clearTimeout(graphicsRestoreTimerRef.current);
-        graphicsRestoreTimerRef.current = null;
-      }
-      interactiveRenderingRef.current = false;
       if (controlsRef.current?.dispose) controlsRef.current.dispose();
       if (requestRef.current != null) cancelAnimationFrame(requestRef.current);
       requestRef.current = null;
@@ -2054,15 +1577,8 @@ function ThreeDBuildingIndex() {
     if (!sceneRef.current || !window.THREE) return;
     let cancelled = false;
 
-    stopKeyboardNavigation();
     clearPendingUploadPreview();
     clearUploadedObjects();
-    presenceVersionRef.current = '';
-    presenceAnchorsRef.current = {};
-    setPresenceMarkers([]);
-    setPresenceError('');
-    setPresenceLastUpdated('');
-    setPresenceDiagnostics({ unmatched: [], duplicates: [] });
     if (modelRef.current) {
       removeSceneObject(modelRef.current);
       modelRef.current = null;
@@ -2070,8 +1586,7 @@ function ThreeDBuildingIndex() {
       requestSceneRender();
     }
     meshMapRef.current = {};
-    setSceneBusyLabel('Loading 3D model');
-    updateModelLoadProgress(0);
+    setSceneBusyLabel('Loading 3D model...');
     setStatus('loading');
     setMessage('');
 
@@ -2095,8 +1610,9 @@ function ThreeDBuildingIndex() {
         setModelHierarchy(hierarchy);
         if (hierarchy.buildings?.length) {
           const buildingNames = hierarchy.buildings.map((entry) => entry.name);
-          setCameraPresets((prev) => ({ ...defaultCameraPresets, ...prev, ...Object.fromEntries(buildingNames.map((name) => [name, prev[name] || defaultCameraPresets[name] || defaultCameraPresets.Building_PhinmaHall])) }));
+          setCameraPresets((prev) => ({ ...prev, ...defaultCameraPresets, ...Object.fromEntries(buildingNames.map((name) => [name, prev[name] || defaultCameraPresets[name] || defaultCameraPresets.Building_PhinmaHall])) }));
         }
+        centerObjectAtOrigin(object);
         updateUploadAnchorLayout(object);
         const namedCam = extractNamedCameraFromGLTF(gltf);
         if (namedCam) {
@@ -2105,27 +1621,14 @@ function ThreeDBuildingIndex() {
         }
         sceneRef.current.add(object);
         modelRef.current = object;
-        const modelBounds = new window.THREE.Box3().setFromObject(object);
-        if (!modelBounds.isEmpty()) {
-          const modelSize = modelBounds.getSize(new window.THREE.Vector3());
-          cameraMoveSpeedRef.current = Math.max(Math.max(modelSize.x, modelSize.y, modelSize.z) * 0.12, 1);
-        }
-        if (!applyCurrentBuildingFrontView(modelSrc)) {
-          frameObjectInCamera(object);
-        }
+        frameObjectInCamera(object);
         requestAnimationFrame(() => {
           syncViewerSize();
           requestSceneRender();
         });
-        updateModelLoadProgress(100);
         setStatus('ready');
       },
-      (event) => {
-        if (cancelled || !event?.lengthComputable || !event.total) return;
-        const percentage = Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100)));
-        updateModelLoadProgress(percentage);
-        if (percentage >= 100) setSceneBusyLabel('Preparing 3D building');
-      },
+      undefined,
       (error) => {
         if (cancelled) return;
         console.error(error);
@@ -2140,123 +1643,6 @@ function ThreeDBuildingIndex() {
   }, [modelSrc]);
 
   useEffect(() => {
-    const definition = getCameraModelDefinition(modelSrc);
-    if (status !== 'ready' || !definition || !modelRef.current) return undefined;
-
-    let stopped = false;
-    let controller = null;
-
-    const fetchPresence = async () => {
-      controller?.abort();
-      controller = new AbortController();
-      try {
-        const payload = await apiGet(
-          `3d-room-presence.php?building_code=${encodeURIComponent(definition.code)}`,
-          { signal: controller.signal }
-        );
-        if (stopped || controller.signal.aborted) return;
-        const markers = Array.isArray(payload?.markers) ? payload.markers : [];
-        const version = String(payload?.version || '');
-        if (version !== presenceVersionRef.current) {
-          presenceVersionRef.current = version;
-          setPresenceMarkers(markers);
-          const liveByScheduleTeacher = new Map(markers.map((marker) => [
-            `${marker.schedule_id || ''}|${marker.teacher_id || ''}`,
-            marker
-          ]));
-          setAttendanceRecords((previous) => previous.map((record) => {
-            const live = liveByScheduleTeacher.get(`${record.schedule_id || ''}|${record.user_id || record.teacher_id || ''}`);
-            if (!live) return record;
-            return {
-              ...record,
-              flag_in_id: live.flag_in_id,
-              flag_check_id: live.flag_check_id,
-              flag_out_id: live.flag_out_id,
-              time_in: live.time_in || '',
-              time_check: live.time_check || '',
-              time_out: live.time_out || '',
-              department_id: live.department_id || record.department_id,
-              department_name: live.department_name || record.department_name
-            };
-          }));
-        }
-        setPresenceLastUpdated(payload?.generated_at || new Date().toISOString());
-        setPresenceError('');
-      } catch (error) {
-        if (stopped || controller?.signal.aborted) return;
-        console.warn('Live 3D room presence unavailable:', error);
-        setPresenceError(error?.body?.message || error?.message || 'Unable to refresh teacher markers.');
-      }
-    };
-
-    fetchPresence();
-    const interval = window.setInterval(fetchPresence, 30000);
-    return () => {
-      stopped = true;
-      controller?.abort();
-      window.clearInterval(interval);
-    };
-  }, [modelSrc, status, presenceRefreshToken]);
-
-  useEffect(() => {
-    if (status !== 'ready' || !modelRef.current || !window.THREE) {
-      presenceAnchorsRef.current = {};
-      requestSceneRender();
-      return;
-    }
-
-    const anchors = {};
-    const unmatched = [];
-    const duplicates = [];
-    presenceMarkers.forEach((marker) => {
-      const key = normalizeMeshKey(marker?.room_name);
-      if (!key) return;
-      if (meshNameCollisionsRef.current[key]) {
-        duplicates.push({ room_name: marker.room_name, meshes: meshNameCollisionsRef.current[key] });
-        return;
-      }
-      const targetMesh = meshMapRef.current[key];
-      if (!targetMesh) {
-        unmatched.push(marker.room_name || `Room ${marker.room_id}`);
-        return;
-      }
-
-      const box = new window.THREE.Box3().setFromObject(targetMesh);
-      if (box.isEmpty()) {
-        unmatched.push(marker.room_name || `Room ${marker.room_id}`);
-        return;
-      }
-      const center = box.getCenter(new window.THREE.Vector3());
-      const size = box.getSize(new window.THREE.Vector3());
-      center.y = box.max.y + Math.max(size.y * 0.08, 0.35);
-      anchors[String(marker.room_id)] = center;
-    });
-
-    presenceAnchorsRef.current = anchors;
-    setPresenceDiagnostics({ unmatched, duplicates });
-    requestSceneRender();
-  }, [presenceMarkers, status, modelSrc]);
-
-  useEffect(() => {
-    const pending = pendingNavigatorRoomRef.current;
-    if (status !== 'ready' || !pending || pending.modelSrc !== modelSrc) return;
-    pendingNavigatorRoomRef.current = null;
-    const focused = focusRoomCamera(pending.roomName, () => {
-      if (pending.record) openTeacherRecordDetails(pending.record, pending.source || 'recent-log', pending.avatar || '');
-      else openRoomTeacherDetails(pending.roomName, pending.source || 'navigation');
-    });
-    if (!focused) {
-      showMissingRoomObjectAlert(pending.roomName).then(() => {
-        if (pending.record) {
-          openTeacherRecordDetails(pending.record, pending.source || 'recent-log', pending.avatar || '');
-        } else {
-          openRoomTeacherDetails(pending.roomName, pending.source || 'navigation', false);
-        }
-      });
-    }
-  }, [status, modelSrc]);
-
-  useEffect(() => {
     let active = true;
     (async () => {
       try {
@@ -2268,16 +1654,86 @@ function ThreeDBuildingIndex() {
             presets[key] = { position: value.position, target: value.target };
           }
         });
-        const nextPresets = { ...defaultCameraPresets, ...cameraPresetsRef.current, ...presets };
-        cameraPresetsRef.current = nextPresets;
-        setCameraPresets(nextPresets);
-        if (modelRef.current) applyCurrentBuildingFrontView(modelSrcRef.current);
+        setCameraPresets((prev) => ({ ...defaultCameraPresets, ...prev, ...presets }));
       } catch (error) {
         console.warn('Camera presets unavailable:', error);
       }
     })();
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (!navigatorRoom) return;
+    const roomKey = String(navigatorRoom).trim();
+    const timer = window.setTimeout(() => {
+      (async () => {
+        try {
+          const payload = await apiGet(`room-status.php?room=${encodeURIComponent(roomKey)}`);
+          setRoomStatuses((prev) => ({ ...prev, [roomKey]: payload }));
+        } catch (error) {
+          console.warn('Room status request failed:', error);
+        }
+      })();
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [navigatorRoom]);
+
+  const createTextLabel = (text) => {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const fontSize = 48;
+    ctx.font = `bold ${fontSize}px Arial`;
+    const textWidth = ctx.measureText(text).width;
+    canvas.width = textWidth + 24;
+    canvas.height = fontSize + 24;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.66)';
+    ctx.beginPath();
+    ctx.roundRect(0, 0, canvas.width, canvas.height, 10);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `bold ${fontSize}px Arial`;
+    ctx.fillText(text, 12, fontSize + 2);
+
+    const texture = new window.THREE.CanvasTexture(canvas);
+    const material = new window.THREE.SpriteMaterial({ map: texture });
+    const sprite = new window.THREE.Sprite(material);
+    sprite.scale.set(10 * (canvas.width / canvas.height), 10, 1);
+    return sprite;
+  };
+
+  const createAvatarSprite = (avatarUrl, size = 2.5) => {
+    if (!window.THREE) return null;
+    const textureLoader = new window.THREE.TextureLoader();
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#d9d9d9';
+    ctx.fillRect(0, 0, 128, 128);
+
+    const texture = new window.THREE.CanvasTexture(canvas);
+    if (avatarUrl) {
+      textureLoader.load(
+        avatarUrl,
+        (loadedTexture) => {
+          texture.copy(loadedTexture);
+          texture.needsUpdate = true;
+          requestSceneRender();
+        },
+        undefined,
+        (error) => {
+          console.warn('Avatar image failed to load:', error);
+        }
+      );
+    }
+
+    const material = new window.THREE.SpriteMaterial({ map: texture });
+    const sprite = new window.THREE.Sprite(material);
+    sprite.scale.set(size, size, 1);
+    return sprite;
+  };
 
   const extractNamedCameraFromGLTF = (gltf) => {
     if (!gltf || !gltf.scene || !window.THREE) return null;
@@ -2304,14 +1760,81 @@ function ThreeDBuildingIndex() {
     return { position, target, name: cameraNode.name };
   };
 
-  const applyView = (view) => {
-    if (!modelRef.current) return;
-    if (view !== 'top') {
-      if (applyCurrentBuildingFrontView()) return;
+  useEffect(() => {
+    if (!modelRef.current || !window.THREE || !sceneRef.current) return;
+
+    if (pinRef.current) { removeSceneObject(pinRef.current); pinRef.current = null; }
+    if (labelRef.current) { removeSceneObject(labelRef.current); labelRef.current = null; }
+    markerSpritesRef.current.forEach(sprite => removeSceneObject(sprite));
+    markerSpritesRef.current = [];
+
+    if (status !== 'ready' || !markerDataList || markerDataList.length === 0) {
+      requestSceneRender();
+      return;
     }
-    cancelCameraMotion();
-    const direction = view === 'top' ? [0, 1, 0.001] : [1, 0.45, 1];
-    frameObjectInCamera(modelRef.current, direction);
+
+    markerDataList.forEach((markerData, markerIndex) => {
+      if (!markerData) return;
+
+      const normalizedTarget = normalizeMeshKey(markerData.roomName);
+      let targetMesh = meshMapRef.current[normalizedTarget] || null;
+      if (!targetMesh) {
+        modelRef.current.traverse((child) => {
+          if (child.isMesh && normalizeMeshKey(child.name) === normalizedTarget) {
+            targetMesh = child;
+          }
+        });
+      }
+
+      if (!targetMesh) {
+        return;
+      }
+
+      const box = new window.THREE.Box3().setFromObject(targetMesh);
+      const center = box.getCenter(new window.THREE.Vector3());
+      const size = box.getSize(new window.THREE.Vector3());
+      const colorHex = markerData.color === 'red' ? 0xff4d4f : markerData.color === 'orange' ? 0xffb020 : 0x22c55e;
+      const emissiveHex = markerData.color === 'red' ? 0x5a1212 : markerData.color === 'orange' ? 0x5a3b12 : 0x114922;
+
+      const geometry = new window.THREE.SphereGeometry(size.y * 0.4, 32, 32);
+      const material = new window.THREE.MeshStandardMaterial({ color: colorHex, emissive: emissiveHex, roughness: 0.25 });
+      const pin = new window.THREE.Mesh(geometry, material);
+      pin.position.copy(center);
+      pin.position.y += size.y + 1;
+      pin.userData = { isMarker: true, record: markerData };
+      sceneRef.current.add(pin);
+      markerSpritesRef.current.push(pin);
+
+      const sprite = createTextLabel(markerData.teacherName || 'Teacher');
+      sprite.position.copy(center);
+      sprite.position.y += size.y + 4;
+      sprite.userData = { isMarker: true, record: markerData };
+      sceneRef.current.add(sprite);
+      markerSpritesRef.current.push(sprite);
+
+      if (markerData.avatarUrl) {
+        const avatarSprite = createAvatarSprite(markerData.avatarUrl, 2);
+        if (avatarSprite) {
+          avatarSprite.position.copy(center);
+          avatarSprite.position.y += size.y + 2.5;
+          avatarSprite.position.x += 1.5;
+          avatarSprite.userData = { isMarker: true, isClickable: true, record: markerData };
+          sceneRef.current.add(avatarSprite);
+          markerSpritesRef.current.push(avatarSprite);
+        }
+      }
+    });
+    requestSceneRender();
+  }, [markerDataList, status]);
+
+  const applyView = (view) => {
+    if (!cameraRef.current) return;
+    const d = 50;
+    if (view === 'top') cameraRef.current.position.set(0, d, 0);
+    else cameraRef.current.position.set(0, 20, d);
+    cameraRef.current.lookAt(0, 0, 0);
+    if (controlsRef.current) controlsRef.current.target.set(0, 0, 0);
+    requestSceneRender();
   };
 
   const rotateModel = (degrees) => {
@@ -2321,11 +1844,19 @@ function ThreeDBuildingIndex() {
     requestSceneRender();
   };
 
-  const handleDefaultView = () => {
-    if (!applyCurrentBuildingFrontView() && modelRef.current) {
-      cancelCameraMotion();
-      frameObjectInCamera(modelRef.current, [1, 0.45, 1]);
-    }
+  const handleResetView = () => {
+    applyView('front');
+    setFocusedRoom('');
+    setRoomModal(null);
+    setViewButtonVisible(false);
+    focusedRoomCenterRef.current = null;
+  };
+
+  const clearViewFocus = () => {
+    setFocusedRoom('');
+    setViewButtonVisible(false);
+    setRoomModal(null);
+    focusedRoomCenterRef.current = null;
   };
 
   const showSwal = async ({ title, text, icon = 'info' }) => {
@@ -2333,83 +1864,6 @@ function ThreeDBuildingIndex() {
       await window.Swal.fire({ title, text, icon });
     } else {
       alert(`${title}\n${text}`);
-    }
-  };
-
-  const showMissingRoomObjectAlert = async (roomName) => {
-    if (!applyCurrentBuildingFrontView() && modelRef.current) {
-      cancelCameraMotion();
-      frameObjectInCamera(modelRef.current, [1, 0.45, 1]);
-    }
-    requestSceneRender();
-    await showSwal({
-      title: '3D Room Object Missing',
-      text: `The building model is displayed, but database room "${roomName}" has no matching renamed room object in this 3D model.`,
-      icon: 'warning'
-    });
-  };
-
-  const handleSaveFrontView = async () => {
-    if (!canSaveFrontView || isSavingFrontView) return;
-    const definition = getCameraModelDefinition();
-    if (!definition || !cameraRef.current || !controlsRef.current || status !== 'ready') {
-      await showSwal({
-        title: 'Camera Not Ready',
-        text: 'Wait for one of the four building models to finish loading.',
-        icon: 'warning'
-      });
-      return;
-    }
-
-    let confirmed = true;
-    if (window.Swal) {
-      const result = await window.Swal.fire({
-        title: `Save ${definition.code} Front View?`,
-        text: 'The current camera position will become the default view for all users.',
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonText: 'Save Front View',
-        confirmButtonColor: '#198754'
-      });
-      confirmed = !!result.isConfirmed;
-    } else {
-      confirmed = window.confirm(`Save the current camera as the global ${definition.code} front view?`);
-    }
-    if (!confirmed) return;
-
-    const roundVector = (vector) => vector.toArray().map((value) => Number(value.toFixed(4)));
-    const position = roundVector(cameraRef.current.position);
-    const target = roundVector(controlsRef.current.target);
-
-    setIsSavingFrontView(true);
-    try {
-      const response = await apiPost('camera-positions.php', {
-        building_code: definition.code,
-        position,
-        target
-      });
-      const preset = response?.preset || { position, target };
-      const nextPresets = {
-        ...cameraPresetsRef.current,
-        [definition.cameraKey]: preset,
-        [definition.aliasKey]: preset
-      };
-      cameraPresetsRef.current = nextPresets;
-      setCameraPresets(nextPresets);
-      await showSwal({
-        title: 'Front View Saved',
-        text: `${definition.code} will now open at this camera position for all users.`,
-        icon: 'success'
-      });
-    } catch (error) {
-      console.error('Unable to save front camera view:', error);
-      await showSwal({
-        title: 'Save Failed',
-        text: error?.body?.message || error?.message || 'Unable to save the camera position.',
-        icon: 'error'
-      });
-    } finally {
-      setIsSavingFrontView(false);
     }
   };
 
@@ -2542,7 +1996,7 @@ function ThreeDBuildingIndex() {
 
     setMessage('');
     setIsUploadBusy(true);
-    setSceneBusyLabel(`Importing ${file.name}`);
+    setSceneBusyLabel(`Importing ${file.name}...`);
 
     try {
       const object = await parseUploadedModelFile(file, ext);
@@ -2572,7 +2026,7 @@ function ThreeDBuildingIndex() {
       setMessage(error?.message || `Failed to import "${file.name}".`);
     } finally {
       setIsUploadBusy(false);
-      setSceneBusyLabel('Loading 3D model');
+      setSceneBusyLabel('Loading 3D model...');
       filePickerActiveRef.current = false;
       event.target.value = '';
     }
@@ -2621,6 +2075,9 @@ function ThreeDBuildingIndex() {
     const box = new window.THREE.Box3().setFromObject(targetMesh);
     const center = box.getCenter(new window.THREE.Vector3());
     const size = box.getSize(new window.THREE.Vector3());
+    const anchor = center.clone();
+    anchor.y += Math.max(size.y * 0.6, 0.5);
+    focusedRoomCenterRef.current = anchor;
     const maxDim = Math.max(size.x, size.y, size.z);
     const fov = cameraRef.current.fov * (Math.PI / 180);
     let distance = Math.abs(maxDim / 2 / Math.tan(fov / 2));
@@ -2632,26 +2089,65 @@ function ThreeDBuildingIndex() {
     return true;
   };
 
-  const handleNavigatorBuildingSelect = async (buildingName) => {
+  const getRoomMeta = (roomName) => {
+    const room = (catalog.rooms || []).find(r => nameEq(r.room_name, roomName)) || null;
+    const building = room
+      ? (catalog.buildings || []).find(b => String(b.building_id) === String(room.building_id))
+      : null;
+    const floor = room
+      ? (catalog.floors || []).find(f => String(f.floor_id) === String(room.floor_id))
+      : null;
+    return {
+      roomName,
+      buildingName: building?.building_name || pendingFilters.building || '-',
+      floorName: floor?.floor_name || pendingFilters.floor || '-'
+    };
+  };
+
+  const getLogRoomMeta = (log) => {
+    const roomName = String(log?.roomName || log?.record?.room_name || '').trim();
+    const catalogMeta = getRoomMeta(roomName);
+    return {
+      roomName,
+      buildingName: log?.buildingName || log?.record?.building_name || catalogMeta.buildingName,
+      floorName: log?.floorName || log?.record?.floor_name || catalogMeta.floorName
+    };
+  };
+
+  const handleViewRoom = (roomName) => {
+    if (roomName) setFocusedRoom(roomName);
+    focusRoomCamera(roomName);
+    setRoomModal(getRoomMeta(roomName));
+  };
+
+  const showRoomStatusModal = (roomName, source = 'navigator') => {
+    const roomKey = String(roomName || '').trim();
+    if (!roomKey) return;
+    setNavigatorRoom(roomKey);
+    setTeacherStatusModal({
+      record: {
+        teacher_name: roomStatuses?.[roomKey]?.teacher_name || 'Teacher',
+        room_name: roomKey,
+        subject: roomStatuses?.[roomKey]?.subject || '',
+        scheduled_time: roomStatuses?.[roomKey]?.scheduled_time || '',
+        status: roomStatuses?.[roomKey]?.status || 'NO_CLASS'
+      },
+      avatarUrl: roomStatuses?.[roomKey]?.photo || '',
+      status: roomStatuses?.[roomKey]?.status || 'NO_CLASS',
+      statusText: roomStatuses?.[roomKey]?.status || 'No class scheduled',
+      source
+    });
+  };
+
+  const handleNavigatorBuildingSelect = (buildingName) => {
     const clean = String(buildingName || '').trim();
     if (!clean) return;
     setNavigatorBuilding(clean);
     setNavigatorFloor('');
     setNavigatorRoom('');
     const mappedModel = getBuildingModelSrc(clean);
-    if (!mappedModel) {
-      await showSwal({
-        title: 'Building Model Not Found',
-        text: `No 3D building model is mapped to "${clean}".`,
-        icon: 'warning'
-      });
-      return;
-    }
-    if (getCameraModelDefinition(mappedModel)?.code !== getCameraModelDefinition(modelSrc)?.code) {
+    if (mappedModel !== modelSrc) {
       setModelSrc(mappedModel);
-      setBuildingExplorerOpen(false);
-      setRoomListOpen(true);
-      return;
     }
     focusBuildingCamera(clean, () => {
       setBuildingExplorerOpen(false);
@@ -2666,7 +2162,7 @@ function ThreeDBuildingIndex() {
     setNavigatorRoom('');
   };
 
-  const handleNavigatorRoomSelect = async (roomName) => {
+  const handleNavigatorRoomSelect = (roomName) => {
     const clean = String(roomName || '').trim();
     if (!clean) return;
 
@@ -2684,18 +2180,16 @@ function ThreeDBuildingIndex() {
     setNavigatorFloor(inferredFloor || navigatorFloor || '');
     setNavigatorRoom(clean);
 
-    const mappedModel = getBuildingModelSrc(inferredBuilding || navigatorBuilding);
-    const currentCode = getCameraModelDefinition(modelSrc)?.code;
-    const destinationCode = getCameraModelDefinition(mappedModel)?.code;
-    if (mappedModel && destinationCode && destinationCode !== currentCode) {
-      pendingNavigatorRoomRef.current = { roomName: clean, modelSrc: mappedModel };
+    const mappedModel = getBuildingModelSrc(inferredBuilding || navigatorBuilding || clean);
+    if (mappedModel !== modelSrc) {
       setModelSrc(mappedModel);
-      return;
     }
 
-    if (!focusRoomCamera(clean, () => openRoomTeacherDetails(clean, 'navigation'))) {
-      await showMissingRoomObjectAlert(clean);
-      openRoomTeacherDetails(clean, 'navigation', false);
+    if (focusRoomCamera(clean)) {
+      window.clearTimeout(roomSelectionTimerRef.current);
+      roomSelectionTimerRef.current = window.setTimeout(() => {
+        showRoomStatusModal(clean, 'navigation');
+      }, 3000);
     }
   };
 
@@ -2710,6 +2204,10 @@ function ThreeDBuildingIndex() {
       return;
     }
 
+    const meta = getLogRoomMeta(log);
+    setRoomModal(null);
+    setFocusedRoom(roomName);
+    setViewButtonVisible(false);
     setPendingFilters((prev) => ({
       ...prev,
       campus: log.campusName || prev.campus || '',
@@ -2718,33 +2216,25 @@ function ThreeDBuildingIndex() {
       room: roomName
     }));
 
-    const mappedModel = getBuildingModelSrc(log.buildingName || log.record?.building_name || '');
-    const currentCode = getCameraModelDefinition(modelSrc)?.code;
-    const destinationCode = getCameraModelDefinition(mappedModel)?.code;
-    if (mappedModel && destinationCode && destinationCode !== currentCode) {
-      pendingNavigatorRoomRef.current = {
-        roomName,
-        modelSrc: mappedModel,
-        record: log.record,
-        avatar: log.avatar,
-        source: 'recent-log'
-      };
-      setModelSrc(mappedModel);
-      return;
-    }
-
     const ok = focusRoomCamera(roomName, () => {
-      openTeacherRecordDetails(log.record, 'recent-log', log.avatar);
+      setViewButtonVisible(true);
+      setRoomModal(meta);
     });
 
     if (!ok) {
-      await showMissingRoomObjectAlert(roomName);
-      openTeacherRecordDetails(log.record, 'recent-log', log.avatar);
+      setFocusedRoom('');
+      setViewButtonVisible(false);
+      await showSwal({
+        title: 'Room Not Found',
+        text: `Room "${roomName}" was not found in the 3D model.`,
+        icon: 'warning'
+      });
     }
   };
 
   const applyFilterView = async () => {
     setAppliedFilters({ ...pendingFilters });
+    setViewButtonVisible(false);
     const hasAttendance = attendanceRecords.some(r => recordMatchesFilter(r, pendingFilters));
     const hasCatalog = (() => {
       if (pendingFilters.room) return roomOptions.includes(pendingFilters.room);
@@ -2767,19 +2257,35 @@ function ThreeDBuildingIndex() {
       if (camData.position) {
         const lookAtPos = camData.target || new window.THREE.Vector3(0, 0, 0);
         smoothCameraTo(camData.position, lookAtPos, 800);
+        setFocusedRoom('');
         return;
       }
     }
 
     if (pendingFilters.room) {
-      const ok = focusRoomCamera(pendingFilters.room);
+      const ok = focusRoomCamera(pendingFilters.room, () => setViewButtonVisible(true));
+      setFocusedRoom(ok ? pendingFilters.room : '');
       if (!ok) {
-        await showMissingRoomObjectAlert(pendingFilters.room);
-        openRoomTeacherDetails(pendingFilters.room, 'filter', false);
+        await showSwal({
+          title: 'Room Not Found',
+          text: `Room "${pendingFilters.room}" was not found in the 3D model.`,
+          icon: 'error'
+        });
       }
     } else {
+      setFocusedRoom('');
     }
   };
+
+  const roomSchedules = useMemo(() => {
+    if (!roomModal?.roomName) return [];
+    const targetDate = String(selectedScheduleDate || '').trim();
+    return attendanceRecords.filter((r) => {
+      if (!nameEq(r.room_name, roomModal.roomName)) return false;
+      if (!targetDate) return true;
+      return String(r.date || '').slice(0, 10) === targetDate;
+    });
+  }, [attendanceRecords, roomModal?.roomName, selectedScheduleDate]);
 
   const selectedLogDate = (() => {
     const key = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
@@ -2795,171 +2301,14 @@ function ThreeDBuildingIndex() {
     .replace(' ', '')}`;
   const isSceneBusy = status === 'loading' || isUploadBusy;
   const hasMovableUpload = !!activeUploadTransform;
-  const presenceLastUpdatedLabel = presenceLastUpdated
-    ? new Date(presenceLastUpdated).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-    : 'Not updated';
-  const getPresenceAvatarUrl = (marker) => marker?.avatar_url
-    ? resolveApiAssetUrl(marker.avatar_url)
-    : defaultAvatarSrc;
-  const setPresenceMarkerRef = (roomId, node) => {
-    const key = String(roomId);
-    if (node) presenceMarkerRefs.current[key] = node;
-    else delete presenceMarkerRefs.current[key];
-  };
-  const openTeacherRecordDetails = (rawRecord, source = 'record', avatarOverride = '') => {
-    if (!rawRecord) return;
-    const record = rawRecord.room_name ? rawRecord : normalizeRecord(rawRecord);
-    const statusValue = record.status || computeAttendanceStatus(record);
-    const parallelSchedules = record.is_parallel
-      ? (record.parallel_rooms || []).map((roomName) => ({ room_name: roomName }))
-      : getParallelSchedules(record);
-    setModalScheduleDate(normalizeDateKey(record.date) || normalizeDateKey(selectedScheduleDate) || toLocalYmd());
-    setSearchTeacher(record.teacher_name || '');
-    setSelectedDepartment('');
-    setTeacherStatusModal({
-      record: {
-        ...record,
-        teacher_name: record.teacher_name || 'Teacher',
-        room_name: record.room_name || '-',
-        subject: record.subject || `${record.subject_code || ''} ${record.subject_name || ''}`.trim(),
-        scheduled_time: record.scheduled_time || `${formatClock(record.start_time)} - ${formatClock(record.end_time)}`,
-        is_parallel: !!record.is_parallel || parallelSchedules.length > 1,
-        parallel_rooms: record.parallel_rooms || parallelSchedules.map((item) => item.room_name).filter(Boolean)
-      },
-      teacherId: record.teacher_id || record.user_id || '',
-      avatarUrl: avatarOverride || record.avatar || '',
-      status: statusValue,
-      attendanceStatus: record.attendance_status || statusValue,
-      statusText: statusValue,
-      source
-    });
-  };
-  const openPresenceMarkerDetails = (marker) => {
-    openTeacherRecordDetails(marker, 'live-presence', getPresenceAvatarUrl(marker));
-  };
-  const openRoomTeacherDetails = (roomName, source = 'navigation', notifyIfEmpty = true) => {
-    const liveMarker = visiblePresenceMarkers.find((marker) => nameEq(marker.room_name, roomName));
-    if (liveMarker) {
-      openPresenceMarkerDetails(liveMarker);
-      return true;
-    }
-    const dateKey = normalizeDateKey(selectedScheduleDate) || toLocalYmd();
-    const roomRecords = attendanceRecords.filter((record) => (
-      nameEq(record.room_name, roomName) && normalizeDateKey(record.date) === dateKey
-    ));
-    if (roomRecords.length > 0) {
-      const now = new Date();
-      const activeRecord = roomRecords.find((record) => {
-        const start = toDateTime(record.date, record.start_time);
-        const end = toDateTime(record.date, record.end_time);
-        return start && end && now >= start && now <= end;
-      });
-      openTeacherRecordDetails(activeRecord || roomRecords[0], source);
-      return true;
-    }
-    setModalScheduleDate(normalizeDateKey(selectedScheduleDate) || toLocalYmd());
-    setSearchTeacher('');
-    setSelectedDepartment('');
-    setTeacherStatusModal({
-      record: {
-        room_name: roomName || 'Room',
-        teacher_name: '',
-        subject: '',
-        section_name: '',
-        scheduled_time: '',
-        no_records: true
-      },
-      teacherId: '',
-      avatarUrl: '',
-      status: 'PENDING',
-      attendanceStatus: 'PENDING',
-      statusText: 'PENDING',
-      source,
-      notifyIfEmpty
-    });
-    return true;
-  };
-  const presenceBadgeClass = (value) => String(value || 'PENDING').toLowerCase().replace(/_/g, '-');
-  const presenceFlagLabel = (value) => {
-    const flagId = Number(value || 1);
-    if (flagId === 2) return 'Present';
-    if (flagId === 3) return 'Absent';
-    if (flagId === 4) return 'Substituted';
-    if (flagId === 5) return 'Late';
-    if (flagId === 7) return 'On leave';
-    if (flagId === 8) return 'Pending';
-    return 'Upcoming';
-  };
-  const formatPresenceCheckpoint = (value) => {
-    if (!value) return 'Not recorded';
-    const date = new Date(String(value).replace(' ', 'T'));
-    if (!Number.isNaN(date.getTime())) {
-      return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    }
-    return String(value);
-  };
-  const formatPresenceCheckpointDetail = (time, flagId) => (
-    `${presenceFlagLabel(flagId)} - ${formatPresenceCheckpoint(time)}`
-  );
-
-  const modalSourceRecords = (normalizeDateKey(modalScheduleDate) || toLocalYmd())
-    === (normalizeDateKey(selectedScheduleDate) || toLocalYmd())
-    ? attendanceRecords
-    : modalAttendanceRecords;
-
-  const modalRoomSchedules = useMemo(() => {
-    if (!teacherStatusModal) return [];
-    const roomName = String(teacherStatusModal.record?.room_name || '').trim();
-    const dateKey = normalizeDateKey(modalScheduleDate) || toLocalYmd();
-    return modalSourceRecords
-      .filter((record) => normalizeDateKey(record.date) === dateKey)
-      .filter((record) => !roomName || nameEq(record.room_name, roomName))
-      .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
-      .sort((left, right) => String(left.start_time || '').localeCompare(String(right.start_time || '')));
-  }, [teacherStatusModal, modalSourceRecords, modalScheduleDate, selectedDepartment, canSaveFrontView]);
-
-  const modalTeacherOptions = useMemo(() => uniqueValues(
-    modalSourceRecords
-      .filter((record) => normalizeDateKey(record.date) === (normalizeDateKey(modalScheduleDate) || toLocalYmd()))
-      .filter((record) => !teacherStatusModal?.record?.room_name || nameEq(record.room_name, teacherStatusModal.record.room_name))
-      .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
-      .map((record) => record.teacher_name)
-  ), [modalSourceRecords, modalScheduleDate, selectedDepartment, teacherStatusModal, canSaveFrontView]);
-
-  const modalDepartmentOptions = useMemo(() => uniqueValues(
-    modalSourceRecords.map((record) => record.department_name)
-  ).sort(), [modalSourceRecords]);
-
-  const modalRecentAttendance = useMemo(() => {
-    const teacherQuery = String(searchTeacher || '').trim().toLowerCase();
-    return modalRoomSchedules
-      .filter((record) => !teacherQuery || String(record.teacher_name || '').toLowerCase().includes(teacherQuery))
-      .flatMap((record, recordIndex) => ([
-        { key: `${record.schedule_id || recordIndex}-in`, label: 'Check in', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'in'), time: record.time_in },
-        { key: `${record.schedule_id || recordIndex}-mid`, label: 'Mid-check', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'mid'), time: record.time_check },
-        { key: `${record.schedule_id || recordIndex}-out`, label: 'Check out', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'out'), time: record.time_out }
-      ]))
-      .sort((left, right) => {
-    if (!left.time && !right.time) return 0;
-    if (!left.time) return 1;
-    if (!right.time) return -1;
-    return String(right.time).localeCompare(String(left.time));
-      });
-  }, [modalRoomSchedules, searchTeacher]);
-
-  const modalSelectedDate = modalDateParts(modalScheduleDate);
 
   return (
     <div className="tdb-page">
       <div className="tdb-shell">
-        <div className="tdb-main" ref={mainPanelRef}>
+        <div className="tdb-main">
           <div className="tdb-top-row">
             <h2 className="tdb-title">3D Building Viewer</h2>
             <div className="tdb-stats">
-              <div className="tdb-stat-card">
-                <div className="tdb-stat-label">OTHER (UPCOMING, PENDING, ETC...)</div>
-                <div className="tdb-stat-value">{stats.totalOther}</div>
-              </div>
               <div className="tdb-stat-card">
                 <div className="tdb-stat-label">TOTAL PRESENT</div>
                 <div className="tdb-stat-value">{stats.totalPresent}</div>
@@ -2974,6 +2323,7 @@ function ThreeDBuildingIndex() {
               </div>
             </div>
           </div>
+
 
           <div
             className={`tdb-viewer-wrap${isFullscreen ? ' tdb-viewer-wrap--fullscreen' : ''}`}
@@ -3012,76 +2362,6 @@ function ThreeDBuildingIndex() {
             )}
 
             <div className="tdb-viewer" ref={mountRef} />
-            <div className="tdb-presence-layer">
-              {presenceMarkersVisible && visiblePresenceMarkers.map((marker) => (
-                <button
-                  key={`${marker.room_id}-${marker.schedule_id}-${marker.teacher_id}`}
-                  type="button"
-                  className={`tdb-presence-marker tdb-presence-marker--${String(marker.status || 'PENDING').toLowerCase()}`}
-                  ref={(node) => setPresenceMarkerRef(marker.room_id, node)}
-                  onClick={() => openPresenceMarkerDetails(marker)}
-                  title={`${marker.teacher_name} · ${marker.room_name} · ${marker.status}`}
-                  aria-label={`Open ${marker.teacher_name} attendance details for ${marker.room_name}`}
-                >
-                  <img
-                    src={getPresenceAvatarUrl(marker)}
-                    alt=""
-                    width="48"
-                    height="48"
-                    loading="lazy"
-                    decoding="async"
-                    onError={(event) => {
-                      if (event.currentTarget.src !== defaultAvatarSrc) event.currentTarget.src = defaultAvatarSrc;
-                    }}
-                  />
-                  {marker.is_substitute && <span className="tdb-presence-sub-badge" aria-label="Substitute">S</span>}
-                  {marker.is_parallel && <span className="tdb-presence-parallel-badge" aria-label="Parallel class">P</span>}
-                  <span className="tdb-presence-marker-name">{marker.teacher_name}</span>
-                </button>
-              ))}
-            </div>
-
-            <div className="tdb-presence-toolbar">
-              <button
-                type="button"
-                className={`tdb-presence-toggle${presenceMarkersVisible ? ' tdb-presence-toggle--active' : ''}`}
-                onClick={() => setPresenceMarkersVisible((value) => !value)}
-              >
-                {presenceMarkersVisible ? 'Hide teachers' : 'Show teachers'}
-              </button>
-              <span className="tdb-presence-updated">Updated {presenceLastUpdatedLabel}</span>
-              {presenceError && (
-                <button type="button" className="tdb-presence-retry" onClick={() => setPresenceRefreshToken((value) => value + 1)}>
-                  Retry
-                </button>
-              )}
-            </div>
-
-            {presenceMarkersVisible && (
-              <div className="tdb-presence-legend" aria-label="Teacher marker legend">
-                <span><i className="tdb-presence-dot tdb-presence-dot--present" />Present</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--late" />Late</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--absent" />Absent</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--pending" />Pending</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--on_leave" />Leave</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--substituted" />Substitute</span>
-              </div>
-            )}
-
-            {canSaveFrontView && (presenceDiagnostics.unmatched.length > 0 || presenceDiagnostics.duplicates.length > 0) && (
-              <details className="tdb-presence-diagnostics">
-                <summary>Marker mapping: {presenceDiagnostics.unmatched.length} unmatched, {presenceDiagnostics.duplicates.length} duplicate</summary>
-                {presenceDiagnostics.unmatched.length > 0 && (
-                  <div>Unmatched: {presenceDiagnostics.unmatched.join(', ')}</div>
-                )}
-                {presenceDiagnostics.duplicates.length > 0 && (
-                  <div>Duplicate: {presenceDiagnostics.duplicates.map((item) => item.room_name).join(', ')}</div>
-                )}
-              </details>
-            )}
-
-            {presenceError && <div className="tdb-presence-error">{presenceError}</div>}
-            <div className="tdb-keyboard-hint">Click the 3D view · WASD/arrows move · Q down · E up</div>
 
             <button
               type="button"
@@ -3157,8 +2437,14 @@ function ThreeDBuildingIndex() {
                         <button
                           key={`${roomName}-${idx}`}
                           type="button"
-                          className="tdb-room-list-item"
+                          className={`tdb-room-list-item ${selectedRoom?.roomName === roomName ? 'tdb-room-list-item--selected' : ''}`}
                           onClick={() => {
+                            setSelectedRoom({
+                              roomName,
+                              roomData: room,
+                              buildingId: room.building_id,
+                              floorId: room.floor_id
+                            });
                             handleNavigatorRoomSelect(roomName);
                           }}
                         >
@@ -3195,36 +2481,7 @@ function ThreeDBuildingIndex() {
             ))}
 
             <div className="tdb-side-controls">
-              <label className="tdb-graphics-control">
-                <span>Graphics</span>
-                <select
-                  value={graphicsMode}
-                  onChange={(event) => setGraphicsMode(event.target.value === 'high' ? 'high' : 'performance')}
-                  aria-label="3D graphics quality"
-                >
-                  <option value="performance">Performance</option>
-                  <option value="high">High Detail</option>
-                </select>
-              </label>
-              <button
-                type="button"
-                className="btn btn-sm tdb-default-view-btn"
-                onClick={handleDefaultView}
-                title="Return to this building's saved front view"
-              >
-                Default View
-              </button>
-              {canSaveFrontView && (
-                <button
-                  type="button"
-                  className="btn btn-sm tdb-save-front-btn"
-                  onClick={handleSaveFrontView}
-                  disabled={status !== 'ready' || isSavingFrontView || !getCameraModelDefinition()}
-                  title="Save the current camera as this building's global front view"
-                >
-                  {isSavingFrontView ? 'Saving Front...' : 'Save Front View'}
-                </button>
-              )}
+              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleResetView}>Reset View</button>
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => applyView('top')}>Top View</button>
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => rotateModel(45)}>Rotate</button>
               <button
@@ -3301,45 +2558,8 @@ function ThreeDBuildingIndex() {
 
             {isSceneBusy && (
               <div className="tdb-loading-overlay" role="status" aria-live="polite">
-                {status === 'loading' ? (
-                  <div
-                    className="tdb-loading-meter"
-                    ref={modelLoadMeterRef}
-                    role="progressbar"
-                    aria-label="3D building loading progress"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    aria-valuenow="0"
-                  >
-                    <svg className="tdb-loading-meter-svg" viewBox="0 0 120 120" aria-hidden="true">
-                      <circle className="tdb-loading-meter-track" cx="60" cy="60" r="49" />
-                      <circle
-                        className="tdb-loading-meter-fill"
-                        cx="60"
-                        cy="60"
-                        r="49"
-                        pathLength="100"
-                        ref={modelLoadFillRef}
-                        style={{ strokeDashoffset: 100 }}
-                      />
-                    </svg>
-                    <div
-                      className="tdb-loading-meter-value"
-                      style={{ color: '#ffffff', WebkitTextFillColor: '#ffffff' }}
-                    >
-                      <strong ref={modelLoadValueRef}>0</strong>
-                      <span>%</span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="tdb-loading-spinner" />
-                )}
-                <div className="tdb-loading-text">
-                  {sceneBusyLabel}
-                  <span className="tdb-loading-dots" aria-hidden="true">
-                    <span>.</span><span>.</span><span>.</span>
-                  </span>
-                </div>
+                <div className="tdb-loading-spinner" />
+                <div className="tdb-loading-text">{sceneBusyLabel}</div>
               </div>
             )}
 
@@ -3368,193 +2588,117 @@ function ThreeDBuildingIndex() {
               </div>
             )}
 
+            {focusedRoom && viewButtonVisible && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm tdb-view-room-btn"
+                onClick={() => handleViewRoom(focusedRoom)}
+                ref={viewBtnRef}
+              >
+                View Room
+              </button>
+            )}
+
+            {markerData && (
+              <div
+                className="tdb-active-class"
+                style={{ borderColor: markerData.color === 'red' ? '#dc3545' : markerData.color === 'orange' ? '#f59e0b' : '#198f54' }}
+              >
+                <div className="tdb-active-title">ACTIVE CLASS</div>
+                <div className="tdb-active-room">{markerData.roomName || '-'}</div>
+                <div className="tdb-active-teacher">{markerData.teacherName || '-'}</div>
+                <div
+                  className="tdb-active-status"
+                  style={{ color: markerData.color === 'red' ? '#f8d7da' : markerData.color === 'orange' ? '#fde68a' : '#d1fae5' }}
+                >
+                  {markerData.statusText}
+                </div>
+              </div>
+            )}
+
+            {!markerData && status === 'ready' && (
+              <div className="tdb-note tdb-note-idle">Waiting for active check-in...</div>
+            )}
+
             {message && <div className="tdb-note tdb-note-error">{message}</div>}
+
+            {roomModal && (
+              <div className="tdb-modal-backdrop" onClick={() => setRoomModal(null)}>
+                <div className="tdb-modal-card" onClick={(e) => e.stopPropagation()}>
+                  <div className="tdb-modal-title">{roomModal.roomName}</div>
+                  <div className="tdb-modal-meta">Building: {roomModal.buildingName}</div>
+                  <div className="tdb-modal-meta">Floor: {roomModal.floorName}</div>
+                  <div className="tdb-modal-date-row">
+                    <label htmlFor="tdb-modal-date" className="tdb-modal-date-label">Schedule Date</label>
+                    <input
+                      id="tdb-modal-date"
+                      type="date"
+                      className="form-control form-control-sm tdb-modal-date-input"
+                      value={selectedScheduleDate}
+                      onChange={(e) => setSelectedScheduleDate(e.target.value || toLocalYmd())}
+                    />
+                  </div>
+                  <div className="tdb-modal-sched-title">Schedules</div>
+                  <div className="tdb-modal-sched-list">
+                    {roomSchedules.length === 0 ? (
+                      <div className="tdb-modal-empty">No schedules found for this room.</div>
+                    ) : (
+                      roomSchedules.map((rec, idx) => (
+                        <div key={`${rec.room_name}-${rec.date}-${idx}`} className="tdb-modal-sched-item">
+                          <div className="tdb-modal-sched-room">{rec.teacher_name || 'Teacher'}</div>
+                          <div className="tdb-modal-sched-meta">{rec.date || '-'} | {formatClock(rec.start_time)} - {formatClock(rec.end_time)}</div>
+                          <div className="tdb-modal-sched-meta">Status: {computeAttendanceStatus(rec)}</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div className="tdb-modal-actions">
+                    <button type="button" className="btn btn-success btn-sm" onClick={() => setRoomModal(null)}>Close</button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {teacherStatusModal && (
               <div className="tdb-teacher-status-backdrop" onClick={() => setTeacherStatusModal(null)}>
                 <div className="tdb-teacher-status-card" onClick={(e) => e.stopPropagation()}>
                   <div className="tdb-teacher-status-header">
-                    <div className="tdb-teacher-room-icon" aria-hidden="true">
-                      ROOM
+                    <div className="tdb-teacher-status-avatar">
+                      <img
+                        src={teacherStatusModal.avatarUrl || defaultAvatarSrc}
+                        alt={teacherStatusModal.record?.teacher_name || 'Teacher'}
+                        onError={(e) => {
+                          if (e.currentTarget.src !== defaultAvatarSrc) {
+                            e.currentTarget.src = defaultAvatarSrc;
+                          }
+                        }}
+                      />
                     </div>
                     <div className="tdb-teacher-status-info">
-                      <div className="tdb-teacher-status-room-label">Room attendance</div>
-                      <div className="tdb-teacher-status-name">{teacherStatusModal.record?.room_name || 'Room'}</div>
-                      <div className="tdb-teacher-status-room">Schedules and attendance checkpoints</div>
+                      <div className="tdb-teacher-status-name">
+                        {teacherStatusModal.record?.teacher_name || 'Teacher'}
+                      </div>
+                      <div className="tdb-teacher-status-room">
+                        {teacherStatusModal.record?.room_name || '-'}
+                      </div>
+                      <div style={{ marginTop: '8px' }}>
+                        <span className={`tdb-teacher-status-badge tdb-teacher-status-badge--${
+                          teacherStatusModal.status === 'PRESENT' ? 'present' :
+                          teacherStatusModal.status === 'LATE' ? 'late' : 'absent'
+                        }`}>
+                          {teacherStatusModal.status}
+                        </span>
+                      </div>
                     </div>
+                  </div>
+                  <div className="tdb-teacher-status-actions">
                     <button
                       type="button"
-                      className="tdb-teacher-status-close"
+                      className="btn btn-success btn-sm"
                       onClick={() => setTeacherStatusModal(null)}
-                      aria-label="Close teacher details"
                     >
-                      &times;
+                      Close
                     </button>
-                  </div>
-                  <div className="tdb-teacher-schedule-block">
-                    <div className="tdb-teacher-modal-columns">
-                      <div className="tdb-teacher-modal-column">
-                        <h4>Room schedules</h4>
-                        <div className="tdb-modal-date-context" aria-label={`${modalSelectedDate.day}, ${modalSelectedDate.date}`}>
-                          <span className="tdb-modal-date-day">{modalSelectedDate.day}</span>
-                          <span className="tdb-modal-date-full">{modalSelectedDate.date}</span>
-                        </div>
-                        <div className="tdb-teacher-modal-filters">
-                          <div className="tdb-field">
-                            <label htmlFor="tdb-modal-filter-date">Date</label>
-                            <input
-                              id="tdb-modal-filter-date"
-                              type="date"
-                              className="form-control form-control-sm"
-                              value={modalScheduleDate}
-                              onChange={(event) => {
-                                setModalScheduleDate(event.target.value || toLocalYmd());
-                                setSelectedDepartment('');
-                                setSearchTeacher('');
-                              }}
-                            />
-                          </div>
-                          {canSaveFrontView && (
-                            <div className="tdb-field">
-                              <label htmlFor="tdb-modal-filter-department">Department</label>
-                              <select
-                                id="tdb-modal-filter-department"
-                                className="form-select form-select-sm"
-                                value={selectedDepartment}
-                                onChange={(event) => setSelectedDepartment(event.target.value)}
-                              >
-                                <option value="">All departments</option>
-                                {modalDepartmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
-                              </select>
-                            </div>
-                          )}
-                          <div className="tdb-field">
-                            <label htmlFor="tdb-modal-filter-teacher">Teacher</label>
-                            <input
-                              id="tdb-modal-filter-teacher"
-                              type="search"
-                              list="tdb-modal-teacher-options"
-                              className="form-control form-control-sm"
-                              placeholder="Filter attendance"
-                              value={searchTeacher}
-                              onChange={(event) => setSearchTeacher(event.target.value)}
-                            />
-                            <datalist id="tdb-modal-teacher-options">
-                              {modalTeacherOptions.map((teacher) => <option key={teacher} value={teacher} />)}
-                            </datalist>
-                          </div>
-                        </div>
-                        <div className="tdb-teacher-schedule-list">
-                          {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading records for the selected date...</div>
-                          ) : modalRecordsError ? (
-                            <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
-                          ) : modalRoomSchedules.length > 0 ? modalRoomSchedules.map((schedule, index) => {
-                            const parallelRows = getParallelSchedules(schedule, modalSourceRecords);
-                            return (
-                              <div className="tdb-teacher-schedule-item" key={`${schedule.schedule_id || index}-${schedule.room_name}`}>
-                                <div>
-                                  <strong>{formatClock(schedule.start_time)} - {formatClock(schedule.end_time)}</strong>
-                                </div>
-                                <div className="tdb-teacher-schedule-person">
-                                  <img
-                                    src={schedule.avatar || (nameEq(schedule.teacher_name, teacherStatusModal.record?.teacher_name) ? teacherStatusModal.avatarUrl : '') || defaultAvatarSrc}
-                                    alt={schedule.teacher_name || 'Teacher'}
-                                    onError={(event) => {
-                                      if (event.currentTarget.src !== defaultAvatarSrc) event.currentTarget.src = defaultAvatarSrc;
-                                    }}
-                                  />
-                                  <span>{schedule.teacher_name || 'Teacher'}</span>
-                                  {parallelRows.length > 1 && <span className="tdb-mini-parallel">PARALLEL</span>}
-                                </div>
-                                <div className="tdb-schedule-course-details">
-                                  <span>{`${schedule.subject_code || ''} ${schedule.subject_name || ''}`.trim() || 'Subject not specified'}</span>
-                                  <span className="tdb-schedule-section">Section: {schedule.section_name || 'Not specified'}</span>
-                                </div>
-                                <div className="tdb-schedule-checkpoints">
-                                  {[
-                                    { key: 'in', label: 'Check-in', time: schedule.time_in },
-                                    { key: 'mid', label: 'Mid-check', time: schedule.time_check },
-                                    { key: 'out', label: 'Check-out', time: schedule.time_out }
-                                  ].map((checkpoint) => {
-                                    const checkpointStatus = computeCheckpointStatus(schedule, checkpoint.key);
-                                    return (
-                                      <div className="tdb-schedule-checkpoint" key={checkpoint.key}>
-                                        <span>{checkpoint.label}</span>
-                                        <strong className={`tdb-mini-status tdb-mini-status--${presenceBadgeClass(checkpointStatus)}`}>
-                                          {checkpointStatus}
-                                        </strong>
-                                        {(checkpointStatus === 'PRESENT' || checkpointStatus === 'LATE') && checkpoint.time && (
-                                          <small>{formatPresenceCheckpoint(checkpoint.time)}</small>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            );
-                          }) : <div className="tdb-teacher-schedule-empty">No schedule records found for this room on the selected date.</div>}
-                        </div>
-                      </div>
-                      <div className="tdb-teacher-modal-column">
-                        <h4>Today/Recent attendance</h4>
-                        <div className="tdb-modal-date-context" aria-label={`${modalSelectedDate.day}, ${modalSelectedDate.date}`}>
-                          <span className="tdb-modal-date-day">{modalSelectedDate.day}</span>
-                          <span className="tdb-modal-date-full">{modalSelectedDate.date}</span>
-                        </div>
-                        {!teacherStatusModal.record?.no_records ? (
-                          <>
-                            <div className="tdb-recent-teacher-profile">
-                              <div className="tdb-teacher-status-avatar">
-                                <img
-                                  src={teacherStatusModal.avatarUrl || defaultAvatarSrc}
-                                  alt={teacherStatusModal.record?.teacher_name || 'Teacher'}
-                                  onError={(event) => {
-                                    if (event.currentTarget.src !== defaultAvatarSrc) event.currentTarget.src = defaultAvatarSrc;
-                                  }}
-                                />
-                              </div>
-                              <div className="tdb-recent-teacher-info">
-                                <strong>{teacherStatusModal.record?.teacher_name || 'Teacher'}</strong>
-                                <span>{teacherStatusModal.record?.scheduled_time || 'Schedule not specified'}</span>
-                              </div>
-                            </div>
-                            <div className="tdb-teacher-compact-summary">
-                              <span>{teacherStatusModal.record?.subject || 'Subject not specified'}</span>
-                              <span>{teacherStatusModal.record?.section_name || 'Section not specified'}</span>
-                              {teacherStatusModal.record?.is_parallel && <strong>PARALLEL</strong>}
-                              {teacherStatusModal.record?.is_substitute && <strong>SUBSTITUTE</strong>}
-                              {teacherStatusModal.status === 'ON_LEAVE' && <strong>{teacherStatusModal.record?.leave_type || 'ON LEAVE'}</strong>}
-                            </div>
-                          </>
-                        ) : (
-                          <div className="tdb-teacher-empty-summary">
-                            <strong>No attendance record</strong>
-                            <span>This room has no teacher attendance data for the selected date.</span>
-                          </div>
-                        )}
-                        <div className="tdb-teacher-attendance-list">
-                          {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading attendance for the selected date...</div>
-                          ) : modalRecordsError ? (
-                            <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
-                          ) : modalRecentAttendance.length > 0 ? modalRecentAttendance.map((checkpoint) => (
-                            <div className="tdb-teacher-attendance-item" key={checkpoint.key}>
-                              <div>
-                                <strong>{checkpoint.label}</strong>
-                                <span>{checkpoint.teacherName || 'Teacher'}</span>
-                                {(checkpoint.status === 'PRESENT' || checkpoint.status === 'LATE') && checkpoint.time && (
-                                  <span>{formatPresenceCheckpoint(checkpoint.time)}</span>
-                                )}
-                              </div>
-                              <span className={`tdb-mini-status tdb-mini-status--${presenceBadgeClass(checkpoint.status)}`}>
-                                {checkpoint.status}
-                              </span>
-                            </div>
-                          )) : <div className="tdb-teacher-schedule-empty">No attendance records found for this room on the selected date.</div>}
-                        </div>
-                      </div>
-                    </div>
                   </div>
                 </div>
               </div>
@@ -3632,7 +2776,7 @@ function ThreeDBuildingIndex() {
           </div>
         </div>
 
-        <aside className="tdb-logs-panel" ref={logsPanelRef}>
+        <aside className="tdb-logs-panel">
           <div className="tdb-time-chip">{dateTimeStamp}</div>
           <div className="tdb-log-date-field">
             <label htmlFor="tdb-log-date">Logs Date</label>
@@ -3644,28 +2788,6 @@ function ThreeDBuildingIndex() {
               onChange={(e) => setSelectedScheduleDate(e.target.value || toLocalYmd())}
             />
           </div>
-          <div className="tdb-log-status-filters" aria-label="Recent log status filters">
-            <button
-              type="button"
-              className={`tdb-log-recent-filter${recentLogStatusFilter === 'recent' ? ' tdb-log-recent-filter--active' : ''}`}
-              onClick={() => setRecentLogStatusFilter('recent')}
-            >
-              Recent
-            </button>
-            <select
-              className="form-select form-select-sm tdb-log-other-filter"
-              aria-label="Filter Recent Logs by other status"
-              value={recentLogStatusFilter === 'recent' ? '' : recentLogStatusFilter}
-              onChange={(event) => setRecentLogStatusFilter(event.target.value || 'recent')}
-            >
-              <option value="">Other status</option>
-              <option value="other">All other statuses</option>
-              <option value="UPCOMING">Upcoming</option>
-              <option value="PENDING">Pending</option>
-              <option value="SUBSTITUTED">Substituted</option>
-              <option value="ON_LEAVE">On leave</option>
-            </select>
-          </div>
           <div className="tdb-logs-title">Recent Logs</div>
 
           <div className="tdb-logs-list">
@@ -3673,21 +2795,17 @@ function ThreeDBuildingIndex() {
               <div className="tdb-no-logs">No logs found for current filters.</div>
             ) : (
               pagedLogs.map((log) => {
-                const statusClass = `tdb-status-${String(log.status || 'PENDING').toLowerCase().replace(/_/g, '-')}`;
+                const statusClass = log.status === 'PRESENT'
+                  ? 'tdb-status-present'
+                  : log.status === 'LATE'
+                    ? 'tdb-status-late'
+                    : 'tdb-status-absent';
                 return (
                   <button
                     key={log.id}
                     type="button"
-                    className={`tdb-log-item tdb-log-item--clickable${log.highlightGroupKey && hoveredLogGroup === log.highlightGroupKey ? ' tdb-log-item--group-highlight' : ''}`}
+                    className="tdb-log-item tdb-log-item--clickable"
                     onClick={() => handleRecentLogClick(log)}
-                    onMouseEnter={() => {
-                      if (log.highlightGroupKey) setHoveredLogGroup(log.highlightGroupKey);
-                    }}
-                    onMouseLeave={() => setHoveredLogGroup('')}
-                    onFocus={() => {
-                      if (log.highlightGroupKey) setHoveredLogGroup(log.highlightGroupKey);
-                    }}
-                    onBlur={() => setHoveredLogGroup('')}
                     aria-label={`View room ${log.roomName}`}
                     title={`View ${log.roomName}`}
                   >
@@ -3702,23 +2820,10 @@ function ThreeDBuildingIndex() {
                     </div>
                     <div className="tdb-log-body">
                       <div className="tdb-log-name">{log.teacherName} ({log.roomName})</div>
-                      <div
-                        className="tdb-log-context"
-                        title={`Subject: ${log.subjectLabel} • Section: ${log.sectionName}`}
-                      >
-                        <span>Subject: {log.subjectLabel}</span>
-                        <i aria-hidden="true">•</i>
-                        <span>Section: {log.sectionName}</span>
-                      </div>
                       <div className="tdb-log-meta">
                         <span className="tdb-pill tdb-pill-type">{log.type}:</span>
                         <span className={`tdb-pill ${statusClass}`}>{log.status}</span>
-                        {log.isParallel && <span className="tdb-log-parallel">PARALLEL</span>}
-                        {log.timeLabel && (
-                          <span className={`tdb-log-time${log.timeKind === 'range' ? ' tdb-log-time--range' : ''}`}>
-                            {log.timeLabel}
-                          </span>
-                        )}
+                        <span className="tdb-log-time">{formatClock(log.eventTime)}</span>
                       </div>
                     </div>
                   </button>
@@ -3736,7 +2841,7 @@ function ThreeDBuildingIndex() {
             >
               {'<'}
             </button>
-            {visibleLogPages.map((pageNo) => (
+            {Array.from({ length: totalLogPages }, (_, idx) => idx + 1).slice(0, 5).map((pageNo) => (
               <button
                 key={pageNo}
                 type="button"
