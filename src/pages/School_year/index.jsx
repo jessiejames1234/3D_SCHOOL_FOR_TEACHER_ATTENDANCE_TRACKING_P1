@@ -2,6 +2,8 @@ import React from 'react';
 import { apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import { MasterPageHeader, MasterStats, MasterToolbar, MasterSearch, MasterResults, MasterSelect } from '../../components/MasterDataPage.jsx';
 
 const TERM_ORDER = ['1st sem', '2nd sem', 'summer'];
 const TERM_LABELS = {
@@ -214,7 +216,10 @@ function SchoolYearIndex() {
   const [showModal, setShowModal] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ session_name: '', start_date: '', end_date: '' });
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
+  const [search, setSearch] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState('active');
+  const [showArchived, setShowArchived] = React.useState(false);
 
   const [showSemesterBatchModal, setShowSemesterBatchModal] = React.useState(false);
   const [semesterBatchTarget, setSemesterBatchTarget] = React.useState(null);
@@ -225,10 +230,18 @@ function SchoolYearIndex() {
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
   };
 
-  const loadData = React.useCallback(async () => {
-    const [years, sems] = await Promise.all([apiGet('school-years'), apiGet('semesters')]);
-    setItems(Array.isArray(years) ? years.filter((x) => String(x.status || '').toLowerCase() !== 'archive') : []);
-    setSemesters(Array.isArray(sems) ? sems.filter((x) => String(x.status || '').toLowerCase() !== 'archive') : []);
+  const loadData = React.useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    try {
+      const [currentYears, archivedYears, sems] = await Promise.all([apiGet('school-years'), apiGet('school-years?archived=1'), apiGet('semesters')]);
+      const yearMap = new Map();
+      [...(Array.isArray(currentYears) ? currentYears : []), ...(Array.isArray(archivedYears) ? archivedYears : [])]
+        .forEach((year) => yearMap.set(String(year.session_id), year));
+      setItems(Array.from(yearMap.values()));
+      setSemesters(Array.isArray(sems) ? sems.filter((x) => String(x.status || '').toLowerCase() !== 'archive') : []);
+    } finally {
+      if (!silent) setLoading(false);
+    }
   }, []);
 
   React.useEffect(() => {
@@ -241,6 +254,12 @@ function SchoolYearIndex() {
     })();
   }, [loadData]);
 
+  useAutoRefresh({
+    refresh: () => loadData({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: !showModal && !showSemesterBatchModal,
+  });
+
   const semesterCountBySession = React.useMemo(() => {
     const map = new Map();
     semesters.forEach((row) => {
@@ -250,6 +269,11 @@ function SchoolYearIndex() {
     });
     return map;
   }, [semesters]);
+
+  const filteredItems = React.useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return items.filter((item) => (!query || `${item.session_name || ''} ${item.start_date || ''} ${item.end_date || ''}`.toLowerCase().includes(query)) && String(item.status || '').toLowerCase() === statusFilter);
+  }, [items, search, statusFilter]);
 
   const semestersBySession = React.useMemo(() => {
     const map = new Map();
@@ -395,6 +419,9 @@ function SchoolYearIndex() {
       return;
     }
 
+    const confirmation = window.Swal ? await window.Swal.fire({ title:'Save Semester Plan?', text:`Update all three semester date ranges for ${semesterBatchTarget.session_name || 'this school year'}?`, icon:'question', showCancelButton:true, confirmButtonText:'Save Semesters', confirmButtonColor:'#198754' }) : { isConfirmed:confirm('Save all three semester date ranges?') };
+    if (!confirmation.isConfirmed) return;
+
     setSemesterSaving(true);
     try {
       await saveSemesterBatchPlan(semesterBatchTarget.session_id, semesterBatchRows);
@@ -446,6 +473,9 @@ function SchoolYearIndex() {
       setLoading(false);
       return;
     }
+
+    const confirmation = window.Swal ? await window.Swal.fire({ title: editing ? 'Save School Year Changes?' : 'Create School Year?', text:`${form.session_name || 'School year'}: ${form.start_date} to ${form.end_date}.`, icon:'question', showCancelButton:true, confirmButtonText: editing ? 'Save Changes' : 'Create School Year', confirmButtonColor:'#198754' }) : { isConfirmed:confirm(`${editing ? 'Save changes to' : 'Create'} this school year?`) };
+    if (!confirmation.isConfirmed) { setLoading(false); return; }
 
     try {
       if (editing) {
@@ -611,6 +641,26 @@ function SchoolYearIndex() {
     }
   };
 
+  const handleRestore = async (it) => {
+    try {
+      const res = window.Swal
+        ? await window.Swal.fire({
+            title: 'Restore School Year?',
+            text: 'The school year will return to the current database as inactive so it can be reviewed safely.',
+            icon: 'question',
+            showCancelButton: true,
+          })
+        : { isConfirmed: confirm('Restore School Year?') };
+      if (!res.isConfirmed) return;
+
+      await apiPost(`school-years/${it.session_id}/restore`, {});
+      await loadData();
+      if (window.Swal) await window.Swal.fire({ icon: 'success', title: 'School Year Restored', text: 'The school year was restored as inactive.', timer: 1700, showConfirmButton: false });
+    } catch (err) {
+      if (window.Swal) await window.Swal.fire({ icon: 'error', title: 'Restore Failed', text: getApiErrorMessage(err, 'The school year could not be restored.') });
+    }
+  };
+
   const showSemesterEditRestrictedAlert = async () => {
     try {
       if (window.Swal) {
@@ -717,14 +767,14 @@ function SchoolYearIndex() {
       label: 'System Status',
       render: (row) => {
         const status = String(row.status || '').toLowerCase();
-        const cls = status === 'active' ? 'bg-success' : 'bg-danger';
-        return <span className={`badge ${cls}`}>{status === 'active' ? 'Active' : 'Inactive'}</span>;
+        return <span className={`mdp-status mdp-status-${status}`}>{status === 'active' ? 'Active' : status === 'archive' ? 'Archived' : 'Inactive'}</span>;
       },
     },
     {
       key: 'actions',
       label: 'Actions',
       actions: (row) => {
+        if (String(row.status || '').toLowerCase() === 'archive') return [{ label: 'Restore', variant: 'success', onClick: () => handleRestore(row) }];
         const actions = [];
         const hasOperationalData = Number(row?.schedule_count || 0) > 0 || Number(row?.attendance_count || 0) > 0;
         if (!hasOperationalData) {
@@ -755,23 +805,19 @@ function SchoolYearIndex() {
       },
     },
   ];
+  const selectSchoolYearStatus = (status) => {
+    setStatusFilter(status);
+    setShowArchived(status === 'archive');
+    setExpandedSessionId(null);
+  };
+  const schoolYearStatusCount = (status) => items.filter((item) => String(item.status || '').toLowerCase() === status).length;
 
   return (
-    <div style={{ padding: 20 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>School Year Setup</h2>
-        <button className="btn btn-success" onClick={() => openModal()}>Create School Year</button>
-      </div>
-
-      <Table
-        columns={columns}
-        data={items}
-        pageSize={10}
-        rowKey="session_id"
-        onRowClick={handleSchoolYearRowClick}
-        expandedRowKey={expandedSessionId}
-        renderExpandedRow={renderExpandedSemesterRow}
-      />
+    <div className="mdp-page">
+      <MasterPageHeader title="School Years" description="Configure academic years and keep all three semester periods aligned." action={statusFilter !== 'archive' ? <button className="mdp-primary" onClick={() => openModal()}>+ Create School Year</button> : null} />
+      <MasterStats loading={loading} items={[{ label: 'Active', value: schoolYearStatusCount('active'), help: 'Current operational periods', icon: '\u2713', active: statusFilter === 'active', onClick: () => selectSchoolYearStatus('active') }, { label: 'Inactive', value: schoolYearStatusCount('inactive'), help: 'Planned or unavailable periods', icon: 'I', tone: 'red', active: statusFilter === 'inactive', onClick: () => selectSchoolYearStatus('inactive') }, { label: 'Archived', value: schoolYearStatusCount('archive'), help: 'Available for restoration', icon: 'A', active: statusFilter === 'archive', onClick: () => selectSchoolYearStatus('archive') }]} />
+      <MasterToolbar><MasterSearch value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search school year or date..." /><MasterSelect label="Status" value={statusFilter} onChange={(event) => selectSchoolYearStatus(event.target.value)}><option value="active">Active</option><option value="inactive">Inactive</option><option value="archive">Archived</option></MasterSelect></MasterToolbar>
+      <MasterResults title={statusFilter === 'archive' ? 'Archived School Years' : 'Academic Timeline'} count={filteredItems.length} loading={loading} description={statusFilter === 'archive' ? 'Restore an archived school year as inactive.' : 'Select a row to review its semester schedule.'}><Table columns={columns} data={filteredItems} loading={loading} pageSize={10} rowKey="session_id" onRowClick={statusFilter === 'archive' ? undefined : handleSchoolYearRowClick} expandedRowKey={statusFilter === 'archive' ? null : expandedSessionId} renderExpandedRow={statusFilter === 'archive' ? undefined : renderExpandedSemesterRow} /></MasterResults>
 
       <Modal show={showModal} title={editing ? 'Edit School Year' : 'Create School Year'} onClose={closeModal}>
         <form onSubmit={handleSubmit} className="space-y-4">

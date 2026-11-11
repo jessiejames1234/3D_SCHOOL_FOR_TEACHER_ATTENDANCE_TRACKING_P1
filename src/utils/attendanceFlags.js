@@ -10,6 +10,7 @@ export function normalizeAttendanceFlagName(value) {
   if (key === 'late') return 'Late';
   if (key === 'substituted') return 'Substituted';
   if (key === 'on leave' || key === 'on_leave') return 'On Leave';
+  if (key === 'incomplete' || key === 'partial attendance' || key === 'partial_attendance') return 'Partial Attendance';
   return raw;
 }
 
@@ -36,5 +37,6 @@ export function attendanceFlagKey(flagId, flagName = '') {
   if (label === 'late') return 'late';
   if (label === 'substituted') return 'substituted';
   if (label === 'on leave' || label === 'on_leave') return 'on_leave';
+  if (label === 'incomplete' || label === 'partial attendance' || label === 'partial_attendance') return 'incomplete';
   return label.replace(/\s+/g, '_') || 'unknown';
 }

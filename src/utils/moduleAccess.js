@@ -9,25 +9,27 @@ export const ROLE_ID_TO_NAME = {
 
 export const PERMISSION_MATRIX = {
   dashboard: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
-  faculty_dashboard: ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+  faculty_dashboard: ['dean', 'program_head', 'secretary', 'teacher'],
   users: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
-  attendance: ['dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
+  attendance: ['dean', 'program_head', 'secretary', 'teacher'],
   attendancemgmt: ['admin', 'secretary', 'dean', 'department_admin', 'program_head'],
   class_schedules: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
   '3d_building': ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
   attendance_edits: ['dean', 'department_admin'],
-  schedule_edits: ['dean', 'department_admin', 'program_head', 'secretary'],
   academic_admin: ['admin'],
-  academic_manage: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
-  academic_program: ['admin', 'dean', 'department_admin'],
+  academic_manage: ['admin', 'department_admin'],
+  academic_program: ['admin', 'department_admin'],
   locations: ['admin'],
+  floor_qr: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
   reports: ['admin', 'dean', 'department_admin', 'program_head', 'secretary', 'teacher'],
-  leaves_file: ['admin', 'dean', 'department_admin', 'secretary'],
-  leaves_approvals: ['admin', 'dean', 'program_head'],
-  substitutions: ['admin', 'dean', 'department_admin', 'secretary'],
-  logs: ['admin', 'dean', 'department_admin', 'program_head', 'secretary'],
+  leaves_file: ['dean', 'department_admin'],
+  leaves_approvals: ['dean', 'department_admin'],
+  substitutions: ['dean', 'department_admin'],
+  penalties: ['dean', 'department_admin', 'program_head', 'secretary'],
+  logs: ['admin', 'dean', 'department_admin'],
   settings: ['admin', 'dean', 'department_admin'],
-  attendance_logs: ['admin', 'dean', 'department_admin', 'program_head'],
+  attendance_logs: ['admin', 'dean', 'department_admin'],
+  calendar_events: ['admin', 'department_admin'],
 };
 
 export const MODULE_LABELS = {
@@ -39,18 +41,20 @@ export const MODULE_LABELS = {
   class_schedules: 'Class Schedules',
   '3d_building': '3D Campus Map',
   attendance_edits: 'Attendance Edit Requests',
-  schedule_edits: 'Schedule Edit Requests',
   academic_admin: 'Academic Admin (Dept/School Year)',
   academic_manage: 'Academic Manage (Sections/Subjects)',
   academic_program: 'Program Management',
   locations: 'Facility Management',
+  floor_qr: 'Floor QR Downloads',
   reports: 'Reports',
   leaves_file: 'File Leave',
   leaves_approvals: 'Leave Approvals',
   substitutions: 'Substitutions',
+  penalties: 'Penalties & Sanctions',
   logs: 'System Logs',
   settings: 'General Settings',
   attendance_logs: 'Attendance Logs',
+  calendar_events: 'Holidays & Events',
 };
 
 export const ALL_MODULES = Object.keys(PERMISSION_MATRIX);
@@ -126,8 +130,34 @@ export function getEffectiveModules(userLike) {
   const bag = parseModulePermissions(userLike?.module_permissions);
   const effective = {};
   for (const m of base) effective[m] = true;
-  for (const m of bag.allow) effective[m] = true;
+  for (const m of bag.allow) {
+    // Explicit grants are validated by the server-side module-access endpoint.
+    // They may intentionally add a safe module outside the role defaults.
+    if (ALL_MODULE_LOOKUP[m]) effective[m] = true;
+  }
   for (const m of bag.deny) delete effective[m];
+  if (roleName === 'department_admin') {
+    delete effective.faculty_dashboard;
+    delete effective.attendance;
+  }
+  if (!['admin', 'department_admin'].includes(roleName)) {
+    delete effective.academic_manage;
+    delete effective.academic_program;
+  }
+  if (roleName !== 'admin') delete effective.academic_admin;
+  if (!['dean', 'department_admin'].includes(roleName)) delete effective.attendance_edits;
+  if (!['dean', 'department_admin'].includes(roleName)) delete effective.leaves_file;
+  const fixedRoleModules = {
+    attendance_logs: ['admin', 'dean', 'department_admin'],
+    leaves_approvals: ['dean', 'department_admin'],
+    leaves_file: ['dean', 'department_admin'],
+    substitutions: ['dean', 'department_admin'],
+    penalties: ['dean', 'department_admin', 'program_head', 'secretary'],
+    calendar_events: ['admin', 'department_admin'],
+  };
+  for (const [moduleKey, allowedRoles] of Object.entries(fixedRoleModules)) {
+    if (!allowedRoles.includes(roleName)) delete effective[moduleKey];
+  }
   return Object.keys(effective).sort();
 }
 
@@ -157,21 +187,23 @@ export function getPermissionFromRoute(routePath) {
   if (p.startsWith('/attendance-logs') || p.startsWith('/logs') || p.startsWith('/attedance_audit')) return 'attendance_logs';
   if (p.startsWith('/system-logs') || p.startsWith('/systemlogs')) return 'logs';
   if (p.startsWith('/attendance-edit-requests')) return 'attendance_edits';
-  if (p.startsWith('/schedule-edit-requests')) return 'schedule_edits';
   if (p.startsWith('/attendance-history') || p.startsWith('/my-attendance') || p.startsWith('/my-requested-edits') || p.startsWith('/attendance')) return 'attendance';
   if (p.startsWith('/dashboard')) return 'dashboard';
   if (p.startsWith('/users')) return 'users';
   if (p.startsWith('/3d-building')) return '3d_building';
   if (p.startsWith('/class-schedules')) return 'class_schedules';
+  if (p.startsWith('/calendar-events')) return 'calendar_events';
   if (p.startsWith('/departments') || p.startsWith('/school_year')) return 'academic_admin';
   if (p.startsWith('/programs')) return 'academic_program';
   if (p.startsWith('/semesters')) return 'academic_admin';
   if (p.startsWith('/sections') || p.startsWith('/subjects') || p.startsWith('/subject-offerings')) return 'academic_manage';
-  if (p.startsWith('/building') || p.startsWith('/floors') || p.startsWith('/rooms')) return 'locations';
+  if (p.startsWith('/floors')) return 'floor_qr';
+  if (p.startsWith('/building') || p.startsWith('/rooms')) return 'locations';
   if (p.startsWith('/school')) return 'settings';
   if (p.startsWith('/file_leave')) return 'leaves_file';
   if (p.startsWith('/leave_approval')) return 'leaves_approvals';
   if (p.startsWith('/substitute') || p.startsWith('/substitutions')) return 'substitutions';
+  if (p.startsWith('/penalties')) return 'penalties';
   if (p.startsWith('/reports')) return 'reports';
   if (p.startsWith('/settings')) return 'settings';
   return null;

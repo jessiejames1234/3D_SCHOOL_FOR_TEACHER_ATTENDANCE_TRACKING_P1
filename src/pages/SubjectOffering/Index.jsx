@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { apiGet, apiPost, apiPut, apiDelete } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
 function SubjectOfferingIndex() {
   const [items, setItems] = useState([]);
@@ -10,6 +11,7 @@ function SubjectOfferingIndex() {
   const [teachers, setTeachers] = useState([]);
   const [semesters, setSemesters] = useState([]);
   const [programs, setPrograms] = useState([]);
+  const [departments, setDepartments] = useState([]);
 
   // States for Table UI Filters
   const [filterSubject, setFilterSubject] = useState('');
@@ -19,6 +21,7 @@ function SubjectOfferingIndex() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ semester_id: '', section_id: '', subject_id: '', user_id: '' });
   const [loading, setLoading] = useState(false);
+  const [dataLoading, setDataLoading] = useState(true);
   const [error, setError] = useState('');
 
   // Spreadsheet import states
@@ -42,21 +45,23 @@ function SubjectOfferingIndex() {
   };
 
   useEffect(() => { 
-    (async () => { 
+    (async () => {
+      setDataLoading(true);
       try{ 
-        const [data, s, sec, sem, teachersRes, prog] = await Promise.all([
+        const [data, s, sec, sem, teachersRes, prog, dept] = await Promise.all([
           apiGet('subject-offerings'), 
           apiGet('subjects'), 
           apiGet('sections'), 
           apiGet('semesters'), 
-          apiGet('teachers').catch(() => []),
-          apiGet('programs')
+          apiGet('users?list=1&teaching_roles=1&include_inactive=1').catch(() => []),
+          apiGet('programs'),
+          apiGet('departments')
         ]);
         
         let teacherList = Array.isArray(teachersRes) ? teachersRes : [];
         if (!teacherList.length || !('role_id' in (teacherList[0] || {}))) {
           try {
-            const users = await apiGet('users');
+            const users = await apiGet('users?list=1&teaching_roles=1&include_inactive=1');
             teacherList = Array.isArray(users) ? users.filter(u => [2,3,4,5].includes(Number(u.role_id))).map(u => ({ ...u, user_id: u.user_id || u.id })) : teacherList;
           } catch(e) {}
         } else {
@@ -69,10 +74,13 @@ function SubjectOfferingIndex() {
         setSemesters(Array.isArray(sem) ? sem : []); 
         setTeachers(teacherList);
         setPrograms(Array.isArray(prog) ? prog : []); 
+        setDepartments(Array.isArray(dept) ? dept : []);
       } catch(e){ 
         console.error(e); 
         setError('Failed to load subject offerings or related data'); 
-      } 
+      } finally {
+        setDataLoading(false);
+      }
     })(); 
   }, []);
 
@@ -127,38 +135,59 @@ function SubjectOfferingIndex() {
   }, [subjects, isAdmin, user]);
 
   const availableTeachers = useMemo(() => {
-    let list = teachers;
+    let list = teachers.filter(t => String(t.status || 'active').toLowerCase() === 'active');
     if (!isAdmin && user?.dept_id) {
       list = list.filter(t => t.dept_id && String(t.dept_id) === String(user.dept_id));
     }
     return list;
   }, [teachers, isAdmin, user]);
 
-  const addEditSubjects = useMemo(() => {
-    let list = subjects;
-    if (isProgramHead) {
-      list = list.filter(s => s.head_id && String(s.head_id) === String(user?.user_id));
+  const historicalTeacherOptions = useMemo(() => {
+    let list = teachers.filter(t => [2, 3, 4, 5].includes(Number(t.role_id)));
+    if (!isAdmin && user?.dept_id) {
+      list = list.filter(t => t.dept_id && String(t.dept_id) === String(user.dept_id));
     }
     return list;
-  }, [subjects, isProgramHead, user]);
+  }, [teachers, isAdmin, user]);
+
+  const activeProgramIds = useMemo(() => {
+    const activeDepartmentIds = new Set(departments.filter(d => String(d.status || '').toLowerCase() === 'active').map(d => String(d.dept_id)));
+    return new Set(programs.filter(p => String(p.status || '').toLowerCase() === 'active' && activeDepartmentIds.has(String(p.dept_id))).map(p => String(p.program_id)));
+  }, [programs, departments]);
+
+  const activeSemesters = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return semesters.filter((semester) => {
+      if (String(semester.status || '').toLowerCase() !== 'active') return false;
+      const start = semester.start_date ? new Date(`${semester.start_date}T00:00:00`) : null;
+      const end = semester.end_date ? new Date(`${semester.end_date}T23:59:59`) : null;
+      return start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && today >= start && today <= end;
+    });
+  }, [semesters]);
+
+  const addEditSubjects = useMemo(() => {
+    let list = subjects.filter(s => String(s.status || '').toLowerCase() === 'active' && activeProgramIds.has(String(s.program_id)));
+    if (isProgramHead) {
+      return list;
+    }
+    return list;
+  }, [subjects, isProgramHead, activeProgramIds]);
 
   const addEditSections = useMemo(() => {
-    let list = sections;
+    let list = sections.filter(s => String(s.status || '').toLowerCase() === 'active' && activeProgramIds.has(String(s.program_id)));
     if (isProgramHead) {
-      list = list.filter(sec => sec.head_id && String(sec.head_id) === String(user?.user_id));
+      return list;
     }
     return list;
-  }, [sections, isProgramHead, user]);
+  }, [sections, isProgramHead, activeProgramIds]);
 
 
   const checkProgramHeadPermission = (rowHeadId) => {
     if (isAdmin) return true;
-    if (isProgramHead) {
-       if (!rowHeadId || String(rowHeadId) !== String(user?.user_id)) {
-          try { if (window.Swal) window.Swal.fire('Unauthorized', 'You can only modify offerings assigned to your specific program.', 'error'); else alert('Unauthorized'); } catch(e){}
-          return false;
-       }
-    }
+    // The backend already returns only programs assigned to this Program Head,
+    // including secondary heads in a multi-head program.
+    if (isProgramHead) return true;
     return true;
   };
 
@@ -168,10 +197,10 @@ function SubjectOfferingIndex() {
       if (!checkProgramHeadPermission(it.head_id)) return;
 
       setEditing(it);
-      setForm({ semester_id: it.semester_id || semesters[0]?.semester_id || '', section_id: it.section_id || '', subject_id: it.subject_id || '', user_id: it.user_id || '' });
+      setForm({ semester_id: activeSemesters.some(s => String(s.semester_id) === String(it.semester_id)) ? it.semester_id : '', section_id: it.section_id || '', subject_id: it.subject_id || '', user_id: it.user_id || '' });
     } else {
       setEditing(null);
-      setForm({ semester_id: semesters[0]?.semester_id || '', section_id: addEditSections[0]?.section_id || '', subject_id: '', user_id: '' });
+      setForm({ semester_id: activeSemesters[0]?.semester_id || '', section_id: addEditSections[0]?.section_id || '', subject_id: '', user_id: '' });
     }
     setShowModal(true);
   };
@@ -193,6 +222,12 @@ function SubjectOfferingIndex() {
     const data = await apiGet('subject-offerings');
     setItems(Array.isArray(data) ? data : []);
   };
+
+  useAutoRefresh({
+    refresh,
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: !showModal,
+  });
 
   const handleSubmit = async (e) => { 
     e.preventDefault(); 
@@ -363,7 +398,7 @@ function SubjectOfferingIndex() {
           <label className="block text-xs text-gray-500 mb-1 font-semibold uppercase">Filter by Teacher</label>
           <select className="w-full border border-gray-300 rounded p-2 text-sm focus:outline-none focus:ring-1 focus:ring-green-500 bg-white" value={filterTeacher} onChange={e=>setFilterTeacher(e.target.value)}>
             <option value="">All Teachers</option>
-            {availableTeachers.map(t=><option key={t.user_id} value={t.user_id}>{t.first_name} {t.last_name}</option>)}
+            {historicalTeacherOptions.map(t=><option key={t.user_id} value={t.user_id}>{t.first_name} {t.last_name}{String(t.status || 'active').toLowerCase() === 'active' ? '' : ' (Inactive)'}</option>)}
           </select>
         </div>
       </div>
@@ -389,7 +424,7 @@ function SubjectOfferingIndex() {
       )}
 
       <div className="overflow-x-auto bg-white rounded-xl shadow-sm border border-gray-200">
-        <Table columns={columns} data={displayData} pageSize={10} />
+        <Table columns={columns} data={displayData} loading={dataLoading} pageSize={10} />
       </div>
 
       <Modal show={showModal} title={editing ? 'Edit Offering' : 'Add Offering'} onClose={closeModal}>
@@ -413,8 +448,8 @@ function SubjectOfferingIndex() {
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Semester</label>
             <select name="semester_id" value={form.semester_id||''} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500">
-              <option value="">{semesters.length ? 'Select semester...' : 'No semesters available'}</option>
-              {semesters.map(s => <option key={s.semester_id} value={s.semester_id}>{s.term}</option>)}
+              <option value="">{activeSemesters.length ? 'Select active semester...' : 'No active semesters available'}</option>
+              {activeSemesters.map(s => <option key={s.semester_id} value={s.semester_id}>{s.term}</option>)}
             </select>
           </div>
 

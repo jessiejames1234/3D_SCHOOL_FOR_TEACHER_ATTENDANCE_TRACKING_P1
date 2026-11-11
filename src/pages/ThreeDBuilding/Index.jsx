@@ -1,7 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AuthContext } from '../../context/AuthContext.jsx';
-import { apiGet, apiPost } from '../../services/api.js';
+import { apiUrl, apiFetch, apiGet, apiPost } from '../../services/api.js';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import LoadingState from '../../components/LoadingState.jsx';
+import TeacherTableView from './TeacherTableView.jsx';
+import { attendanceLateDisplay } from '../../utils/attendanceLateDisplay.js';
 import './Index.css';
+
+function checkpointDisplayLabel(status, record, stage) {
+  if (status !== 'LATE' || !['in', 'mid'].includes(stage)) return status;
+  return attendanceLateDisplay('Late', stage, {
+    date: record?.date,
+    startTime: record?.start_time,
+    endTime: record?.end_time,
+    scannedAt: record?.[{ in: 'time_in', mid: 'time_check', out: 'time_out' }[stage]],
+  });
+}
 
 function ThreeDBuildingIndex() {
   const auth = React.useContext(AuthContext) || {};
@@ -22,66 +36,103 @@ function ThreeDBuildingIndex() {
     }
   })();
 
-  const resolveUrl = (path) => {
-    try { return new URL(path, window.location.href).href; }
-    catch (e) { return path; }
-  };
-
-  const resolveServerRoot = () => {
-    const apiBase = (typeof window !== 'undefined' && window.API_BASE) ? window.API_BASE : '../server-php/index.php/api';
-    let base = apiBase;
-    try { base = new URL(apiBase, window.location.href).href; }
-    catch (e) { base = resolveUrl(apiBase); }
-    return base.replace(/\/?index\.php\/api\/?$/, '').replace(/\/?api\/?$/, '');
-  };
-
-  const serverRoot = resolveServerRoot();
   const resolveApiAssetUrl = (path) => {
-    const clean = String(path || '').replace(/^\/+/, '');
-    return new URL(`./index.php/api/${clean}`, `${serverRoot}/`).href;
+    return apiUrl(path);
   };
-  const defaultModel = new URL('./3dbuilding/MW.glb', `${serverRoot}/`).href;
-  const getBuildingModelSrc = (buildingName) => {
+  // Models are frontend static assets. Resolve them from the document base so
+  // localhost subfolders and a future /tams deployment work without depending
+  // on the PHP API address.
+  const resolveBuildingModelUrl = (filename) => {
+    const safeFilename = String(filename || '').split('/').pop();
+    const url = new URL(`building/models/${safeFilename}`, document.baseURI);
+    const assetVersion = window.APP_ASSET_VERSIONS?.[url.pathname];
+    if (assetVersion) url.searchParams.set('v', assetVersion);
+    return url.href;
+  };
+  const resolveStoredBuildingModelUrl = (path, version = '') => {
+    const cleanPath = String(path || '').replace(/^\/+/, '');
+    if (!cleanPath) return null;
+    const url = new URL(cleanPath, document.baseURI);
+    const staticAssetVersion = window.APP_ASSET_VERSIONS?.[url.pathname];
+    if (staticAssetVersion) url.searchParams.set('v', staticAssetVersion);
+    else if (version) url.searchParams.set('v', String(version));
+    return url.href;
+  };
+  const bundledModelFilenameForBuilding = (buildingName) => {
     const normalized = String(buildingName || '').trim().toLowerCase();
-    if (!normalized) return null;
-    if (normalized.includes('main west') || normalized.includes('mainwest') || normalized.includes('main_west') || normalized === 'mw') {
-      return new URL('./3dbuilding/MW.glb', `${serverRoot}/`).href;
-    }
-    if (normalized.includes('main south') || normalized.includes('mainsouth') || normalized.includes('main_south') || normalized === 'ms') {
-      return new URL('./3dbuilding/MS.glb', `${serverRoot}/`).href;
-    }
-    if (normalized.includes('phinma hall') || normalized.includes('phinmahall') || normalized.includes('phinma_hall') || normalized === 'ph') {
-      return new URL('./3dbuilding/PH.glb', `${serverRoot}/`).href;
-    }
-    if (normalized.includes('main north') || normalized.includes('mainnorth') || normalized.includes('main_north') || normalized === 'mn') {
-      return new URL('./3dbuilding/MN.glb', `${serverRoot}/`).href;
-    }
+    if (normalized.includes('main west') || normalized.includes('mainwest') || normalized.includes('main_west') || normalized === 'mw') return 'MW.glb';
+    if (normalized.includes('main south') || normalized.includes('mainsouth') || normalized.includes('main_south') || normalized === 'ms') return 'MS.glb';
+    if (normalized.includes('phinma hall') || normalized.includes('phinmahall') || normalized.includes('phinma_hall') || normalized === 'ph') return 'PH.glb';
+    if (normalized.includes('main north') || normalized.includes('mainnorth') || normalized.includes('main_north') || normalized === 'mn') return 'MN.glb';
+    if (normalized.includes('senior high') || normalized.includes('seniorhigh') || normalized.includes('senior_high') || normalized === 'shs') return 'SHS.glb';
+    if (normalized === 'bed' || normalized.includes('basic education')) return 'BED.glb';
     return null;
+  };
+  const getBuildingModelSrc = (buildingName) => {
+    const normalized = String(buildingName || '').trim();
+    if (!normalized) return null;
+    const storedBuilding = (catalog?.buildings || []).find((building) => nameEq(building.building_name, normalized));
+    if (storedBuilding) {
+      return resolveStoredBuildingModelUrl(
+        storedBuilding.model_path,
+        storedBuilding.model_updated_at || storedBuilding.model_size || ''
+      );
+    }
+    const bundledFilename = bundledModelFilenameForBuilding(normalized);
+    return bundledFilename ? resolveBuildingModelUrl(bundledFilename) : null;
   };
   const defaultCameraPresets = {
     Building_PhinmaHall: { position: [-22, 10, 22], target: [0, 3, 0] },
     Building_MainSouth: { position: [22, 10, 16], target: [0, 3, 0] },
     Building_MainNorth: { position: [-22, 10, -16], target: [0, 3, 0] },
     Building_MainWest: { position: [22, 10, -16], target: [0, 3, 0] },
+    Building_SeniorHigh: { position: [22, 10, -16], target: [0, 3, 0] },
+    Building_BED: { position: [22, 10, -16], target: [0, 3, 0] },
     PhinmaHall: { position: [-22, 10, 22], target: [0, 3, 0] },
     MainSouth: { position: [22, 10, 16], target: [0, 3, 0] },
     MainNorth: { position: [-22, 10, -16], target: [0, 3, 0] },
-    MainWest: { position: [22, 10, -16], target: [0, 3, 0] }
+    MainWest: { position: [22, 10, -16], target: [0, 3, 0] },
+    SeniorHigh: { position: [22, 10, -16], target: [0, 3, 0] },
+    'Senior High Building': { position: [22, 10, -16], target: [0, 3, 0] },
+    BED: { position: [22, 10, -16], target: [0, 3, 0] }
   };
   const cameraModelDefinitions = {
     MW: { code: 'MW', cameraKey: 'Building_MainWest', aliasKey: 'MainWest', filename: 'MW.glb' },
     MN: { code: 'MN', cameraKey: 'Building_MainNorth', aliasKey: 'MainNorth', filename: 'MN.glb' },
     MS: { code: 'MS', cameraKey: 'Building_MainSouth', aliasKey: 'MainSouth', filename: 'MS.glb' },
-    PH: { code: 'PH', cameraKey: 'Building_PhinmaHall', aliasKey: 'PhinmaHall', filename: 'PH.glb' }
+    PH: { code: 'PH', cameraKey: 'Building_PhinmaHall', aliasKey: 'PhinmaHall', filename: 'PH.glb' },
+    SHS: { code: 'SHS', cameraKey: 'Building_SeniorHigh', aliasKey: 'SeniorHigh', filename: 'SHS.glb' },
+    BED: { code: 'BED', cameraKey: 'Building_BED', aliasKey: 'BED', filename: 'BED.glb' }
   };
   const getCameraModelDefinition = (source = modelSrcRef.current) => {
     let pathname = String(source || '');
     try { pathname = new URL(source, window.location.href).pathname; } catch (e) { /* use raw source */ }
     const filename = decodeURIComponent(pathname).split('/').pop()?.toLowerCase() || '';
-    return Object.values(cameraModelDefinitions).find((entry) => entry.filename.toLowerCase() === filename) || null;
+    const matchedBuilding = (catalog?.buildings || []).find((building) => {
+      const storedUrl = resolveStoredBuildingModelUrl(building.model_path);
+      if (!storedUrl) return false;
+      try { return new URL(storedUrl).pathname === pathname; } catch (error) { return false; }
+    });
+    const knownFilename = bundledModelFilenameForBuilding(matchedBuilding?.building_name || '');
+    const knownDefinition = Object.values(cameraModelDefinitions).find((entry) => (
+      entry.filename.toLowerCase() === filename
+      || (knownFilename && entry.filename.toLowerCase() === knownFilename.toLowerCase())
+    ));
+    if (knownDefinition) return { ...knownDefinition, buildingId: matchedBuilding?.building_id || null };
+    if (matchedBuilding?.building_id) {
+      return {
+        code: `B${matchedBuilding.building_id}`,
+        cameraKey: `Building_ID_${matchedBuilding.building_id}`,
+        aliasKey: matchedBuilding.building_name,
+        filename,
+        buildingId: matchedBuilding.building_id
+      };
+    }
+    return null;
   };
 
-  const [modelSrc, setModelSrc] = useState(defaultModel);
+  const [modelSrc, setModelSrc] = useState('');
+  const [viewMode, setViewMode] = useState('3d');
   const [graphicsMode, setGraphicsMode] = useState(() => {
     try {
       const savedMode = window.localStorage.getItem('tdb_graphics_mode');
@@ -94,13 +145,21 @@ function ThreeDBuildingIndex() {
   const [message, setMessage] = useState('');
   const [presenceMarkers, setPresenceMarkers] = useState([]);
   const [presenceMarkersVisible, setPresenceMarkersVisible] = useState(true);
+  const [movementGuideExpanded, setMovementGuideExpanded] = useState(true);
   const [presenceLastUpdated, setPresenceLastUpdated] = useState('');
   const [presenceError, setPresenceError] = useState('');
   const [presenceDiagnostics, setPresenceDiagnostics] = useState({ unmatched: [], duplicates: [] });
   const [presenceRefreshToken, setPresenceRefreshToken] = useState(0);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
+  const [attendanceRecordsLoading, setAttendanceRecordsLoading] = useState(true);
+  const [attendanceRecordsError, setAttendanceRecordsError] = useState('');
+  const [attendanceRefreshToken, setAttendanceRefreshToken] = useState(0);
+  const [recentLogsRefreshToken, setRecentLogsRefreshToken] = useState(0);
   const [nowTime, setNowTime] = useState(new Date());
   const [catalog, setCatalog] = useState({ schools: [], buildings: [], floors: [], rooms: [] });
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [scheduleCatalog, setScheduleCatalog] = useState([]);
+  const [scheduleCatalogLoaded, setScheduleCatalogLoaded] = useState(false);
 
   const [searchTeacher, setSearchTeacher] = useState('');
   const [selectedDepartment, setSelectedDepartment] = useState('');
@@ -108,6 +167,10 @@ function ThreeDBuildingIndex() {
   const [appliedFilters, setAppliedFilters] = useState({ campus: '', building: '', floor: '', room: '' });
   const [logsPage, setLogsPage] = useState(1);
   const [recentLogStatusFilter, setRecentLogStatusFilter] = useState('recent');
+  const [pagedLogs, setPagedLogs] = useState([]);
+  const [recentLogsLoading, setRecentLogsLoading] = useState(true);
+  const [recentLogsError, setRecentLogsError] = useState('');
+  const [recentLogsPagination, setRecentLogsPagination] = useState({ page: 1, page_size: 15, total: 0, total_pages: 1 });
   const [hoveredLogGroup, setHoveredLogGroup] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [sceneBusyLabel, setSceneBusyLabel] = useState('Loading 3D model');
@@ -134,11 +197,14 @@ function ThreeDBuildingIndex() {
   const mainPanelRef = useRef(null);
   const logsPanelRef = useRef(null);
   const fileInputRef = useRef(null);
+  const buildingModelInputRef = useRef(null);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
   const rendererRef = useRef(null);
   const controlsRef = useRef(null);
   const modelRef = useRef(null);
+  const modelInitialQuaternionRef = useRef(null);
+  const frameNextBuildingModelRef = useRef(false);
   const uploadedObjectsRef = useRef([]);
   const meshMapRef = useRef({});
   const meshNameCollisionsRef = useRef({});
@@ -177,13 +243,14 @@ function ThreeDBuildingIndex() {
   const namedCameraDataRef = useRef(null);
   const cameraTweenTokenRef = useRef(0);
   const pendingNavigatorRoomRef = useRef(null);
+  const loadedModelSrcRef = useRef('');
   const keyboardKeysRef = useRef(new Set());
   const keyboardAnimationRef = useRef(null);
   const keyboardLastFrameRef = useRef(0);
   const cameraMoveSpeedRef = useRef(4);
   const fittedViewRef = useRef({ active: false, direction: [1, 0.45, 1] });
   const cameraPresetsRef = useRef(defaultCameraPresets);
-  const modelSrcRef = useRef(defaultModel);
+  const modelSrcRef = useRef('');
   const modelLoadMeterRef = useRef(null);
   const modelLoadFillRef = useRef(null);
   const modelLoadValueRef = useRef(null);
@@ -200,6 +267,7 @@ function ThreeDBuildingIndex() {
   };
 
   const uniqueValues = (list) => Array.from(new Set((list || []).filter(Boolean)));
+  const isEntityActive = (entity) => ['active', '1', 'true'].includes(String(entity?.status || '').trim().toLowerCase());
   const normalizeKey = (value) => String(value || '')
     .trim()
     .toLowerCase()
@@ -217,11 +285,16 @@ function ThreeDBuildingIndex() {
     return `${y}-${m}-${day}`;
   };
 
-  const [selectedScheduleDate, setSelectedScheduleDate] = useState(() => toLocalYmd());
+  const selectedScheduleDate = toLocalYmd(nowTime);
+  const [selectedTableDate, setSelectedTableDate] = useState(() => toLocalYmd());
   const [modalScheduleDate, setModalScheduleDate] = useState(() => toLocalYmd());
   const [modalAttendanceRecords, setModalAttendanceRecords] = useState([]);
   const [modalRecordsLoading, setModalRecordsLoading] = useState(false);
   const [modalRecordsError, setModalRecordsError] = useState('');
+  const [modalTodayAttendanceRecords, setModalTodayAttendanceRecords] = useState([]);
+  const [modalTodayRecordsLoading, setModalTodayRecordsLoading] = useState(false);
+  const [modalTodayRecordsError, setModalTodayRecordsError] = useState('');
+  const currentDateKey = toLocalYmd(nowTime);
 
   const normalizeMeshKey = (name) => {
     return String(name || '')
@@ -1106,7 +1179,9 @@ function ThreeDBuildingIndex() {
     return {
       attendance_id: raw?.attendance_id || '',
       schedule_id: raw?.schedule_id || '',
-      user_id: raw?.user_id || raw?.teacher_id || '',
+      user_id: raw?.teacher_id ?? raw?.user_id ?? '',
+      room_id: raw?.room_id ?? '',
+      section_id: raw?.section_id ?? '',
       avatar: raw?.avatar || raw?.image || raw?.teacher_avatar || '',
       date: raw?.date || '',
       room_name: roomName,
@@ -1144,7 +1219,8 @@ function ThreeDBuildingIndex() {
     if (flagId === 2 || flagName === 'present') return 'PRESENT';
     if (flagId === 4 || flagName === 'substituted') return 'SUBSTITUTED';
     if (flagId === 7 || flagName === 'on leave' || flagName === 'on_leave') return 'ON_LEAVE';
-    if (flagId === 1 || flagId === 8 || flagName === 'upcoming' || flagName === 'pending') return 'PENDING';
+    if (flagId === 1 || flagName === 'upcoming') return 'UPCOMING';
+    if (flagId === 8 || flagName === 'pending') return 'PENDING';
     return '';
   };
 
@@ -1192,6 +1268,13 @@ function ThreeDBuildingIndex() {
       if (inMins !== null && startMins !== null && inMins > (startMins + 5)) return 'LATE';
     }
     return 'PRESENT';
+  };
+
+  const computeOverallAttendanceStatus = (record) => {
+    const statuses = ['in', 'mid', 'out'].map((checkpoint) => computeCheckpointStatus(record, checkpoint));
+    const counts = statuses.reduce((result, value) => ({ ...result, [value]: (result[value] || 0) + 1 }), {});
+    const winner = Object.entries(counts).find(([, count]) => count >= 2);
+    return winner ? winner[0] : 'INCOMPLETE';
   };
 
   const normalizeScheduleForDate = (schedule, dateKey) => normalizeRecord({
@@ -1242,10 +1325,11 @@ function ThreeDBuildingIndex() {
     return `text:${String(record?.subject_code || record?.subject_name || record?.subject || '').trim().toLowerCase()}`;
   };
   const scheduleTeacherKey = (record) => String(
-    record?.user_id || record?.teacher_id || record?.teacher_name || ''
+    record?.teacher_id ?? record?.user_id ?? record?.teacher_name ?? ''
   ).trim().toLowerCase();
   const parallelScheduleGroupKey = (record) => [
     scheduleTeacherKey(record),
+    String(record?.semester_id ?? ''),
     normalizeDateKey(record?.date),
     String(record?.start_time || '').slice(0, 5),
     String(record?.end_time || '').slice(0, 5),
@@ -1255,6 +1339,8 @@ function ThreeDBuildingIndex() {
     if (!left || !right) return false;
     const leftTeacher = scheduleTeacherKey(left);
     const rightTeacher = scheduleTeacherKey(right);
+    const leftSemester = String(left.semester_id ?? '');
+    const rightSemester = String(right.semester_id ?? '');
     const leftDate = normalizeDateKey(left.date);
     const rightDate = normalizeDateKey(right.date);
     const leftStart = String(left.start_time || '').slice(0, 5);
@@ -1263,17 +1349,28 @@ function ThreeDBuildingIndex() {
     const rightEnd = String(right.end_time || '').slice(0, 5);
     const leftSubject = scheduleSubjectKey(left);
     const rightSubject = scheduleSubjectKey(right);
-    if (!leftTeacher || !rightTeacher || !leftDate || !rightDate || !leftStart || !rightStart || !leftEnd || !rightEnd) return false;
+    const leftSchedule = String(left.schedule_id ?? '');
+    const rightSchedule = String(right.schedule_id ?? '');
+    const leftSection = String(left.section_id ?? '');
+    const rightSection = String(right.section_id ?? '');
+    const leftRoom = String(left.room_id ?? '');
+    const rightRoom = String(right.room_id ?? '');
+    if (!leftTeacher || !rightTeacher || !leftSemester || !rightSemester || !leftDate || !rightDate || !leftStart || !rightStart || !leftEnd || !rightEnd) return false;
+    if (!leftSchedule || !rightSchedule || !leftSection || !rightSection || !leftRoom || !rightRoom) return false;
     if (leftSubject === 'text:' || rightSubject === 'text:') return false;
     return leftTeacher === rightTeacher
+      && leftSemester === rightSemester
       && leftDate === rightDate
       && leftStart === rightStart
       && leftEnd === rightEnd
-      && leftSubject === rightSubject;
+      && leftSubject === rightSubject
+      && leftSchedule !== rightSchedule
+      && leftSection !== rightSection
+      && leftRoom !== rightRoom;
   };
   const getParallelSchedules = (record, records = attendanceRecords) => {
-    const matches = (records || []).filter((candidate) => isParallelSchedule(candidate, record));
-    return matches.length > 1 ? matches : [];
+    const parallelPeers = (records || []).filter((candidate) => isParallelSchedule(candidate, record));
+    return parallelPeers.length > 0 ? [record, ...parallelPeers] : [];
   };
 
   const attendanceCampusOptions = useMemo(() => {
@@ -1307,8 +1404,8 @@ function ThreeDBuildingIndex() {
 
   const campusOptions = useMemo(() => {
     const schoolNames = uniqueValues((catalog.schools || []).map(s => s.school_name));
-    return schoolNames.length ? schoolNames : attendanceCampusOptions;
-  }, [catalog.schools, attendanceCampusOptions]);
+    return catalogLoaded ? schoolNames : attendanceCampusOptions;
+  }, [catalog.schools, attendanceCampusOptions, catalogLoaded]);
 
   const selectedCampusId = useMemo(() => {
     if (!pendingFilters.campus) return null;
@@ -1327,8 +1424,8 @@ function ThreeDBuildingIndex() {
   }, [catalog.buildings, selectedCampusId]);
 
   const buildingOptions = useMemo(() => {
-    return catalogBuildingOptions.length ? catalogBuildingOptions : attendanceBuildingOptions;
-  }, [catalogBuildingOptions, attendanceBuildingOptions]);
+    return catalogLoaded ? catalogBuildingOptions : attendanceBuildingOptions;
+  }, [catalogBuildingOptions, attendanceBuildingOptions, catalogLoaded]);
 
   const selectedBuilding = useMemo(() => {
     if (!pendingFilters.building) return null;
@@ -1348,8 +1445,8 @@ function ThreeDBuildingIndex() {
   }, [catalog.floors, selectedBuildingId]);
 
   const floorOptions = useMemo(() => {
-    return catalogFloorOptions.length ? catalogFloorOptions : attendanceFloorOptions;
-  }, [catalogFloorOptions, attendanceFloorOptions]);
+    return catalogLoaded ? catalogFloorOptions : attendanceFloorOptions;
+  }, [catalogFloorOptions, attendanceFloorOptions, catalogLoaded]);
 
   const selectedFloor = useMemo(() => {
     if (!pendingFilters.floor) return null;
@@ -1373,33 +1470,43 @@ function ThreeDBuildingIndex() {
   }, [catalog.rooms, selectedBuildingId, selectedFloorId]);
 
   const roomOptions = useMemo(() => {
-    return catalogRoomOptions.length ? catalogRoomOptions : attendanceRoomOptions;
-  }, [catalogRoomOptions, attendanceRoomOptions]);
+    return catalogLoaded ? catalogRoomOptions : attendanceRoomOptions;
+  }, [catalogRoomOptions, attendanceRoomOptions, catalogLoaded]);
   const sortedRoomOptions = useMemo(() => {
     return [...roomOptions].sort((a, b) => String(a).localeCompare(String(b)));
   }, [roomOptions]);
 
   const navigatorBuildings = useMemo(() => {
+    if (catalogLoaded) {
+      return [...(catalog.buildings || [])]
+        .filter((building) => building.building_name)
+        .map((building) => ({
+          id: building.building_id,
+          name: building.building_name,
+          displayName: toDisplayName(building.building_name)
+        }))
+        .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+    }
+    const activeNames = (catalog.buildings || []).map((building) => building.building_name);
     const fromModel = (modelHierarchy.buildings || []).map((entry) => ({
+      id: (catalog.buildings || []).find((building) => nameEq(building.building_name, entry.name))?.building_id || null,
       name: entry.name,
       displayName: entry.displayName
-    }));
+    })).filter((entry) => !catalogLoaded || activeNames.some((name) => nameEq(name, entry.name)));
     if (fromModel.length) {
       return fromModel.sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
     }
-    return [...(catalog.buildings || [])]
-      .filter((building) => building.building_name)
-      .map((building) => ({
-        name: building.building_name,
-        displayName: toDisplayName(building.building_name)
-      }))
-      .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
-  }, [modelHierarchy.buildings, catalog.buildings]);
+    return [];
+  }, [modelHierarchy.buildings, catalog.buildings, catalogLoaded]);
 
   const navigatorFloors = useMemo(() => {
     if (!navigatorBuilding) return [];
     const fromModel = [...(modelHierarchy.floors || [])]
       .filter((floor) => nameEq(floor.buildingName, navigatorBuilding))
+      .filter((floor) => !catalogLoaded || (catalog.floors || []).some((activeFloor) =>
+        nameEq(activeFloor.floor_name, floor.floorName)
+        && nameEq(activeFloor.building_name, floor.buildingName)
+      ))
       .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
     if (fromModel.length) return fromModel;
     return [...(catalog.floors || [])]
@@ -1410,7 +1517,27 @@ function ThreeDBuildingIndex() {
         displayName: toDisplayName(floor.floor_name)
       }))
       .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
-  }, [modelHierarchy.floors, navigatorBuilding, catalog.floors]);
+  }, [modelHierarchy.floors, navigatorBuilding, catalog.floors, catalogLoaded]);
+
+  const tableFloorOptions = useMemo(() => {
+    if (navigatorBuilding) return navigatorFloors;
+    const uniqueFloors = new Map();
+    (catalog.floors || []).forEach((floor) => {
+      const floorName = String(floor.floor_name || '').trim();
+      const key = floorName.toLowerCase();
+      if (!key || uniqueFloors.has(key)) return;
+      uniqueFloors.set(key, {
+        buildingName: '',
+        floorName,
+        displayName: toDisplayName(floorName)
+      });
+    });
+    return [...uniqueFloors.values()].sort((left, right) => String(left.displayName).localeCompare(String(right.displayName)));
+  }, [navigatorBuilding, navigatorFloors, catalog.floors]);
+
+  const navigatorBuildingRecord = useMemo(() => (
+    (catalog.buildings || []).find((building) => nameEq(building.building_name, navigatorBuilding)) || null
+  ), [catalog.buildings, navigatorBuilding]);
 
   const navigatorRooms = useMemo(() => {
     const search = String(buildingSearchText || '').trim().toLowerCase();
@@ -1429,6 +1556,13 @@ function ThreeDBuildingIndex() {
 
     return baseRooms
       .filter((room) => {
+        if (catalogLoaded && !(catalog.rooms || []).some((activeRoom) => {
+          if (!nameEq(activeRoom.room_name, room.roomName)) return false;
+          const activeBuilding = (catalog.buildings || []).find((building) => String(building.building_id) === String(activeRoom.building_id));
+          const activeFloor = (catalog.floors || []).find((floor) => String(floor.floor_id) === String(activeRoom.floor_id));
+          return (!room.buildingName || nameEq(activeBuilding?.building_name, room.buildingName))
+            && (!room.floorName || nameEq(activeFloor?.floor_name, room.floorName));
+        })) return false;
         if (navigatorBuilding && !nameEq(room.buildingName, navigatorBuilding)) return false;
         if (navigatorFloor && !nameEq(room.floorName, navigatorFloor)) return false;
         if (!search) return true;
@@ -1437,7 +1571,7 @@ function ThreeDBuildingIndex() {
           || room.floorName.toLowerCase().includes(search);
       })
       .sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
-  }, [modelHierarchy.rooms, navigatorBuilding, navigatorFloor, buildingSearchText, catalog.rooms, catalog.buildings, catalog.floors]);
+  }, [modelHierarchy.rooms, navigatorBuilding, navigatorFloor, buildingSearchText, catalog.rooms, catalog.buildings, catalog.floors, catalogLoaded]);
 
   const roomExplorerRooms = useMemo(() => {
     const labelFilter = String(roomListFilter || '').trim().toLowerCase();
@@ -1453,30 +1587,47 @@ function ThreeDBuildingIndex() {
       }
     }
 
+    // Resolve the selected floor inside the selected building so rooms are
+    // filtered by their stable floor_id instead of a display-name comparison.
+    let filterFloorId = null;
+    if (navigatorFloor && filterBuildingId) {
+      const matchedFloor = (catalog.floors || []).find(floor =>
+        String(floor.building_id) === filterBuildingId
+        && nameEq(floor.floor_name, navigatorFloor)
+      );
+      if (!matchedFloor) return [];
+      filterFloorId = String(matchedFloor.floor_id);
+    }
+
     return (catalog.rooms || [])
       .filter((room) => {
         // Filter by building if navigatorBuilding is set
         if (filterBuildingId && String(room.building_id) !== filterBuildingId) return false;
+        // Filter by floor unless ALL is selected
+        if (filterFloorId && String(room.floor_id) !== filterFloorId) return false;
         // Filter by search text
         if (labelFilter && !String(room.room_name || '').toLowerCase().includes(labelFilter)) return false;
         return true;
       })
       .sort((a, b) => String(a.room_name || '').localeCompare(String(b.room_name || '')));
-  }, [catalog.rooms, catalog.buildings, navigatorBuilding, roomListFilter]);
+  }, [catalog.rooms, catalog.buildings, catalog.floors, navigatorBuilding, navigatorFloor, roomListFilter]);
 
   useEffect(() => {
-    setPendingFilters(prev => ({
-      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
-      building: prev.building && buildingOptions.includes(prev.building) ? prev.building : '',
-      floor: prev.floor && floorOptions.includes(prev.floor) ? prev.floor : '',
-      room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
-    }));
-    setAppliedFilters(prev => ({
-      campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
-      building: prev.building && buildingOptions.includes(prev.building) ? prev.building : '',
-      floor: prev.floor && floorOptions.includes(prev.floor) ? prev.floor : '',
-      room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
-    }));
+    const keepValidFilters = (prev) => {
+      const next = {
+        campus: (prev.campus && campusOptions.includes(prev.campus)) ? prev.campus : '',
+        building: prev.building && buildingOptions.includes(prev.building) ? prev.building : '',
+        floor: prev.floor && floorOptions.includes(prev.floor) ? prev.floor : '',
+        room: prev.room && roomOptions.includes(prev.room) ? prev.room : ''
+      };
+      const unchanged = next.campus === prev.campus
+        && next.building === prev.building
+        && next.floor === prev.floor
+        && next.room === prev.room;
+      return unchanged ? prev : next;
+    };
+    setPendingFilters(keepValidFilters);
+    setAppliedFilters(keepValidFilters);
   }, [campusOptions, buildingOptions, floorOptions, roomOptions]);
 
   const recordMatchesFilter = (record, filters) => {
@@ -1546,73 +1697,8 @@ function ThreeDBuildingIndex() {
     return { label: '', kind: 'none' };
   };
 
-  const allRecentLogs = useMemo(() => {
-    const checkpoints = [
-      { key: 'in', label: 'CHECK IN' },
-      { key: 'mid', label: 'CHECK MID' },
-      { key: 'out', label: 'CHECK OUT' }
-    ];
-    const orderedRecords = [...searchedRecords].sort((left, right) => {
-      const leftTime = left.time_out || left.time_check || left.time_in || left.end_time || left.start_time || '';
-      const rightTime = right.time_out || right.time_check || right.time_in || right.end_time || right.start_time || '';
-      const leftDate = toDateTime(left.date, leftTime) || new Date(0);
-      const rightDate = toDateTime(right.date, rightTime) || new Date(0);
-      return rightDate.getTime() - leftDate.getTime();
-    });
-    return orderedRecords.flatMap((rec, idx) => {
-      const parallelSchedules = getParallelSchedules(rec, searchedRecords);
-      const parallelGroupKey = parallelSchedules.length > 1 ? parallelScheduleGroupKey(rec) : '';
-      const attendanceGroupKey = rec.attendance_id || [
-        rec.schedule_id || idx,
-        scheduleTeacherKey(rec),
-        normalizeDateKey(rec.date),
-        rec.room_name || ''
-      ].join('|');
-      const highlightGroupKey = parallelGroupKey
-        ? `parallel:${parallelGroupKey}`
-        : `attendance:${attendanceGroupKey}`;
-      return checkpoints.map((checkpoint) => {
-        const status = computeRecentLogStatus(rec, checkpoint.key);
-        const timeDisplay = getRecentLogTimeDisplay(rec, checkpoint.key, status);
-        return {
-          id: `${rec.attendance_id || rec.schedule_id || idx}-${rec.teacher_name}-${rec.room_name}-${checkpoint.key}`,
-          teacherName: rec.teacher_name || 'Teacher',
-          roomName: rec.room_name || '-',
-          campusName: rec.campus_name || '',
-          buildingName: rec.building_name || '',
-          floorName: rec.floor_name || '',
-          avatar: rec.avatar || '',
-          subjectLabel: `${rec.subject_code || ''} ${rec.subject_name || ''}`.trim() || 'Subject not specified',
-          sectionName: rec.section_name || 'Section not specified',
-          type: checkpoint.label,
-          status,
-          isParallel: !!parallelGroupKey,
-          parallelGroupKey,
-          highlightGroupKey,
-          timeLabel: timeDisplay.label,
-          timeKind: timeDisplay.kind,
-          record: rec
-        };
-      });
-    });
-  }, [searchedRecords]);
-
-  const recentLogs = useMemo(() => {
-    if (recentLogStatusFilter === 'recent') {
-      return allRecentLogs.filter((log) => ['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    if (recentLogStatusFilter === 'other') {
-      return allRecentLogs.filter((log) => !['PRESENT', 'LATE', 'ABSENT'].includes(log.status));
-    }
-    return allRecentLogs.filter((log) => log.status === recentLogStatusFilter);
-  }, [allRecentLogs, recentLogStatusFilter]);
-
-  const LOGS_PER_PAGE = 15;
-  const totalLogPages = Math.max(1, Math.ceil(recentLogs.length / LOGS_PER_PAGE));
-  const pagedLogs = useMemo(() => {
-    const start = (logsPage - 1) * LOGS_PER_PAGE;
-    return recentLogs.slice(start, start + LOGS_PER_PAGE);
-  }, [recentLogs, logsPage]);
+  const LOGS_PER_PAGE = 10;
+  const totalLogPages = Math.max(1, Number(recentLogsPagination.total_pages || 1));
   const visibleLogPages = useMemo(() => {
     const buttonCount = Math.min(5, totalLogPages);
     const maximumStart = Math.max(1, totalLogPages - buttonCount + 1);
@@ -1630,6 +1716,50 @@ function ThreeDBuildingIndex() {
   useEffect(() => {
     setLogsPage(1);
   }, [appliedFilters, selectedScheduleDate, recentLogStatusFilter]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const fetchRecentLogs = async () => {
+      setRecentLogsLoading(true);
+      setRecentLogsError('');
+      try {
+        const query = new URLSearchParams({
+          date: normalizeDateKey(selectedScheduleDate) || toLocalYmd(),
+          log_view: '1',
+          log_status: recentLogStatusFilter,
+          page: String(logsPage),
+          page_size: String(LOGS_PER_PAGE),
+          include_avatar: '0'
+        });
+        if (appliedFilters.campus) query.set('campus_name', appliedFilters.campus);
+        if (appliedFilters.building) query.set('building_name', appliedFilters.building);
+        if (appliedFilters.floor) query.set('floor_name', appliedFilters.floor);
+        if (appliedFilters.room) query.set('room_name', appliedFilters.room);
+        const payload = await apiGet(`attendance?${query.toString()}`, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        const nextRows = (Array.isArray(payload?.rows) ? payload.rows : []).map((log) => ({
+          ...log,
+          avatar: log.avatar ? resolveApiAssetUrl(log.avatar) : '',
+          record: normalizeRecord(log.record || {})
+        }));
+        setPagedLogs(nextRows);
+        setRecentLogsPagination(payload?.pagination || { page: 1, page_size: LOGS_PER_PAGE, total: nextRows.length, total_pages: 1 });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setPagedLogs([]);
+        setRecentLogsError(error?.body?.message || error?.message || 'Unable to load recent logs.');
+      } finally {
+        if (!controller.signal.aborted) setRecentLogsLoading(false);
+      }
+    };
+    fetchRecentLogs();
+    return () => controller.abort();
+  }, [appliedFilters, selectedScheduleDate, recentLogStatusFilter, logsPage, attendanceRefreshToken, recentLogsRefreshToken]);
+
+  useAutoRefresh({
+    refresh: () => setRecentLogsRefreshToken((value) => value + 1),
+    intervalMs: AUTO_REFRESH_INTERVALS.WORKFLOW,
+  });
 
   useEffect(() => {
     const timer = setInterval(() => setNowTime(new Date()), 60000);
@@ -1671,42 +1801,73 @@ function ThreeDBuildingIndex() {
         ]);
         if (!mounted) return;
         const clean = (list) => Array.isArray(list)
-          ? list.filter(x => String(x.status || '').toLowerCase() !== 'archive')
+          ? list.filter(isEntityActive)
           : [];
+        const activeSchools = clean(schools);
+        const activeSchoolIds = new Set(activeSchools.map((school) => String(school.school_id)));
+        const activeBuildings = clean(buildings).filter((building) => (
+          !building.school_id || activeSchoolIds.has(String(building.school_id))
+        ));
+        const activeBuildingIds = new Set(activeBuildings.map((building) => String(building.building_id)));
+        const activeFloors = clean(floors).filter((floor) => activeBuildingIds.has(String(floor.building_id)));
+        const activeFloorIds = new Set(activeFloors.map((floor) => String(floor.floor_id)));
+        const activeRooms = clean(rooms).filter((room) => (
+          activeBuildingIds.has(String(room.building_id))
+          && activeFloorIds.has(String(room.floor_id))
+        ));
         setCatalog({
-          schools: clean(schools),
-          buildings: clean(buildings),
-          floors: clean(floors),
-          rooms: clean(rooms)
+          schools: activeSchools,
+          buildings: activeBuildings,
+          floors: activeFloors,
+          rooms: activeRooms
         });
+        setCatalogLoaded(true);
       } catch (err) {
         console.error('Catalog fetch failed:', err);
+        if (mounted) setCatalogLoaded(false);
       }
     })();
     return () => { mounted = false; };
   }, []);
 
   useEffect(() => {
+    let active = true;
+    apiGet('class-schedules?compact=1&include_avatar=0')
+      .then((rows) => {
+        if (active) setScheduleCatalog(Array.isArray(rows) ? rows : []);
+      })
+      .catch((error) => console.warn('Schedule fetch failed for 3D viewer:', error))
+      .finally(() => { if (active) setScheduleCatalogLoaded(true); });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!scheduleCatalogLoaded) return undefined;
     const fetchTeacherLocation = async () => {
+      setAttendanceRecordsLoading(true);
+      setAttendanceRecordsError('');
       try {
         const queryDate = selectedScheduleDate || toLocalYmd();
-        const [records, schedules] = await Promise.all([
-          apiGet(`attendance?date=${encodeURIComponent(queryDate)}`),
-          apiGet('class-schedules').catch((err) => {
-            console.warn('Schedule fetch failed for 3D viewer:', err);
-            return [];
-          })
-        ]);
+        const query = new URLSearchParams({ date: queryDate, include_avatar: '0' });
+        if (appliedFilters.campus) query.set('campus_name', appliedFilters.campus);
+        if (appliedFilters.building) query.set('building_name', appliedFilters.building);
+        if (appliedFilters.floor) query.set('floor_name', appliedFilters.floor);
+        if (appliedFilters.room) query.set('room_name', appliedFilters.room);
+        const records = await apiGet(`attendance?${query.toString()}`);
         const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
-        const scheduleRecords = buildScheduleRecordsForDate(Array.isArray(schedules) ? schedules : [], queryDate);
+        const scheduleRecords = buildScheduleRecordsForDate(scheduleCatalog, queryDate)
+          .filter(record => recordMatchesFilter(record, appliedFilters));
         setAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, queryDate));
         setMessage('');
       } catch (err) {
         console.error('Attendance fetch failed:', err);
+        setAttendanceRecordsError(err?.body?.message || err?.message || 'Unable to load attendance records.');
         if (err?.status === 401 || err?.status === 403) {
           setMessage('Unable to load schedules. Please sign in again.');
           setAttendanceRecords([]);
         }
+      } finally {
+        setAttendanceRecordsLoading(false);
       }
     };
 
@@ -1715,9 +1876,10 @@ function ThreeDBuildingIndex() {
     // attendance/history refresh infrequent so it does not interrupt the viewer.
     const interval = setInterval(fetchTeacherLocation, 300000);
     return () => clearInterval(interval);
-  }, [selectedScheduleDate]);
+  }, [selectedScheduleDate, attendanceRefreshToken, scheduleCatalog, scheduleCatalogLoaded, appliedFilters]);
 
   useEffect(() => {
+    if (!scheduleCatalogLoaded) return undefined;
     if (!teacherStatusModal) {
       setModalAttendanceRecords([]);
       setModalRecordsLoading(false);
@@ -1741,16 +1903,10 @@ function ThreeDBuildingIndex() {
 
     (async () => {
       try {
-        const [records, schedules] = await Promise.all([
-          apiGet(`attendance?date=${encodeURIComponent(modalDateKey)}`),
-          apiGet('class-schedules').catch((error) => {
-            console.warn('Modal schedule fetch failed for 3D viewer:', error);
-            return [];
-          })
-        ]);
+        const records = await apiGet(`attendance?date=${encodeURIComponent(modalDateKey)}&include_avatar=0`);
         if (cancelled) return;
         const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
-        const scheduleRecords = buildScheduleRecordsForDate(Array.isArray(schedules) ? schedules : [], modalDateKey);
+        const scheduleRecords = buildScheduleRecordsForDate(scheduleCatalog, modalDateKey);
         setModalAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, modalDateKey));
       } catch (error) {
         if (cancelled) return;
@@ -1764,7 +1920,51 @@ function ThreeDBuildingIndex() {
     return () => {
       cancelled = true;
     };
-  }, [teacherStatusModal, modalScheduleDate, selectedScheduleDate]);
+  }, [teacherStatusModal, modalScheduleDate, selectedScheduleDate, scheduleCatalog, scheduleCatalogLoaded]);
+
+  useEffect(() => {
+    if (!scheduleCatalogLoaded) return undefined;
+    if (!teacherStatusModal) {
+      setModalTodayAttendanceRecords([]);
+      setModalTodayRecordsLoading(false);
+      setModalTodayRecordsError('');
+      return undefined;
+    }
+
+    const todayKey = currentDateKey;
+    const pageDateKey = normalizeDateKey(selectedScheduleDate) || todayKey;
+    if (pageDateKey === todayKey) {
+      setModalTodayAttendanceRecords([]);
+      setModalTodayRecordsLoading(false);
+      setModalTodayRecordsError('');
+      return undefined;
+    }
+
+    let cancelled = false;
+    setModalTodayRecordsLoading(true);
+    setModalTodayRecordsError('');
+    setModalTodayAttendanceRecords([]);
+
+    (async () => {
+      try {
+        const records = await apiGet(`attendance?date=${encodeURIComponent(todayKey)}&operational_only=1&include_avatar=0`);
+        if (cancelled) return;
+        const normalizedAttendance = Array.isArray(records) ? records.map(normalizeRecord) : [];
+        const scheduleRecords = buildScheduleRecordsForDate(scheduleCatalog, todayKey);
+        setModalTodayAttendanceRecords(mergeSchedulesWithAttendance(scheduleRecords, normalizedAttendance, todayKey));
+      } catch (error) {
+        if (cancelled) return;
+        console.error('Today attendance fetch failed:', error);
+        setModalTodayRecordsError("Unable to load today's attendance records.");
+      } finally {
+        if (!cancelled) setModalTodayRecordsLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [teacherStatusModal, selectedScheduleDate, currentDateKey, scheduleCatalog, scheduleCatalogLoaded]);
 
   useEffect(() => {
     if (!window.THREE || !mountRef.current) return;
@@ -2022,6 +2222,7 @@ function ThreeDBuildingIndex() {
       clearUploadedObjects({ suppressTransformSync: true });
       removeSceneObject(modelRef.current);
       modelRef.current = null;
+      modelInitialQuaternionRef.current = null;
       renderer.renderLists?.dispose?.();
       hideUploadAnchorButtons();
       meshMapRef.current = {};
@@ -2053,6 +2254,7 @@ function ThreeDBuildingIndex() {
   useEffect(() => {
     if (!sceneRef.current || !window.THREE) return;
     let cancelled = false;
+    loadedModelSrcRef.current = '';
 
     stopKeyboardNavigation();
     clearPendingUploadPreview();
@@ -2066,6 +2268,7 @@ function ThreeDBuildingIndex() {
     if (modelRef.current) {
       removeSceneObject(modelRef.current);
       modelRef.current = null;
+      modelInitialQuaternionRef.current = null;
       rendererRef.current?.renderLists?.dispose?.();
       requestSceneRender();
     }
@@ -2074,6 +2277,14 @@ function ThreeDBuildingIndex() {
     updateModelLoadProgress(0);
     setStatus('loading');
     setMessage('');
+
+    if (!modelSrc) {
+      setModelHierarchy({ buildings: [], floors: [], rooms: [] });
+      setStatus('empty');
+      setMessage('No 3D building model has been added yet.');
+      requestSceneRender();
+      return () => { cancelled = true; };
+    }
 
     const loader = new window.THREE.GLTFLoader();
     loader.load(
@@ -2105,12 +2316,16 @@ function ThreeDBuildingIndex() {
         }
         sceneRef.current.add(object);
         modelRef.current = object;
+        modelInitialQuaternionRef.current = object.quaternion.clone();
         const modelBounds = new window.THREE.Box3().setFromObject(object);
         if (!modelBounds.isEmpty()) {
           const modelSize = modelBounds.getSize(new window.THREE.Vector3());
           cameraMoveSpeedRef.current = Math.max(Math.max(modelSize.x, modelSize.y, modelSize.z) * 0.12, 1);
         }
-        if (!applyCurrentBuildingFrontView(modelSrc)) {
+        if (frameNextBuildingModelRef.current) {
+          frameNextBuildingModelRef.current = false;
+          frameObjectInCamera(object);
+        } else if (!applyCurrentBuildingFrontView(modelSrc)) {
           frameObjectInCamera(object);
         }
         requestAnimationFrame(() => {
@@ -2118,6 +2333,7 @@ function ThreeDBuildingIndex() {
           requestSceneRender();
         });
         updateModelLoadProgress(100);
+        loadedModelSrcRef.current = modelSrc;
         setStatus('ready');
       },
       (event) => {
@@ -2128,6 +2344,7 @@ function ThreeDBuildingIndex() {
       },
       (error) => {
         if (cancelled) return;
+        frameNextBuildingModelRef.current = false;
         console.error(error);
         setStatus('error');
         setMessage('Failed to load model.');
@@ -2139,31 +2356,36 @@ function ThreeDBuildingIndex() {
     };
   }, [modelSrc]);
 
-  useEffect(() => {
+  const presenceRequestRef = useRef(null);
+
+  const refreshPresence = React.useCallback(async () => {
     const definition = getCameraModelDefinition(modelSrc);
-    if (status !== 'ready' || !definition || !modelRef.current) return undefined;
+    const isTableView = viewMode === 'table';
+    if (isTableView || status !== 'ready' || !definition || !modelRef.current) return;
 
-    let stopped = false;
-    let controller = null;
-
-    const fetchPresence = async () => {
-      controller?.abort();
-      controller = new AbortController();
-      try {
-        const payload = await apiGet(
-          `3d-room-presence.php?building_code=${encodeURIComponent(definition.code)}`,
-          { signal: controller.signal }
-        );
-        if (stopped || controller.signal.aborted) return;
-        const markers = Array.isArray(payload?.markers) ? payload.markers : [];
-        const version = String(payload?.version || '');
-        if (version !== presenceVersionRef.current) {
-          presenceVersionRef.current = version;
-          setPresenceMarkers(markers);
-          const liveByScheduleTeacher = new Map(markers.map((marker) => [
-            `${marker.schedule_id || ''}|${marker.teacher_id || ''}`,
-            marker
-          ]));
+    presenceRequestRef.current?.abort();
+    const controller = new AbortController();
+    presenceRequestRef.current = controller;
+    try {
+      const scopeQuery = definition.buildingId
+        ? `building_id=${encodeURIComponent(definition.buildingId)}`
+        : `building_code=${encodeURIComponent(definition.code)}`;
+      const payload = await apiGet(
+        `3d-room-presence.php?${scopeQuery}`,
+        { signal: controller.signal }
+      );
+      if (controller.signal.aborted) return;
+      const markers = Array.isArray(payload?.markers) ? payload.markers : [];
+      const version = `${scopeQuery}|${String(payload?.version || '')}`;
+      if (version !== presenceVersionRef.current) {
+        presenceVersionRef.current = version;
+        setPresenceMarkers(markers);
+        setAttendanceRefreshToken((value) => value + 1);
+        const liveByScheduleTeacher = new Map(markers.map((marker) => [
+          `${marker.schedule_id || ''}|${marker.teacher_id || ''}`,
+          marker
+        ]));
+        if ((normalizeDateKey(selectedScheduleDate) || toLocalYmd()) === toLocalYmd()) {
           setAttendanceRecords((previous) => previous.map((record) => {
             const live = liveByScheduleTeacher.get(`${record.schedule_id || ''}|${record.user_id || record.teacher_id || ''}`);
             if (!live) return record;
@@ -2180,23 +2402,28 @@ function ThreeDBuildingIndex() {
             };
           }));
         }
-        setPresenceLastUpdated(payload?.generated_at || new Date().toISOString());
-        setPresenceError('');
-      } catch (error) {
-        if (stopped || controller?.signal.aborted) return;
-        console.warn('Live 3D room presence unavailable:', error);
-        setPresenceError(error?.body?.message || error?.message || 'Unable to refresh teacher markers.');
       }
-    };
+      setPresenceLastUpdated(payload?.generated_at || new Date().toISOString());
+      setPresenceError('');
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      console.warn('Live 3D room presence unavailable:', error);
+      setPresenceError(error?.body?.message || error?.message || 'Unable to refresh teacher markers.');
+    }
+  }, [modelSrc, status, viewMode, selectedScheduleDate]);
 
-    fetchPresence();
-    const interval = window.setInterval(fetchPresence, 30000);
+  useEffect(() => {
+    refreshPresence();
     return () => {
-      stopped = true;
-      controller?.abort();
-      window.clearInterval(interval);
+      presenceRequestRef.current?.abort();
     };
-  }, [modelSrc, status, presenceRefreshToken]);
+  }, [refreshPresence, presenceRefreshToken]);
+
+  useAutoRefresh({
+    refresh: refreshPresence,
+    intervalMs: AUTO_REFRESH_INTERVALS.LIVE,
+    enabled: viewMode === '3d' && status === 'ready' && Boolean(modelSrc),
+  });
 
   useEffect(() => {
     if (status !== 'ready' || !modelRef.current || !window.THREE) {
@@ -2239,7 +2466,8 @@ function ThreeDBuildingIndex() {
 
   useEffect(() => {
     const pending = pendingNavigatorRoomRef.current;
-    if (status !== 'ready' || !pending || pending.modelSrc !== modelSrc) return;
+    if (status !== 'ready' || !pending || pending.modelSrc !== modelSrc
+      || loadedModelSrcRef.current !== pending.modelSrc) return;
     pendingNavigatorRoomRef.current = null;
     const focused = focusRoomCamera(pending.roomName, () => {
       if (pending.record) openTeacherRecordDetails(pending.record, pending.source || 'recent-log', pending.avatar || '');
@@ -2322,6 +2550,10 @@ function ThreeDBuildingIndex() {
   };
 
   const handleDefaultView = () => {
+    if (modelRef.current && modelInitialQuaternionRef.current) {
+      modelRef.current.quaternion.copy(modelInitialQuaternionRef.current);
+      modelRef.current.updateMatrixWorld(true);
+    }
     if (!applyCurrentBuildingFrontView() && modelRef.current) {
       cancelCameraMotion();
       frameObjectInCamera(modelRef.current, [1, 0.45, 1]);
@@ -2355,7 +2587,7 @@ function ThreeDBuildingIndex() {
     if (!definition || !cameraRef.current || !controlsRef.current || status !== 'ready') {
       await showSwal({
         title: 'Camera Not Ready',
-        text: 'Wait for one of the four building models to finish loading.',
+        text: 'Wait for one of the six building models to finish loading.',
         icon: 'warning'
       });
       return;
@@ -2640,11 +2872,9 @@ function ThreeDBuildingIndex() {
     setNavigatorRoom('');
     const mappedModel = getBuildingModelSrc(clean);
     if (!mappedModel) {
-      await showSwal({
-        title: 'Building Model Not Found',
-        text: `No 3D building model is mapped to "${clean}".`,
-        icon: 'warning'
-      });
+      setModelSrc('');
+      setBuildingExplorerOpen(false);
+      setRoomListOpen(true);
       return;
     }
     if (getCameraModelDefinition(mappedModel)?.code !== getCameraModelDefinition(modelSrc)?.code) {
@@ -2659,9 +2889,89 @@ function ThreeDBuildingIndex() {
     });
   };
 
+  const handleTableBuildingSelect = (buildingName) => {
+    const clean = String(buildingName || '').trim();
+    if (clean) {
+      handleNavigatorBuildingSelect(clean);
+      return;
+    }
+    setNavigatorBuilding('');
+    setNavigatorFloor('');
+    setNavigatorRoom('');
+  };
+
+  const openBuildingModelPicker = () => {
+    if (!canSaveFrontView || !navigatorBuildingRecord?.building_id || isUploadBusy) return;
+    buildingModelInputRef.current?.click();
+  };
+
+  const handlePersistentBuildingModelSelection = async (event) => {
+    const file = event.target.files?.[0] || null;
+    event.target.value = '';
+    if (!file || !navigatorBuildingRecord?.building_id || !canSaveFrontView) return;
+    if (!String(file.name || '').toLowerCase().endsWith('.glb')) {
+      await showSwal({ title: 'Invalid Model', text: 'Only binary .glb building models are allowed.', icon: 'warning' });
+      return;
+    }
+    if (file.size <= 0 || file.size > 40 * 1024 * 1024) {
+      await showSwal({ title: 'Invalid Model Size', text: 'The GLB must be larger than 0 bytes and no more than 40 MB.', icon: 'warning' });
+      return;
+    }
+
+    const replacing = Boolean(navigatorBuildingRecord.model_path);
+    if (replacing && window.Swal) {
+      const confirmation = await window.Swal.fire({
+        title: 'Change Building Model?',
+        text: `Replace the current GLB for ${navigatorBuildingRecord.building_name}? Its saved default camera view will be reset.`,
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Change Building'
+      });
+      if (!confirmation.isConfirmed) return;
+    }
+
+    setIsUploadBusy(true);
+    setSceneBusyLabel(replacing ? 'Changing building model' : 'Adding building model');
+    try {
+      const replacedDefinition = getCameraModelDefinition(modelSrc);
+      const payload = new FormData();
+      payload.append('model', file, file.name);
+      const uploaded = await apiFetch(`buildings/${navigatorBuildingRecord.building_id}/model`, { method: 'POST', body: payload });
+      const freshBuildings = await apiGet('buildings');
+      setCatalog((previous) => ({ ...previous, buildings: Array.isArray(freshBuildings) ? freshBuildings : previous.buildings }));
+      if (replacedDefinition) {
+        const nextPresets = { ...cameraPresetsRef.current };
+        [replacedDefinition.cameraKey, replacedDefinition.aliasKey].forEach((key) => {
+          if (!key) return;
+          if (defaultCameraPresets[key]) nextPresets[key] = defaultCameraPresets[key];
+          else delete nextPresets[key];
+        });
+        cameraPresetsRef.current = nextPresets;
+        setCameraPresets(nextPresets);
+      }
+      const nextSource = resolveStoredBuildingModelUrl(uploaded?.model_path, uploaded?.model_updated_at || Date.now());
+      if (nextSource) {
+        frameNextBuildingModelRef.current = true;
+        setModelSrc(nextSource);
+      }
+      await showSwal({
+        title: replacing ? 'Building Model Changed' : 'Building Model Added',
+        text: `${file.name} is now connected to ${navigatorBuildingRecord.building_name}.`,
+        icon: 'success'
+      });
+    } catch (error) {
+      await showSwal({
+        title: 'Model Upload Failed',
+        text: error?.body?.message || error?.message || 'Unable to upload the GLB building model.',
+        icon: 'error'
+      });
+    } finally {
+      setIsUploadBusy(false);
+    }
+  };
+
   const handleNavigatorFloorSelect = (floorName) => {
     const clean = String(floorName || '').trim();
-    if (!clean) return;
     setNavigatorFloor(clean);
     setNavigatorRoom('');
   };
@@ -2699,49 +3009,88 @@ function ThreeDBuildingIndex() {
     }
   };
 
-  const handleRecentLogClick = async (log) => {
-    const roomName = String(log?.roomName || '').trim();
+  const navigateRecordTo3D = async (record, source, details = {}) => {
+    const roomName = String(record?.room_name || details.roomName || '').trim();
     if (!roomName || roomName === '-') {
       await showSwal({
         title: 'Room Not Found',
-        text: 'This log has no room assigned.',
+        text: 'This record has no room assigned.',
         icon: 'warning'
       });
       return;
     }
 
+    // Database room IDs take priority over display names and the currently
+    // selected building. Keep uploaded models when resolving building aliases.
+    const roomEntry = (catalog.rooms || []).find((room) => (
+      record?.room_id && String(room.room_id) === String(record.room_id)
+    )) || (catalog.rooms || []).find((room) => (
+      (nameEq(room.room_name, roomName) || nameEq(room.roomName, roomName))
+      && (!record?.building_id || String(room.building_id) === String(record.building_id))
+    ));
+    const floorId = roomEntry?.floor_id || record?.floor_id;
+    const floorEntry = floorId ? (catalog.floors || []).find((floor) => (
+      String(floor.floor_id) === String(floorId)
+    )) : null;
+    const buildingId = roomEntry?.building_id || floorEntry?.building_id || record?.building_id;
+    const buildingHint = roomEntry?.building_name || roomEntry?.buildingName
+      || record?.building_name || details.buildingName || deriveBuildingFromRoom(roomName);
+    const bundledFilename = bundledModelFilenameForBuilding(buildingHint);
+    const buildingEntry = (buildingId ? (catalog.buildings || []).find((building) => (
+      String(building.building_id) === String(buildingId)
+    )) : null) || (catalog.buildings || []).find((building) => (
+      nameEq(building.building_name, buildingHint)
+      || (bundledFilename && bundledModelFilenameForBuilding(building.building_name) === bundledFilename)
+    ));
+    const buildingName = buildingEntry?.building_name || buildingHint;
+    const floorName = floorEntry?.floor_name || roomEntry?.floor_name
+      || record?.floor_name || details.floorName || '';
+    const mappedModel = getBuildingModelSrc(buildingName);
+    if (!mappedModel) {
+      await showSwal({
+        title: '3D Building Not Available',
+        text: `No 3D model is configured for the building containing room "${roomName}".`,
+        icon: 'warning'
+      });
+      return;
+    }
+
+    setViewMode('3d');
+    setNavigatorBuilding(buildingName);
+    setNavigatorFloor(floorName);
+    setNavigatorRoom(roomName);
     setPendingFilters((prev) => ({
       ...prev,
-      campus: log.campusName || prev.campus || '',
-      building: log.buildingName || prev.building || '',
-      floor: log.floorName || prev.floor || '',
+      campus: record?.campus_name || details.campusName || prev.campus || '',
+      building: buildingName,
+      floor: floorName,
       room: roomName
     }));
 
-    const mappedModel = getBuildingModelSrc(log.buildingName || log.record?.building_name || '');
-    const currentCode = getCameraModelDefinition(modelSrc)?.code;
-    const destinationCode = getCameraModelDefinition(mappedModel)?.code;
-    if (mappedModel && destinationCode && destinationCode !== currentCode) {
+    if (status !== 'ready' || modelSrc !== mappedModel || loadedModelSrcRef.current !== mappedModel) {
       pendingNavigatorRoomRef.current = {
         roomName,
         modelSrc: mappedModel,
-        record: log.record,
-        avatar: log.avatar,
-        source: 'recent-log'
+        record,
+        avatar: details.avatar,
+        source
       };
       setModelSrc(mappedModel);
       return;
     }
 
+    pendingNavigatorRoomRef.current = null;
     const ok = focusRoomCamera(roomName, () => {
-      openTeacherRecordDetails(log.record, 'recent-log', log.avatar);
+      openTeacherRecordDetails(record, source, details.avatar);
     });
 
     if (!ok) {
       await showMissingRoomObjectAlert(roomName);
-      openTeacherRecordDetails(log.record, 'recent-log', log.avatar);
+      openTeacherRecordDetails(record, source, details.avatar);
     }
   };
+
+  const handleRecentLogClick = (log) => navigateRecordTo3D(log?.record, 'recent-log', log || {});
 
   const applyFilterView = async () => {
     setAppliedFilters({ ...pendingFilters });
@@ -2801,6 +3150,12 @@ function ThreeDBuildingIndex() {
   const getPresenceAvatarUrl = (marker) => marker?.avatar_url
     ? resolveApiAssetUrl(marker.avatar_url)
     : defaultAvatarSrc;
+  const formatPresenceGrace = (marker) => {
+    const totalSeconds = Math.max(0, Number(marker?.grace_seconds_remaining || 0));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.floor(totalSeconds % 60);
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  };
   const setPresenceMarkerRef = (roomId, node) => {
     const key = String(roomId);
     if (node) presenceMarkerRefs.current[key] = node;
@@ -2836,6 +3191,9 @@ function ThreeDBuildingIndex() {
   };
   const openPresenceMarkerDetails = (marker) => {
     openTeacherRecordDetails(marker, 'live-presence', getPresenceAvatarUrl(marker));
+  };
+  const locateTableRecordIn3D = (record) => {
+    return navigateRecordTo3D(record, 'table-view');
   };
   const openRoomTeacherDetails = (roomName, source = 'navigation', notifyIfEmpty = true) => {
     const liveMarker = visiblePresenceMarkers.find((marker) => nameEq(marker.room_name, roomName));
@@ -2907,16 +3265,28 @@ function ThreeDBuildingIndex() {
     ? attendanceRecords
     : modalAttendanceRecords;
 
+  const modalTodaySourceRecords = (normalizeDateKey(selectedScheduleDate) || currentDateKey) === currentDateKey
+    ? attendanceRecords
+    : modalTodayAttendanceRecords;
+  const modalTodayIsLoading = (normalizeDateKey(selectedScheduleDate) || currentDateKey) === currentDateKey
+    ? attendanceRecordsLoading
+    : modalTodayRecordsLoading;
+  const modalTodayError = (normalizeDateKey(selectedScheduleDate) || currentDateKey) === currentDateKey
+    ? attendanceRecordsError
+    : modalTodayRecordsError;
+
   const modalRoomSchedules = useMemo(() => {
     if (!teacherStatusModal) return [];
     const roomName = String(teacherStatusModal.record?.room_name || '').trim();
+    const teacherQuery = String(searchTeacher || '').trim().toLowerCase();
     const dateKey = normalizeDateKey(modalScheduleDate) || toLocalYmd();
     return modalSourceRecords
       .filter((record) => normalizeDateKey(record.date) === dateKey)
       .filter((record) => !roomName || nameEq(record.room_name, roomName))
       .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
+      .filter((record) => !teacherQuery || String(record.teacher_name || '').toLowerCase().includes(teacherQuery))
       .sort((left, right) => String(left.start_time || '').localeCompare(String(right.start_time || '')));
-  }, [teacherStatusModal, modalSourceRecords, modalScheduleDate, selectedDepartment, canSaveFrontView]);
+  }, [teacherStatusModal, modalSourceRecords, modalScheduleDate, selectedDepartment, searchTeacher, canSaveFrontView]);
 
   const modalTeacherOptions = useMemo(() => uniqueValues(
     modalSourceRecords
@@ -2930,14 +3300,23 @@ function ThreeDBuildingIndex() {
     modalSourceRecords.map((record) => record.department_name)
   ).sort(), [modalSourceRecords]);
 
+  const modalTodayRoomSchedules = useMemo(() => {
+    if (!teacherStatusModal) return [];
+    const roomName = String(teacherStatusModal.record?.room_name || '').trim();
+    const todayKey = currentDateKey;
+    return modalTodaySourceRecords
+      .filter((record) => normalizeDateKey(record.date) === todayKey)
+      .filter((record) => !roomName || nameEq(record.room_name, roomName))
+      .filter((record) => !canSaveFrontView || !selectedDepartment || nameEq(record.department_name, selectedDepartment))
+      .sort((left, right) => String(left.start_time || '').localeCompare(String(right.start_time || '')));
+  }, [teacherStatusModal, modalTodaySourceRecords, selectedDepartment, canSaveFrontView, currentDateKey]);
+
   const modalRecentAttendance = useMemo(() => {
-    const teacherQuery = String(searchTeacher || '').trim().toLowerCase();
-    return modalRoomSchedules
-      .filter((record) => !teacherQuery || String(record.teacher_name || '').toLowerCase().includes(teacherQuery))
+    return modalTodayRoomSchedules
       .flatMap((record, recordIndex) => ([
-        { key: `${record.schedule_id || recordIndex}-in`, label: 'Check in', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'in'), time: record.time_in },
-        { key: `${record.schedule_id || recordIndex}-mid`, label: 'Mid-check', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'mid'), time: record.time_check },
-        { key: `${record.schedule_id || recordIndex}-out`, label: 'Check out', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'out'), time: record.time_out }
+        { key: `${record.schedule_id || recordIndex}-in`, label: 'Check in', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'in'), time: record.time_in, record, stage: 'in' },
+        { key: `${record.schedule_id || recordIndex}-mid`, label: 'Mid-check', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'mid'), time: record.time_check, record, stage: 'mid' },
+        { key: `${record.schedule_id || recordIndex}-out`, label: 'Check out', teacherName: record.teacher_name, status: computeCheckpointStatus(record, 'out'), time: record.time_out, record, stage: 'out' }
       ]))
       .sort((left, right) => {
     if (!left.time && !right.time) return 0;
@@ -2945,16 +3324,37 @@ function ThreeDBuildingIndex() {
     if (!right.time) return -1;
     return String(right.time).localeCompare(String(left.time));
       });
-  }, [modalRoomSchedules, searchTeacher]);
+  }, [modalTodayRoomSchedules]);
 
   const modalSelectedDate = modalDateParts(modalScheduleDate);
+  const modalTodayDate = modalDateParts(currentDateKey);
 
   return (
     <div className="tdb-page">
       <div className="tdb-shell">
         <div className="tdb-main" ref={mainPanelRef}>
           <div className="tdb-top-row">
-            <h2 className="tdb-title">3D Building Viewer</h2>
+            <div className="tdb-title-row">
+              <h2 className="tdb-title">3D Building Viewer</h2>
+              <div className="tdb-view-mode-switch" role="group" aria-label="Building viewer display mode">
+                <button
+                  type="button"
+                  className={viewMode === '3d' ? 'is-active' : ''}
+                  onClick={() => setViewMode('3d')}
+                  aria-pressed={viewMode === '3d'}
+                >
+                  3D View
+                </button>
+                <button
+                  type="button"
+                  className={viewMode === 'table' ? 'is-active' : ''}
+                  onClick={() => setViewMode('table')}
+                  aria-pressed={viewMode === 'table'}
+                >
+                  Table View
+                </button>
+              </div>
+            </div>
             <div className="tdb-stats">
               <div className="tdb-stat-card">
                 <div className="tdb-stat-label">OTHER (UPCOMING, PENDING, ETC...)</div>
@@ -2976,7 +3376,7 @@ function ThreeDBuildingIndex() {
           </div>
 
           <div
-            className={`tdb-viewer-wrap${isFullscreen ? ' tdb-viewer-wrap--fullscreen' : ''}`}
+            className={`tdb-viewer-wrap${isFullscreen ? ' tdb-viewer-wrap--fullscreen' : ''}${viewMode === 'table' ? ' tdb-viewer-wrap--table' : ''}`}
             ref={viewerWrapRef}
           >
             <input
@@ -2985,6 +3385,13 @@ function ThreeDBuildingIndex() {
               className="tdb-hidden-file-input"
               accept={supportedUploadExts.join(',')}
               onChange={handleUploadedModelSelection}
+            />
+            <input
+              ref={buildingModelInputRef}
+              type="file"
+              className="tdb-hidden-file-input"
+              accept=".glb,model/gltf-binary"
+              onChange={handlePersistentBuildingModelSelection}
             />
 
             {!isFullscreen && (
@@ -2995,7 +3402,9 @@ function ThreeDBuildingIndex() {
                 aria-label="Expand 3D viewer fullscreen"
                 title="Expand 3D viewer"
               >
-                <span aria-hidden="true">+</span>
+                <svg className="tdb-fullscreen-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 4H4v5M15 4h5v5M20 15v5h-5M9 20H4v-5" />
+                </svg>
               </button>
             )}
 
@@ -3007,11 +3416,45 @@ function ThreeDBuildingIndex() {
                 aria-label="Exit fullscreen"
                 title="Exit fullscreen"
               >
-                <span aria-hidden="true">&times;</span>
+                <svg className="tdb-fullscreen-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9h5V4M20 9h-5V4M15 20v-5h5M9 20v-5H4" />
+                </svg>
               </button>
             )}
 
             <div className="tdb-viewer" ref={mountRef} />
+            {viewMode === 'table' && (
+              <TeacherTableView
+                buildings={navigatorBuildings}
+                floors={tableFloorOptions}
+                selectedBuilding={navigatorBuilding}
+                selectedFloor={navigatorFloor}
+                selectedDate={selectedTableDate}
+                getAvatarUrl={(record) => record?.avatar || getPresenceAvatarUrl(record)}
+                fallbackAvatar={defaultAvatarSrc}
+                onBuildingChange={handleTableBuildingSelect}
+                onFloorChange={handleNavigatorFloorSelect}
+                onDateChange={(dateValue) => setSelectedTableDate(dateValue || selectedScheduleDate)}
+                onViewDetails={(record) => openTeacherRecordDetails(record, 'table-view', record?.avatar || getPresenceAvatarUrl(record))}
+                onLocateIn3D={locateTableRecordIn3D}
+              />
+            )}
+            {navigatorBuildingRecord && !navigatorBuildingRecord.model_path && (
+              <div className="tdb-missing-building-model">
+                {canSaveFrontView ? (
+                  <button type="button" onClick={openBuildingModelPicker} disabled={isUploadBusy}>
+                    <span aria-hidden="true">+</span>
+                    <strong>{isUploadBusy ? 'Uploading GLB...' : 'Add Building Model'}</strong>
+                    <small>{navigatorBuildingRecord.building_name}</small>
+                  </button>
+                ) : (
+                  <div>
+                    <strong>No 3D model available</strong>
+                    <small>{navigatorBuildingRecord.building_name}</small>
+                  </div>
+                )}
+              </div>
+            )}
             <div className="tdb-presence-layer">
               {presenceMarkersVisible && visiblePresenceMarkers.map((marker) => (
                 <button
@@ -3020,7 +3463,7 @@ function ThreeDBuildingIndex() {
                   className={`tdb-presence-marker tdb-presence-marker--${String(marker.status || 'PENDING').toLowerCase()}`}
                   ref={(node) => setPresenceMarkerRef(marker.room_id, node)}
                   onClick={() => openPresenceMarkerDetails(marker)}
-                  title={`${marker.teacher_name} · ${marker.room_name} · ${marker.status}`}
+                  title={`${marker.teacher_name} · ${marker.room_name} · ${marker.status}${marker.is_recently_ended ? ` · Previous class · ${formatPresenceGrace(marker)} remaining` : ''}`}
                   aria-label={`Open ${marker.teacher_name} attendance details for ${marker.room_name}`}
                 >
                   <img
@@ -3036,7 +3479,9 @@ function ThreeDBuildingIndex() {
                   />
                   {marker.is_substitute && <span className="tdb-presence-sub-badge" aria-label="Substitute">S</span>}
                   {marker.is_parallel && <span className="tdb-presence-parallel-badge" aria-label="Parallel class">P</span>}
-                  <span className="tdb-presence-marker-name">{marker.teacher_name}</span>
+                  <span className="tdb-presence-marker-name">
+                    {marker.teacher_name}{marker.is_recently_ended ? ` · Previous class (${formatPresenceGrace(marker)})` : ''}
+                  </span>
                 </button>
               ))}
             </div>
@@ -3049,6 +3494,16 @@ function ThreeDBuildingIndex() {
               >
                 {presenceMarkersVisible ? 'Hide teachers' : 'Show teachers'}
               </button>
+              {presenceMarkersVisible && (
+                <div className="tdb-presence-legend" aria-label="Teacher marker legend">
+                  <span><i className="tdb-presence-dot tdb-presence-dot--present" />Present</span>
+                  <span><i className="tdb-presence-dot tdb-presence-dot--late" />Late</span>
+                  <span><i className="tdb-presence-dot tdb-presence-dot--absent" />Absent</span>
+                  <span><i className="tdb-presence-dot tdb-presence-dot--pending" />Pending</span>
+                  <span><i className="tdb-presence-dot tdb-presence-dot--on_leave" />Leave</span>
+                  <span><i className="tdb-presence-dot tdb-presence-dot--substituted" />Substitute</span>
+                </div>
+              )}
               <span className="tdb-presence-updated">Updated {presenceLastUpdatedLabel}</span>
               {presenceError && (
                 <button type="button" className="tdb-presence-retry" onClick={() => setPresenceRefreshToken((value) => value + 1)}>
@@ -3056,17 +3511,6 @@ function ThreeDBuildingIndex() {
                 </button>
               )}
             </div>
-
-            {presenceMarkersVisible && (
-              <div className="tdb-presence-legend" aria-label="Teacher marker legend">
-                <span><i className="tdb-presence-dot tdb-presence-dot--present" />Present</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--late" />Late</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--absent" />Absent</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--pending" />Pending</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--on_leave" />Leave</span>
-                <span><i className="tdb-presence-dot tdb-presence-dot--substituted" />Substitute</span>
-              </div>
-            )}
 
             {canSaveFrontView && (presenceDiagnostics.unmatched.length > 0 || presenceDiagnostics.duplicates.length > 0) && (
               <details className="tdb-presence-diagnostics">
@@ -3081,7 +3525,27 @@ function ThreeDBuildingIndex() {
             )}
 
             {presenceError && <div className="tdb-presence-error">{presenceError}</div>}
-            <div className="tdb-keyboard-hint">Click the 3D view · WASD/arrows move · Q down · E up</div>
+            {movementGuideExpanded && (
+              <div className="tdb-movement-guide">
+                <div className="tdb-movement-guide-header">
+                  <strong>Movement Guide</strong>
+                  <button
+                    type="button"
+                    className="tdb-movement-guide-toggle"
+                    onClick={() => setMovementGuideExpanded(false)}
+                    aria-label="Minimize movement guide"
+                    aria-expanded="true"
+                    aria-controls="tdb-movement-guide-content"
+                    title="Minimize movement guide"
+                  >
+                    &minus;
+                  </button>
+                </div>
+                <div id="tdb-movement-guide-content" className="tdb-movement-guide-content">
+                  Click the 3D view · WASD/arrows move · Q down · E up
+                </div>
+              </div>
+            )}
 
             <button
               type="button"
@@ -3120,7 +3584,7 @@ function ThreeDBuildingIndex() {
                         </button>
                       ))
                     ) : (
-                      <div className="tdb-navigator-empty">Loading building hierarchy...</div>
+                      <div className="tdb-navigator-empty"><LoadingState label="Loading building hierarchy..." compact /></div>
                     )}
                   </div>
                 </div>
@@ -3128,6 +3592,13 @@ function ThreeDBuildingIndex() {
                   <div className="tdb-navigator-section">
                     <div className="tdb-navigator-title">Floors</div>
                     <div className="tdb-navigator-chips">
+                      <button
+                        type="button"
+                        className={`tdb-navigator-chip ${!navigatorFloor ? 'tdb-navigator-chip--active' : ''}`}
+                        onClick={() => handleNavigatorFloorSelect('')}
+                      >
+                        ALL
+                      </button>
                       {navigatorFloors.length > 0 ? (
                         navigatorFloors.map((floor) => (
                           <button
@@ -3179,22 +3650,16 @@ function ThreeDBuildingIndex() {
               </div>
             )}
 
-            {isFullscreen && uploadAnchorDefs.map((anchor) => (
-              <button
-                key={anchor.id}
-                type="button"
-                className="tdb-glass-plus-btn tdb-glass-plus-btn--anchor"
-                onClick={() => triggerUploadDialog(anchor.id)}
-                aria-label={anchor.label}
-                title={anchor.label}
-                ref={(node) => setUploadAnchorRef(anchor.id, node)}
-                style={{ display: 'none' }}
-              >
-                <span aria-hidden="true">+</span>
-              </button>
-            ))}
-
             <div className="tdb-side-controls">
+              <button
+                type="button"
+                className={`tdb-movement-guide-switch${movementGuideExpanded ? ' tdb-movement-guide-switch--active' : ''}`}
+                onClick={() => setMovementGuideExpanded((value) => !value)}
+                aria-expanded={movementGuideExpanded}
+                aria-controls="tdb-movement-guide-content"
+              >
+                {movementGuideExpanded ? 'Hide Guide' : 'Show Guide'}
+              </button>
               <label className="tdb-graphics-control">
                 <span>Graphics</span>
                 <select
@@ -3225,26 +3690,18 @@ function ThreeDBuildingIndex() {
                   {isSavingFrontView ? 'Saving Front...' : 'Save Front View'}
                 </button>
               )}
+              {canSaveFrontView && navigatorBuildingRecord?.model_path && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm tdb-change-building-btn"
+                  onClick={openBuildingModelPicker}
+                  disabled={isUploadBusy}
+                >
+                  {isUploadBusy ? 'Uploading...' : 'Change Building'}
+                </button>
+              )}
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => applyView('top')}>Top View</button>
               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => rotateModel(45)}>Rotate</button>
-              <button
-                type="button"
-                className={`btn btn-sm ${moveModeEnabled ? 'btn-warning' : 'btn-outline-secondary'}`}
-                onClick={() => setMoveModeEnabled((prev) => !prev)}
-                disabled={!hasMovableUpload}
-                title={hasMovableUpload ? 'Drag the uploaded building to reposition it in the viewer' : 'Upload a building first'}
-              >
-                {moveModeEnabled ? 'Stop Move' : 'Move Building'}
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                onClick={resetMoveTargetPosition}
-                disabled={!hasMovableUpload}
-                title={hasMovableUpload ? 'Reset the uploaded building back to its initial viewer position' : 'Upload a building first'}
-              >
-                Reset Position
-              </button>
               {activeUploadTransform && (
                 <div className={`tdb-move-chip${moveModeEnabled ? ' tdb-move-chip--active' : ''}`}>
                   <div className="tdb-move-chip-title">
@@ -3446,7 +3903,7 @@ function ThreeDBuildingIndex() {
                         </div>
                         <div className="tdb-teacher-schedule-list">
                           {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading records for the selected date...</div>
+                            <div className="tdb-teacher-schedule-empty"><LoadingState label="Loading records for the selected date..." compact /></div>
                           ) : modalRecordsError ? (
                             <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
                           ) : modalRoomSchedules.length > 0 ? modalRoomSchedules.map((schedule, index) => {
@@ -3482,7 +3939,7 @@ function ThreeDBuildingIndex() {
                                       <div className="tdb-schedule-checkpoint" key={checkpoint.key}>
                                         <span>{checkpoint.label}</span>
                                         <strong className={`tdb-mini-status tdb-mini-status--${presenceBadgeClass(checkpointStatus)}`}>
-                                          {checkpointStatus}
+                                          {checkpointDisplayLabel(checkpointStatus, schedule, checkpoint.key)}
                                         </strong>
                                         {(checkpointStatus === 'PRESENT' || checkpointStatus === 'LATE') && checkpoint.time && (
                                           <small>{formatPresenceCheckpoint(checkpoint.time)}</small>
@@ -3498,9 +3955,9 @@ function ThreeDBuildingIndex() {
                       </div>
                       <div className="tdb-teacher-modal-column">
                         <h4>Today/Recent attendance</h4>
-                        <div className="tdb-modal-date-context" aria-label={`${modalSelectedDate.day}, ${modalSelectedDate.date}`}>
-                          <span className="tdb-modal-date-day">{modalSelectedDate.day}</span>
-                          <span className="tdb-modal-date-full">{modalSelectedDate.date}</span>
+                        <div className="tdb-modal-date-context" aria-label={`${modalTodayDate.day}, ${modalTodayDate.date}`}>
+                          <span className="tdb-modal-date-day">{modalTodayDate.day}</span>
+                          <span className="tdb-modal-date-full">{modalTodayDate.date}</span>
                         </div>
                         {!teacherStatusModal.record?.no_records ? (
                           <>
@@ -3530,14 +3987,14 @@ function ThreeDBuildingIndex() {
                         ) : (
                           <div className="tdb-teacher-empty-summary">
                             <strong>No attendance record</strong>
-                            <span>This room has no teacher attendance data for the selected date.</span>
+                            <span>This room has no teacher attendance data for today.</span>
                           </div>
                         )}
                         <div className="tdb-teacher-attendance-list">
-                          {modalRecordsLoading ? (
-                            <div className="tdb-teacher-schedule-empty">Loading attendance for the selected date...</div>
-                          ) : modalRecordsError ? (
-                            <div className="tdb-teacher-schedule-empty">{modalRecordsError}</div>
+                          {modalTodayIsLoading ? (
+                            <div className="tdb-teacher-schedule-empty"><LoadingState label="Loading today's attendance..." compact /></div>
+                          ) : modalTodayError ? (
+                            <div className="tdb-teacher-schedule-empty">{modalTodayError}</div>
                           ) : modalRecentAttendance.length > 0 ? modalRecentAttendance.map((checkpoint) => (
                             <div className="tdb-teacher-attendance-item" key={checkpoint.key}>
                               <div>
@@ -3548,10 +4005,10 @@ function ThreeDBuildingIndex() {
                                 )}
                               </div>
                               <span className={`tdb-mini-status tdb-mini-status--${presenceBadgeClass(checkpoint.status)}`}>
-                                {checkpoint.status}
+                                {checkpointDisplayLabel(checkpoint.status, checkpoint.record, checkpoint.stage)}
                               </span>
                             </div>
-                          )) : <div className="tdb-teacher-schedule-empty">No attendance records found for this room on the selected date.</div>}
+                          )) : <div className="tdb-teacher-schedule-empty">No attendance records found for this room today.</div>}
                         </div>
                       </div>
                     </div>
@@ -3634,16 +4091,6 @@ function ThreeDBuildingIndex() {
 
         <aside className="tdb-logs-panel" ref={logsPanelRef}>
           <div className="tdb-time-chip">{dateTimeStamp}</div>
-          <div className="tdb-log-date-field">
-            <label htmlFor="tdb-log-date">Logs Date</label>
-            <input
-              id="tdb-log-date"
-              type="date"
-              className="form-control form-control-sm"
-              value={selectedScheduleDate}
-              onChange={(e) => setSelectedScheduleDate(e.target.value || toLocalYmd())}
-            />
-          </div>
           <div className="tdb-log-status-filters" aria-label="Recent log status filters">
             <button
               type="button"
@@ -3654,22 +4101,40 @@ function ThreeDBuildingIndex() {
             </button>
             <select
               className="form-select form-select-sm tdb-log-other-filter"
-              aria-label="Filter Recent Logs by other status"
+              aria-label="Filter recent logs by checkpoint or overall status"
               value={recentLogStatusFilter === 'recent' ? '' : recentLogStatusFilter}
               onChange={(event) => setRecentLogStatusFilter(event.target.value || 'recent')}
             >
-              <option value="">Other status</option>
-              <option value="other">All other statuses</option>
-              <option value="UPCOMING">Upcoming</option>
-              <option value="PENDING">Pending</option>
-              <option value="SUBSTITUTED">Substituted</option>
-              <option value="ON_LEAVE">On leave</option>
+              <option value="">Choose status filter</option>
+              <optgroup label="Checkpoint status">
+                <option value="PRESENT">Present</option>
+                <option value="LATE">Late</option>
+                <option value="ABSENT">Absent</option>
+              </optgroup>
+              <optgroup label="Overall status">
+                <option value="OVERALL">All overall results</option>
+                <option value="OVERALL_PRESENT">Overall: Present</option>
+                <option value="OVERALL_LATE">Overall: Late</option>
+                <option value="OVERALL_ABSENT">Overall: Absent</option>
+                <option value="OVERALL_INCOMPLETE">Overall: Partial Attendance</option>
+              </optgroup>
+              <optgroup label="Other checkpoint status">
+                <option value="other">All other statuses</option>
+                <option value="UPCOMING">Upcoming</option>
+                <option value="PENDING">Pending</option>
+                <option value="SUBSTITUTED">Substituted</option>
+                <option value="ON_LEAVE">On leave</option>
+              </optgroup>
             </select>
           </div>
           <div className="tdb-logs-title">Recent Logs</div>
 
           <div className="tdb-logs-list">
-            {pagedLogs.length === 0 ? (
+            {recentLogsLoading && pagedLogs.length === 0 ? (
+              <div className="tdb-no-logs">Loading recent logs...</div>
+            ) : recentLogsError && pagedLogs.length === 0 ? (
+              <div className="tdb-no-logs">{recentLogsError}</div>
+            ) : pagedLogs.length === 0 ? (
               <div className="tdb-no-logs">No logs found for current filters.</div>
             ) : (
               pagedLogs.map((log) => {

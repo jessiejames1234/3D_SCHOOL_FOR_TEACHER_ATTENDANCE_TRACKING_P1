@@ -1,8 +1,10 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom';
+import LoadingState from './LoadingState.jsx';
 
 /**
- * Reusable Table with client-side pagination - Tailwind Version
+ * Reusable table with client-side pagination and optional controlled
+ * server-side pagination.
  */
 function Table({
   columns = [],
@@ -18,10 +20,18 @@ function Table({
   wrapCells = false,
   className = '',
   onRowClick = null,
+  onRowMouseEnter = null,
+  onRowMouseLeave = null,
+  rowClassName = '',
+  rowStyle = null,
   expandedRowKey = null,
   renderExpandedRow = null,
+  serverPagination = false,
+  totalItems = null,
+  page = null,
+  onPageChange = null,
 }) {
-  const [currentPage, setCurrentPage] = useState(1);
+  const [internalCurrentPage, setInternalCurrentPage] = useState(1);
 
   // Derive row key (Logic kept intact)
   const getRowKey = React.useMemo(() => {
@@ -36,36 +46,32 @@ function Table({
     };
   }, [rowKey]);
 
-  // Loading Logic: show a brief loading pulse only on initial mount (page load).
-  // Also ignore external `loading` prop after initial mount so updates (add/edit)
-  // that set loading=true in parent won't flash the table loader.
-  const [localLoading, setLocalLoading] = useState(false);
-  const initialMountRef = useRef(true);
-
-  useEffect(() => {
-    setLocalLoading(true);
-    const initTimer = setTimeout(() => setLocalLoading(false), 600);
-    // After a slightly longer window, consider initial mount finished and
-    // ignore parent `loading` toggles to avoid reload animation on updates.
-    const finishTimer = setTimeout(() => { initialMountRef.current = false; }, 900);
-    return () => { clearTimeout(initTimer); clearTimeout(finishTimer); };
-  }, []);
-
-  const finalLoading = localLoading || (loading && initialMountRef.current);
+  // Loading is controlled by the page that owns the request. A timer cannot
+  // know whether an API call has finished and previously caused false empty
+  // states whenever a response took longer than the timer.
+  const finalLoading = Boolean(loading);
 
   // Pagination Logic
-  const total = data.length;
+  const total = serverPagination
+    ? Math.max(0, Number(totalItems) || 0)
+    : data.length;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const safeCurrentPage = Math.min(Math.max(currentPage, 1), totalPages);
+  const requestedPage = serverPagination ? Number(page) || 1 : internalCurrentPage;
+  const safeCurrentPage = Math.min(Math.max(requestedPage, 1), totalPages);
 
   const pageData = useMemo(() => {
+    if (serverPagination) return data;
     const start = (safeCurrentPage - 1) * pageSize;
     return data.slice(start, start + pageSize);
-  }, [data, safeCurrentPage, pageSize]);
+  }, [data, safeCurrentPage, pageSize, serverPagination]);
 
   const goToPage = (page) => {
     const target = Math.min(Math.max(page, 1), totalPages);
-    setCurrentPage(target);
+    if (serverPagination) {
+      if (typeof onPageChange === 'function' && target !== safeCurrentPage) onPageChange(target);
+      return;
+    }
+    setInternalCurrentPage(target);
   };
 
   const paginationItems = useMemo(() => {
@@ -109,16 +115,6 @@ function Table({
   };
 
   // --- SUB-COMPONENTS ---
-
-  // Tailwind Spinner
-  const LoadingSpinner = () => (
-    <div className="flex justify-center items-center py-8">
-      <svg className="animate-spin h-8 w-8 text-green-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-      </svg>
-    </div>
-  );
 
   // Kebab Menu (Styled with Tailwind) - renders dropdown into document.body so it sits outside the table
   function KebabMenu({ actions = [], row }) {
@@ -190,11 +186,11 @@ function Table({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="list-group list-group-flush" style={{ padding: 0 }}>
-          {actions.map((a, i) => (
+          {actions.filter(a => !a.show || a.show(row)).map((a, i) => (
             <button
               key={i}
               type="button"
-              className={`list-group-item list-group-item-action ${a.variant === 'danger' ? 'text-danger' : ''}`}
+              className={`list-group-item list-group-item-action ${a.variant === 'danger' ? 'text-danger' : ''} ${a.variant === 'success' ? 'text-success' : ''}`}
               onClick={() => { setOpen(false); try { a.onClick(row); } catch (err) { console.error(err); } }}
             >
               {a.label}
@@ -247,7 +243,7 @@ function Table({
             {finalLoading ? (
               <tr>
                 <td colSpan={columns.length} className="px-6 py-4 whitespace-nowrap">
-                  <LoadingSpinner />
+                  <LoadingState label="Loading records..." compact />
                 </td>
               </tr>
             ) : pageData.length === 0 ? (
@@ -260,6 +256,12 @@ function Table({
               pageData.map((row, idx) => {
                 const rowId = getRowKey(row, idx);
                 const globalIndex = (safeCurrentPage - 1) * pageSize + idx; // zero-based global index
+                const resolvedRowClassName = typeof rowClassName === 'function'
+                  ? rowClassName(row, idx, globalIndex)
+                  : rowClassName;
+                const resolvedRowStyle = typeof rowStyle === 'function'
+                  ? rowStyle(row, idx, globalIndex)
+                  : rowStyle;
                 const hasExpandedRenderer = typeof renderExpandedRow === 'function';
                 const isExpanded = hasExpandedRenderer
                   && expandedRowKey !== null
@@ -270,8 +272,11 @@ function Table({
                     <tr
                       className={`transition-colors duration-150 
                         ${striped && idx % 2 !== 0 ? 'bg-gray-50' : 'bg-white'} 
-                        ${hover ? 'hover:bg-green-50' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
+                        ${hover ? 'hover:bg-green-50' : ''} ${onRowClick ? 'cursor-pointer' : ''} ${resolvedRowClassName || ''}`}
+                      style={resolvedRowStyle || undefined}
                       onClick={onRowClick ? (e) => handleRowClick(row, idx, e) : undefined}
+                      onMouseEnter={onRowMouseEnter ? (e) => onRowMouseEnter(row, idx, globalIndex, e) : undefined}
+                      onMouseLeave={onRowMouseLeave ? (e) => onRowMouseLeave(row, idx, globalIndex, e) : undefined}
                     >
                       {columns.map((col) => (
                         <td

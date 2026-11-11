@@ -1,3 +1,13 @@
-server-php/logs/*
-!server-php/logs/.gitkeep
-server-php/cache/
+api/logs/*
+!api/logs/.gitkeep
+api/cache/*
+!api/cache/.gitkeep
+api/config/.jwt-secret
+api/config/private-security.php
+.env
+.env.*
+!.env.example
+.codex-tmp/
+
+# Local database backups contain user records.
+/database/

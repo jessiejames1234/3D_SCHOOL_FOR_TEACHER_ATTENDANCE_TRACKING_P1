@@ -1,5 +1,8 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/api/helpers/http_security_helper.php';
+app_apply_http_security();
+
 
 // Serve the public app directly from the project root. This avoids dev-tunnel
 // issues where the bare "/" URL does not reliably follow the /public/ redirect.
@@ -30,5 +33,16 @@ if (stripos($html, '<base ') === false) {
     }
 }
 
+require_once __DIR__ . '/api/helpers/static_assets_helper.php';
+$html = app_version_html_assets($html, app_static_versions(__DIR__, $basePath), $basePath);
+header('Cache-Control: no-cache, must-revalidate');
 header('Content-Type: text/html; charset=UTF-8');
+// Delimit the development-server response only for iPhones on Dev Tunnels.
+// Resolve the public host through the existing trusted-forwarding helper.
+$publicHost = app_http_host_without_port(app_http_public_request_host());
+$isIphoneDevTunnel = stripos((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 'iPhone') !== false
+    && str_ends_with($publicHost, '.devtunnels.ms');
+if (PHP_SAPI === 'cli-server' && $isIphoneDevTunnel) {
+    header('Content-Length: ' . strlen($html));
+}
 echo $html;

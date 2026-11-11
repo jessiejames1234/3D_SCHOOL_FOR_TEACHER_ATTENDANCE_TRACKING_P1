@@ -2,24 +2,86 @@ import React from 'react';
 import ReactDOM from 'react-dom';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
-import StatisticsBoxs from "../../components/statistics_boxs.jsx";
+import { MasterPageHeader, MasterStats, MasterToolbar, MasterSearch, MasterResults, MasterSelect } from '../../components/MasterDataPage.jsx';
 import { apiGet, apiPost, apiPut } from '../../services/api.js';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import { formatAcademicLabel, formatDepartmentLabel, formatProgramLabel } from '../../utils/academicLabels.js';
 
 const PROGRAM_REQUIRED_ROLE_IDS = ['2', '3', '4', '5'];
 const roleNeedsProgram = (roleId) => PROGRAM_REQUIRED_ROLE_IDS.includes(String(roleId));
+const generateSubName = (name = '') => (String(name).match(/[A-Z0-9]/g) || []).join('').slice(0, 30);
+const ROLE_COLORS = { 2: '#8b5cf6', 3: '#0d9488', 4: '#64748b', 5: '#16a34a', 6: '#2563eb' };
+const USER_IMPORT_HEADERS = ['First Name', 'Last Name', 'Email', 'School ID', 'Contact No', 'Role', 'Department', 'Program'];
+
+function normalizeImportContact(value) {
+  const contact = String(value ?? '').replace(/\D/g, '');
+  return /^9\d{9}$/.test(contact) ? `0${contact}` : contact;
+}
+
+function UserTableAvatar({ user }) {
+  const imageSrc = user?.avatar || user?.image || '';
+  const [imageFailed, setImageFailed] = React.useState(false);
+
+  React.useEffect(() => {
+    setImageFailed(false);
+  }, [imageSrc]);
+
+  const initials = [user?.first_name, user?.last_name]
+    .map((part) => String(part || '').trim().charAt(0).toUpperCase())
+    .filter(Boolean)
+    .join('') || '?';
+
+  const circleStyle = {
+    width: 44,
+    height: 44,
+    borderRadius: '50%',
+    border: '2px solid #d1fae5'
+  };
+
+  if (!imageSrc || imageFailed) {
+    return React.createElement('span', {
+      'aria-label': `${`${user?.first_name || ''} ${user?.last_name || ''}`.trim() || 'User'} initials`,
+      style: {
+        ...circleStyle,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: '#ecfdf5',
+        color: '#047857',
+        fontSize: 14,
+        fontWeight: 800,
+        letterSpacing: '0.02em'
+      }
+    }, initials);
+  }
+
+  return React.createElement('img', {
+    src: imageSrc,
+    alt: '',
+    style: { ...circleStyle, objectFit: 'cover' },
+    onError: () => setImageFailed(true)
+  });
+}
 
 export default function UserIndex(){
   const [users, setUsers] = React.useState([]);
+  const [canManageAdmins, setCanManageAdmins] = React.useState(false);
   const [roles, setRoles] = React.useState([]);
   const [departments, setDepartments] = React.useState([]);
+  const [academicPrograms, setAcademicPrograms] = React.useState([]);
   const [programHeads, setProgramHeads] = React.useState([]);
+  const [programOptionsDeptId, setProgramOptionsDeptId] = React.useState('');
   const [showModal, setShowModal] = React.useState(false);
-  const [form, setForm] = React.useState({ first_name:'', last_name:'', email:'', password:'', contact_no:'', role_id: '', id_number: '', dept_id: '', assigned_program_head_id: '' });
+  const [form, setForm] = React.useState({ first_name:'', last_name:'', email:'', contact_no:'', role_id: '', id_number: '', dept_id: '', assigned_program_head_id: '' });
   const [editImageUrl, setEditImageUrl] = React.useState('');
   const [loading, setLoading] = React.useState(false);
+  const [dataLoading, setDataLoading] = React.useState(true);
   const [error, setError] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState('all');
-  const [allUsers, setAllUsers] = React.useState(null);
+  const [userPage, setUserPage] = React.useState(1);
+  const [userPagination, setUserPagination] = React.useState({ page: 1, page_size: 10, total: 0, total_pages: 1 });
+  const [userStats, setUserStats] = React.useState({ total: 0, active: 0, inactive: 0, archived: 0 });
+  const [userRoleCounts, setUserRoleCounts] = React.useState({});
   const [importing, setImporting] = React.useState(false);
   const [importSummary, setImportSummary] = React.useState(null);
   const [importErrors, setImportErrors] = React.useState([]);
@@ -30,26 +92,30 @@ export default function UserIndex(){
   const [importFileName, setImportFileName] = React.useState('');
   const [importProcessing, setImportProcessing] = React.useState(false);
   const [importPage, setImportPage] = React.useState(1);
-  const [showAddRoleModal, setShowAddRoleModal] = React.useState(false);
-  const [addRoleForm, setAddRoleForm] = React.useState({ role_name: '' });
-  const [addRoleLoading, setAddRoleLoading] = React.useState(false);
-  const [addRoleError, setAddRoleError] = React.useState('');
   const [showAddDeptModal, setShowAddDeptModal] = React.useState(false);
-  const [addDeptForm, setAddDeptForm] = React.useState({ dept_name: '' });
+  const [addDeptForm, setAddDeptForm] = React.useState({ sub_name: '', dept_name: '' });
   const [addDeptLoading, setAddDeptLoading] = React.useState(false);
   const [addDeptError, setAddDeptError] = React.useState('');
+  const [showAddProgramModal, setShowAddProgramModal] = React.useState(false);
+  const [addProgramForm, setAddProgramForm] = React.useState({ sub_name: '', program_name: '', dept_id: '' });
+  const [addProgramLoading, setAddProgramLoading] = React.useState(false);
+  const [addProgramError, setAddProgramError] = React.useState('');
   const fileInputRef = React.useRef(null);
   const importPreviewSeq = React.useRef(0);
   const importAutoValidateTimerRef = React.useRef(null);
   const formRef = React.useRef(form);
-  const emailDomainRegex = /^[A-Za-z0-9._%+-]+@phinmaed\.com$/i;
+  const emailDomainRegex = /^[^\s@]+\.coc@phinmaed\.com$/i;
   const idNumberRegex = /^\d{2}-\d{3}-[A-Za-z]$/;
+  const personNameRegex = /^[\p{L}\p{M}][\p{L}\p{M} .'-]*$/u;
   const IMPORT_PAGE_SIZE = 10;
 
   // Filters for the user table
   const [searchTerm, setSearchTerm] = React.useState('');
+  
+  const [debouncedSearch, setDebouncedSearch] = React.useState('');
   const [roleFilter, setRoleFilter] = React.useState('');
   const [deptFilter, setDeptFilter] = React.useState('');
+  const userRequestRef = React.useRef(0);
 
   // Authentication & Role Check logic
   const currentUser = React.useMemo(() => {
@@ -86,134 +152,38 @@ export default function UserIndex(){
     return String(user?._status || user?.status || '').toLowerCase().trim();
   }, []);
 
-  const applyRoleScope = React.useCallback((list) => {
-    let scoped = Array.isArray(list) ? list.slice() : [];
-
-    // Hide Admin role from user management view
-    scoped = scoped.filter(u => String(u?.role_id) !== '1');
-
-    // --- ROLE-BASED VISIBILITY FILTERING ---
-    if (isDeanScopedRole) {
-      // Dean-like roles: view program heads, secretaries, and teachers in own department.
-      const deptId = Number(currentUser?.dept_id || 0);
-      if (!deptId) {
-        scoped = [];
-      } else {
-        scoped = scoped.filter(u => [3, 4, 5].includes(Number(u.role_id)) && Number(u.dept_id) === deptId);
-      }
-    } else if (isSecretary) {
-      // Secretary: view-only teachers within own department.
-      const deptId = Number(currentUser?.dept_id || 0);
-      if (!deptId) {
-        scoped = [];
-      } else {
-        scoped = scoped.filter(u => Number(u.role_id) === 5 && Number(u.dept_id) === deptId);
-      }
-    } else if (isProgramHead) {
-      // Program Head: view-only assigned teachers (server-enforced, with client safety filter if present).
-      scoped = scoped.filter(u => Number(u.role_id) === 5);
-    } else if (!isAdmin) {
-      // Fallback for unknown/unauthorized roles
-      scoped = [];
-    }
-
-    return scoped;
-  }, [isDeanScopedRole, isSecretary, isProgramHead, isAdmin, currentUser]);
-
-  const effectiveStatusFilter = (!isAdmin && statusFilter === 'archive') ? 'all' : statusFilter;
+  const effectiveStatusFilter = (!isAdmin && !isDepartmentAdmin && statusFilter === 'archive') ? 'all' : statusFilter;
   const isArchiveView = effectiveStatusFilter === 'archive';
-
-  const scopedUsers = React.useMemo(() => {
-    const src = Array.isArray(allUsers) ? allUsers : users || [];
-    return applyRoleScope(src);
-  }, [allUsers, users, applyRoleScope]);
-
-  const statusFilteredUsers = React.useMemo(() => {
-    let list = scopedUsers.slice();
-    if (effectiveStatusFilter === 'archive') {
-      list = list.filter(u => normalizeStatus(u) === 'archive');
-    } else if (effectiveStatusFilter === 'active') {
-      list = list.filter(u => normalizeStatus(u) === 'active');
-    } else if (effectiveStatusFilter === 'inactive') {
-      list = list.filter(u => normalizeStatus(u) === 'inactive');
-    } else {
-      list = list.filter(u => normalizeStatus(u) !== 'archive');
-    }
-    return list;
-  }, [scopedUsers, effectiveStatusFilter, normalizeStatus]);
-
-  // Derived filtered users for table display
-  const filteredUsers = React.useMemo(() => {
-    let list = statusFilteredUsers.slice();
-
-    if (searchTerm && searchTerm.trim()) {
-      const q = searchTerm.trim().toLowerCase();
-      list = list.filter(u => (`${u.first_name || ''} ${u.last_name || ''} ${u.email || ''} ${u.id_number || ''}`).toLowerCase().includes(q));
-    }
-    if (roleFilter) list = list.filter(u => String(u.role_id) === String(roleFilter));
-    if (deptFilter) list = list.filter(u => String(u.dept_id) === String(deptFilter));
-
-    if (effectiveStatusFilter === 'all') {
-      const priority = { active: 0, inactive: 1 };
-      list = list.slice().sort((a, b) => {
-        const aKey = priority[normalizeStatus(a)] ?? 2;
-        const bKey = priority[normalizeStatus(b)] ?? 2;
-        if (aKey !== bKey) return aKey - bKey;
-        const aName = `${a.first_name || ''} ${a.last_name || ''}`.trim().toLowerCase();
-        const bName = `${b.first_name || ''} ${b.last_name || ''}`.trim().toLowerCase();
-        if (aName < bName) return -1;
-        if (aName > bName) return 1;
-        return 0;
-      });
-    }
-
-    return list;
-  }, [statusFilteredUsers, searchTerm, roleFilter, deptFilter, effectiveStatusFilter, normalizeStatus]);
-
-  const userStats = React.useMemo(() => {
-    let total = 0;
-    let active = 0;
-    let inactive = 0;
-    let archived = 0;
-    (scopedUsers || []).forEach((u) => {
-      const s = normalizeStatus(u);
-      if (s === 'archive') {
-        archived += 1;
-        return;
-      }
-      total += 1;
-      if (s === 'active') active += 1;
-      else if (s === 'inactive') inactive += 1;
-    });
-    return { total, active, inactive, archived };
-  }, [scopedUsers, normalizeStatus]);
+  const filteredUsers = users;
 
   const statsItems = React.useMemo(() => {
     const items = [
-      { key: 'all', label: 'All Users', value: userStats.total, subLabel: 'Active + Inactive' },
-      { key: 'active', label: 'Total Active Users', value: userStats.active, subLabel: 'Status: Active' },
-      { key: 'inactive', label: 'Total Inactive Users', value: userStats.inactive, subLabel: 'Status: Inactive' }
+      { key: 'all', label: 'All Accounts', value: userStats.total, subLabel: 'Active + inactive' },
+      { key: 'active', label: 'Active', value: userStats.active, subLabel: 'Available for operations' },
+      { key: 'inactive', label: 'Inactive', value: userStats.inactive, subLabel: 'Currently unavailable' }
     ];
-    if (isAdmin) {
-      items.push({ key: 'archive', label: 'Archived Users', value: userStats.archived, subLabel: 'Status: Archived' });
+    if (isAdmin || isDepartmentAdmin) {
+      items.push({ key: 'archive', label: 'Archived', value: userStats.archived, subLabel: 'Available for restoration' });
     }
     return items;
-  }, [userStats, isAdmin]);
+  }, [userStats, isAdmin, isDepartmentAdmin]);
 
   const roleFilterOptions = React.useMemo(() => {
     const list = Array.isArray(roles) ? roles : [];
+    if (canManageAdmins) return list;
     const noAdmin = list.filter(r => String(r?.role_id) !== '1');
-    if (isDeanScopedRole) return noAdmin.filter(r => [3, 4, 5].includes(Number(r.role_id)));
-    if (isProgramHead) return noAdmin.filter(r => Number(r.role_id) === 5);
+    if (isDepartmentAdmin) return noAdmin.filter(r => [2, 3, 4, 5].includes(Number(r.role_id)));
+    if (isDean) return noAdmin.filter(r => [3, 4, 5].includes(Number(r.role_id)));
+    if (isProgramHead) return noAdmin.filter(r => [4, 5].includes(Number(r.role_id)));
     return noAdmin;
-  }, [roles, isDeanScopedRole, isProgramHead]);
+  }, [roles, isDepartmentAdmin, isDean, isProgramHead, canManageAdmins]);
 
   const normalizeRoleToken = React.useCallback((value) => {
     return String(value || '').trim().toLowerCase().replace(/\s+/g, '_');
   }, []);
 
   const adminRoleTokens = React.useMemo(() => {
-    const tokens = new Set(['1', 'admin', 'administrator']);
+    const tokens = new Set(['admin', 'administrator']);
     (Array.isArray(roles) ? roles : []).forEach((r) => {
       if (String(r?.role_id) === '1') {
         const name = r?.role_name || r?.name || '';
@@ -232,7 +202,6 @@ export default function UserIndex(){
   const resolveRoleIdValue = React.useCallback((value) => {
     const raw = String(value || '').trim();
     if (!raw) return null;
-    if (/^\d+$/.test(raw)) return Number(raw);
     const token = normalizeRoleToken(raw);
     const match = (Array.isArray(roles) ? roles : []).find((r) => {
       const roleName = r?.role_name || r?.name || '';
@@ -255,7 +224,7 @@ export default function UserIndex(){
   const fixedDeptLabel = React.useMemo(() => {
     if (!fixedDeptId) return '';
     const dept = (Array.isArray(departments) ? departments : []).find(d => String(d.dept_id) === String(fixedDeptId));
-    return dept ? (dept.dept_name || dept.name || String(fixedDeptId)) : String(fixedDeptId);
+    return dept ? formatDepartmentLabel(dept, String(fixedDeptId)) : String(fixedDeptId);
   }, [departments, fixedDeptId]);
 
   React.useEffect(() => {
@@ -331,7 +300,7 @@ export default function UserIndex(){
         const rect = btn.getBoundingClientRect();
         const vh = window.innerHeight; const vw = window.innerWidth;
         const minW = 160;
-        const estimatedH = archived ? 40 * 2 : 40 * 3; 
+        const estimatedH = archived ? 40 * 2 : 40 * (onArchive ? 3 : 2);
         const naturalH = menuRef.current ? menuRef.current.scrollHeight : estimatedH;
         const maxH = Math.floor(vh * 0.6);
         const menuH = Math.min(naturalH, maxH);
@@ -346,17 +315,16 @@ export default function UserIndex(){
       window.addEventListener('resize', compute);
       window.addEventListener('scroll', compute, true);
       return ()=>{ cancelAnimationFrame(raf); window.removeEventListener('resize', compute); window.removeEventListener('scroll', compute, true); };
-    }, [open, archived]);
+    }, [open, archived, onArchive]);
 
     const menuNode = open ? React.createElement('div', { ref: menuRef, className: 'card', style: { ...(menuStyle || { position:'fixed', top:0, right:0 }), boxShadow:'0 6px 18px rgba(0,0,0,0.12)' }, onClick: e=> e.stopPropagation() },
       React.createElement('div', { className: 'list-group list-group-flush', style: { padding:0 } },
         archived ? React.createElement(React.Fragment, null,
-          React.createElement('button', { type:'button', className:'list-group-item list-group-item-action', onClick: ()=>{ setOpen(false); onEdit && onEdit(); } }, 'Edit'),
           React.createElement('button', { type:'button', className:'list-group-item list-group-item-action text-primary', onClick: ()=>{ setOpen(false); onUnarchive ? onUnarchive() : (onToggle && onToggle()); } }, 'Unarchive')
         ) : React.createElement(React.Fragment, null,
           React.createElement('button', { type:'button', className:'list-group-item list-group-item-action', onClick: ()=>{ setOpen(false); onEdit && onEdit(); } }, 'Edit'),
           React.createElement('button', { type:'button', className:'list-group-item list-group-item-action', onClick: ()=>{ setOpen(false); onToggle && onToggle(); } }, 'Toggle'),
-          React.createElement('button', { type:'button', className:'list-group-item list-group-item-action text-danger', onClick: ()=>{ setOpen(false); onArchive && onArchive(); } }, 'Archive')
+          onArchive ? React.createElement('button', { type:'button', className:'list-group-item list-group-item-action text-danger', onClick: ()=>{ setOpen(false); onArchive(); } }, 'Archive') : null
         )
       )
     ) : null;
@@ -372,7 +340,8 @@ export default function UserIndex(){
   const handleStatusSelect = (key)=>{
     const allowed = ['all','active','inactive','archive'];
     const next = allowed.includes(String(key)) ? String(key) : 'all';
-    if (!isAdmin && next === 'archive') return;
+    if (!isAdmin && !isDepartmentAdmin && next === 'archive') return;
+    setUserPage(1);
     setStatusFilter(next);
   };
 
@@ -381,27 +350,40 @@ export default function UserIndex(){
       const res = await safeSwal({ title: 'Unarchive user?', text: 'This will restore the user and set status to inactive.', icon: 'warning', showCancelButton: true });
       if (!res.isConfirmed) return;
       await apiPost(`users/${user.user_id}/toggle`, {});
-      await new Promise(r=>setTimeout(r, 120));
-      await apiPost(`users/${user.user_id}/toggle`, {});
       await fetchUsers();
       try { await safeSwal({ icon:'success', title: 'Unarchived', timer:1200, showConfirmButton:false }); } catch(e){}
-    }catch(err){ console.error(err); setError(err.body?.error || err.message || 'Failed to unarchive user'); try { await safeSwal({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to unarchive' }); } catch(e){} }
+    }catch(err){ console.error(err); const message = err.body?.message || err.message || 'Failed to unarchive user'; setError(message); try { await safeSwal({ icon:'error', title:'Error', text: message }); } catch(e){} }
   };
 
-  // Base Columns available for everyone allowed to see the page
+  // Compact directory columns keep related information together and reduce
+  // horizontal scrolling without changing any underlying user data.
   const columns = [
-    { key: 'avatar', label: 'Image', render: (u)=>{
-      const src = u.avatar || u.image || '/src/assets/unknown.jpg';
-      return React.createElement('img', { src, alt: `${u.first_name || ''} ${u.last_name || ''}`, style: { width:40, height:40, borderRadius:'50%', objectFit:'cover', border: '1px solid #ddd' } });
-    }},
-    { key: 'name', label: 'Name', render: u=> `${u.first_name} ${u.last_name}` },
-    { key: 'school_id', label: 'School ID', render: u=> {
+    { key: 'user', label: 'User', render: (u)=>{
       const val = u?.id_number ?? u?.school_id ?? (u?.school && (u.school.school_id ?? u.school.id)) ?? null;
-      return val !== null && val !== undefined && String(val) !== '' ? String(val) : 'N/A';
+      const schoolId = val !== null && val !== undefined && String(val) !== '' ? String(val) : 'No School ID';
+      return React.createElement('div', { className: 'd-flex align-items-center gap-3', style: { minWidth: 210 } },
+        React.createElement('div', { className: 'position-relative flex-shrink-0' },
+          React.createElement(UserTableAvatar, { user: u }),
+          React.createElement('span', { className: `position-absolute rounded-circle ${normalizeStatus(u) === 'active' ? 'bg-success' : 'bg-secondary'}`, style: { width:10, height:10, right:0, bottom:1, border:'2px solid white' }, title: normalizeStatus(u) || 'unknown' })
+        ),
+        React.createElement('div', { className: 'min-w-0' },
+          React.createElement('div', { className: 'fw-bold text-dark text-truncate' }, `${u.first_name || ''} ${u.last_name || ''}`.trim() || 'Unnamed user'),
+          React.createElement('div', { className: 'small text-muted' }, schoolId)
+        )
+      );
     } },
-    { key: 'department', label: 'Department', render: u=> u.dept_name || u.department || (u.dept_id? String(u.dept_id): 'N/A') },
-    { key: 'email', label: 'Email' },
-    { key: 'contact_no', label: 'Contact' },
+    { key: 'contact', label: 'Contact', render: u=> React.createElement('div', { style: { minWidth: 190 } },
+      React.createElement('div', { className: 'text-dark text-break' }, u.email || 'No email'),
+      React.createElement('div', { className: 'small text-muted mt-1' }, u.contact_no || 'No phone number')
+    ) },
+    { key: 'assignment', label: 'Assignment', render: u=> {
+      const department = formatAcademicLabel(u.department_sub_name || u.dept_sub_name, u.dept_name || u.department, u.dept_id ? String(u.dept_id) : 'No department');
+      const program = formatAcademicLabel(u.assigned_program_sub_name || u.program_sub_name, u.assigned_program_name, '');
+      return React.createElement('div', { style: { minWidth: 210 } },
+        React.createElement('div', { className: 'fw-semibold text-dark' }, department),
+        showProgramColumns && program ? React.createElement('div', { className: 'small text-muted mt-1' }, program) : null
+      );
+    } },
     { key: 'role_name', label: 'Role', render: u=> {
       const raw = (u.role_name || u.role || '').toString();
       const display = formatRoleName(raw);
@@ -421,17 +403,10 @@ export default function UserIndex(){
     } },
     { key: 'status', label: 'Status', render: u=> {
       const s = String(u.status || '').toLowerCase();
-      const cls = s === 'active' ? 'bg-success' : (s === 'inactive' ? 'bg-danger' : 'bg-secondary');
       const text = s === 'active' ? 'Active' : (s === 'inactive' ? 'Inactive' : s);
-      return React.createElement('span', { className: `badge ${cls}` }, text);
+      return React.createElement('span', { className: `mdp-status mdp-status-${s === 'active' || s === 'inactive' || s === 'archive' ? s : 'warning'}` }, text);
     }}
   ];
-
-  if (showProgramColumns) {
-    columns.splice(4, 0,
-      { key: 'program_name', label: 'Program', render: u=> u.assigned_program_name || 'N/A' }
-    );
-  }
 
   // Append the Action Button column for accounts allowed to manage users.
   if (canManageUsers) {
@@ -442,26 +417,42 @@ export default function UserIndex(){
         archived: isArchiveView, 
         onEdit: ()=> handleEdit(u), 
         onToggle: ()=> handleToggleActive(u), 
-        onArchive: ()=> handleArchive(u), 
+        onArchive: (isAdmin || isDepartmentAdmin) ? ()=> handleArchive(u) : null,
         onUnarchive: ()=> handleUnarchive(u) 
       }) 
     });
   }
 
-  React.useEffect(()=>{
-    const token = localStorage.getItem('token');
-    if (!token) { window.location.hash = '#/login'; return; }
-    fetchUsers(); fetchRoles(); fetchDepartments();
-  }, []);
-
-  const fetchUsers = async ()=>{
+  const fetchUsers = async ({ silent = false } = {})=>{
+    const requestId = ++userRequestRef.current;
+    if (!silent) setDataLoading(true);
     try{
-      const data = await apiGet('users');
-      if (!Array.isArray(data)) { setUsers([]); setAllUsers([]); return; }
-      const normalized = data.map(u => ({ ...u, _status: String(u.status || '').toLowerCase().trim() }));
-      setAllUsers(normalized);
+      const params = new URLSearchParams({
+        paginate: '1',
+        page: String(userPage),
+        page_size: '10',
+        status: effectiveStatusFilter,
+      });
+      if (debouncedSearch) params.set('search', debouncedSearch);
+      if (roleFilter) params.set('role_id', roleFilter);
+      if (deptFilter) params.set('dept_id', deptFilter);
+      const data = await apiGet(`users?${params.toString()}`);
+      if (requestId !== userRequestRef.current) return;
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      const normalized = rows.map(u => ({ ...u, _status: String(u.status || '').toLowerCase().trim() }));
+      const nextPagination = data?.pagination || { page: 1, page_size: 10, total: normalized.length, total_pages: 1 };
       setUsers(normalized);
-    }catch(err){ console.error(err); setError('Failed to load users'); }
+      setCanManageAdmins(data?.can_manage_admins === true);
+      setUserPagination(nextPagination);
+      setUserStats(data?.status_counts || { total: 0, active: 0, inactive: 0, archived: 0 });
+      setUserRoleCounts(data?.role_counts || {});
+      if (Number(nextPagination.page || 1) !== Number(userPage)) setUserPage(Number(nextPagination.page || 1));
+    }catch(err){
+      if (requestId !== userRequestRef.current) return;
+      console.error(err);
+      if (!silent) setError('Failed to load users');
+    }
+    finally { if (requestId === userRequestRef.current && !silent) setDataLoading(false); }
   };
   const fetchRoles = async ()=>{
     try{ const data = await apiGet('roles'); setRoles(Array.isArray(data)? data: []); }catch(e){ console.error(e); }
@@ -469,15 +460,27 @@ export default function UserIndex(){
   const fetchDepartments = async ()=>{
     try{
       const d = await apiGet('departments');
-      const list = Array.isArray(d) ? d.filter(x => String(x.status || '').toLowerCase() !== 'archive') : [];
+      const list = Array.isArray(d) ? d.filter(x => String(x.status || '').toLowerCase() === 'active') : [];
       setDepartments(list);
       return list;
     }catch(e){ console.error('Failed to load departments', e); return []; }
+  };
+  const fetchPrograms = async ()=>{
+    try {
+      const data = await apiGet('programs');
+      const list = Array.isArray(data) ? data.filter(x => String(x.status || '').toLowerCase() === 'active') : [];
+      setAcademicPrograms(list);
+      return list;
+    } catch (e) {
+      console.error('Failed to load programs', e);
+      return [];
+    }
   };
   const fetchProgramHeads = async (deptId = '', roleId = form.role_id, ownerUserId = form.user_id || '')=>{
     try{
       if (!deptId) {
         setProgramHeads([]);
+        setProgramOptionsDeptId('');
         return;
       }
       const data = await apiGet('programs');
@@ -485,52 +488,48 @@ export default function UserIndex(){
       list = list.filter(p => String(p.status || '').toLowerCase() === 'active');
       list = list.filter(p => String(p.dept_id) === String(deptId));
       const mapped = list.map(p => {
-        const headName = `${p.head_first || ''} ${p.head_last || ''}`.trim();
-        const label = headName ? `${p.program_name} (${headName})` : `${p.program_name}`;
-        return { id: p.program_id, label };
+        const programLabel = formatProgramLabel(p, String(p.program_id));
+        return { id: p.program_id, label: programLabel };
       });
       setProgramHeads(mapped);
+      setProgramOptionsDeptId(String(deptId));
+      return mapped;
     }catch(e){
       console.error('Failed to load program heads', e);
       setProgramHeads([]);
+      setProgramOptionsDeptId(String(deptId || ''));
+      return [];
     }
   };
 
   React.useEffect(()=>{
-    let cancelled = false;
-    let refreshing = false;
-
-    const refreshViaHttps = async ()=>{
-      if (cancelled || document.hidden || refreshing || !localStorage.getItem('token')) return;
-      refreshing = true;
-      try {
-        await Promise.all([fetchUsers(), fetchRoles(), fetchDepartments()]);
-        const currentForm = formRef.current || {};
-        if (roleNeedsProgram(currentForm.role_id) && currentForm.dept_id) {
-          await fetchProgramHeads(currentForm.dept_id, currentForm.role_id, currentForm.user_id || '');
-        }
-      } catch(e) {
-        console.error('Failed to refresh users via HTTPS', e);
-      } finally {
-        refreshing = false;
-      }
-    };
-
-    const intervalId = window.setInterval(refreshViaHttps, 3000);
-    const handleFocusRefresh = ()=> refreshViaHttps();
-    window.addEventListener('focus', handleFocusRefresh);
-    document.addEventListener('visibilitychange', handleFocusRefresh);
-
-    return ()=>{
-      cancelled = true;
-      window.clearInterval(intervalId);
-      window.removeEventListener('focus', handleFocusRefresh);
-      document.removeEventListener('visibilitychange', handleFocusRefresh);
-    };
+    if (!currentUser) { window.location.hash = '#/login'; return; }
+    fetchRoles();
+    fetchDepartments();
+    fetchPrograms();
   }, []);
 
+  React.useEffect(() => {
+    if (!currentUser) return;
+    fetchUsers();
+  }, [userPage, effectiveStatusFilter, roleFilter, deptFilter, debouncedSearch]);
+
+  React.useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setUserPage(1);
+      setDebouncedSearch(searchTerm.trim());
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [searchTerm]);
+
+  useAutoRefresh({
+    refresh: () => fetchUsers({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: Boolean(currentUser) && !showModal,
+  });
+
   React.useEffect(()=>{
-    if (!isAdmin || !showModal) return;
+    if (!canManageUsers || !showModal) return;
     if (!roleNeedsProgram(form.role_id)) {
       setProgramHeads([]);
       return;
@@ -540,7 +539,7 @@ export default function UserIndex(){
       return;
     }
     fetchProgramHeads(form.dept_id || '', form.role_id, form.user_id || '');
-  }, [isAdmin, showModal, form.role_id, form.dept_id, form.user_id]);
+  }, [canManageUsers, showModal, form.role_id, form.dept_id, form.user_id]);
 
   React.useEffect(() => {
     if (!showModal) return;
@@ -555,18 +554,48 @@ export default function UserIndex(){
     if (!showModal) return;
     if (!roleNeedsProgram(form.role_id)) return;
     if (!form.assigned_program_head_id) return;
+    if (String(programOptionsDeptId) !== String(form.dept_id || '')) return;
     const valid = programHeads.some(ph => String(ph.id) === String(form.assigned_program_head_id));
     if (!valid) setForm(prev => ({ ...prev, assigned_program_head_id: '' }));
-  }, [showModal, form.role_id, form.assigned_program_head_id, programHeads]);
+  }, [showModal, form.role_id, form.dept_id, form.assigned_program_head_id, programHeads, programOptionsDeptId]);
 
   const openModal = ()=>{ 
-    const defaultRoleId = roleFilterOptions[0]?.role_id || '';
+    const defaultRoleId = roleFilterOptions.find(role => Number(role.role_id) !== 1)?.role_id || '';
     const defaultDeptId = isDepartmentAdmin ? fixedDeptId : (String(defaultRoleId) === '1' ? '' : (departments[0]?.dept_id || ''));
-    setForm({ first_name:'', last_name:'', email:'', password:'', contact_no:'', role_id: defaultRoleId, id_number: '', dept_id: defaultDeptId, assigned_program_head_id: '' });
+    setForm({ first_name:'', last_name:'', email:'', contact_no:'', role_id: defaultRoleId, id_number: '', dept_id: defaultDeptId, assigned_program_head_id: '' });
     setEditImageUrl('');
     setError('');
     setShowModal(true);
   };
+  // Real-time contact number availability check
+  const [contactAvailability, setContactAvailability] = React.useState(null);
+  const contactCheckTimer = React.useRef(null);
+  React.useEffect(() => {
+    if (contactCheckTimer.current) {
+      clearTimeout(contactCheckTimer.current);
+    }
+    const digits = String(form.contact_no || '').replace(/\D/g, '').slice(0, 11);
+    if (digits.length === 11 && /^09\d{9}$/.test(digits)) {
+      setContactAvailability(null);
+      contactCheckTimer.current = setTimeout(async () => {
+        try {
+          const excludeUserId = form.user_id || 0;
+          const data = await apiGet(`check-contact?contact_no=${encodeURIComponent(digits)}&exclude_user_id=${excludeUserId}`);
+          if (data && data.checked) {
+            setContactAvailability(data.available);
+          }
+        } catch (e) {
+          console.warn('Contact availability check failed', e);
+        }
+      }, 500);
+    } else {
+      setContactAvailability(null);
+    }
+    return () => {
+      if (contactCheckTimer.current) clearTimeout(contactCheckTimer.current);
+    };
+  }, [form.contact_no, form.user_id]);
+
   const closeModal = ()=> setShowModal(false);
   const handleChange = (e)=>{
     const { name, value } = e.target;
@@ -576,7 +605,7 @@ export default function UserIndex(){
       return;
     }
     if (name === 'id_number') {
-      const clean = (value || '').toString().replace(/[^0-9\-]/g, '');
+      const clean = (value || '').toString().replace(/[^0-9A-Za-z\-]/g, '').toUpperCase().slice(0, 8);
       setForm(prev => ({ ...prev, id_number: clean }));
       return;
     }
@@ -585,7 +614,13 @@ export default function UserIndex(){
       return;
     }
     if (name === 'role_id') {
-      setForm(prev=> ({ ...prev, role_id: value, assigned_program_head_id: '' }));
+      setForm(prev => ({
+        ...prev,
+        role_id: value,
+        assigned_program_head_id: prev.has_active_schedule && roleNeedsProgram(value)
+          ? prev.assigned_program_head_id
+          : ''
+      }));
       return;
     }
     setForm(prev=> ({ ...prev, [name]: value }));
@@ -595,22 +630,30 @@ export default function UserIndex(){
     e && e.preventDefault && e.preventDefault();
     setLoading(true); setError('');
     try{
-      let createdEmailNotification = null;
-      if (!form.first_name || !form.last_name || !form.email || !form.role_id) { setError('Please fill required fields'); setLoading(false); return; }
-      if (String(form.role_id) === '1') { setError('Admin role is not allowed here'); setLoading(false); return; }
+      const normalizedFirstName = String(form.first_name || '').trim();
+      const normalizedLastName = String(form.last_name || '').trim();
+      const originalUser = users.find(user => String(user.user_id) === String(form.user_id));
+      const editingAdmin = canManageAdmins && Number(originalUser?.role_id) === 1 && String(form.role_id) === '1';
+      const unchangedAdminField = (key) => editingAdmin && String(form[key] || '').trim() === String(originalUser?.[key] || '').trim();
+      if (!normalizedFirstName || !normalizedLastName || !form.email || !form.role_id) { setError('Please fill required fields'); setLoading(false); return; }
+      if (!unchangedAdminField('first_name') && !personNameRegex.test(normalizedFirstName)) { setError('First name may contain letters, spaces, apostrophes, periods, and hyphens only'); setLoading(false); return; }
+      if (!unchangedAdminField('last_name') && !personNameRegex.test(normalizedLastName)) { setError('Last name may contain letters, spaces, apostrophes, periods, and hyphens only'); setLoading(false); return; }
+      if (String(form.role_id) === '1' && !editingAdmin) { setError('Admin role is not allowed here'); setLoading(false); return; }
       const normalizedEmail = String(form.email || '').trim().toLowerCase();
-      if (!emailDomainRegex.test(normalizedEmail)) { setError('Email must use @phinmaed.com'); setLoading(false); return; }
+      if (!emailDomainRegex.test(normalizedEmail)) { setError('Enter a valid email ending in .coc@phinmaed.com'); setLoading(false); return; }
       const normalizedIdNumber = String(form.id_number || '').trim();
-      if (!normalizedIdNumber) { setError('ID number is required'); setLoading(false); return; }
-      if (!idNumberRegex.test(normalizedIdNumber)) { setError('ID number must match format ##-###-letter (e.g. 24-018-F)'); setLoading(false); return; }
+      if (!unchangedAdminField('id_number') && !normalizedIdNumber) { setError('ID number is required'); setLoading(false); return; }
+      if (!unchangedAdminField('id_number') && !idNumberRegex.test(normalizedIdNumber)) { setError('ID number must match format ##-###-letter (e.g. 24-018-F)'); setLoading(false); return; }
 
-      if (form.contact_no) {
+      if (form.contact_no && !unchangedAdminField('contact_no')) {
         if (!/^09\d+$/.test(form.contact_no)) { setError('Contact number must start with 09 and contain digits only'); setLoading(false); return; }
         if (form.contact_no.length !== 11) { setError('Contact number must be 11 digits (e.g. 09123456789)'); setLoading(false); return; }
       }
 
-      const payload = { ...form, email: normalizedEmail, id_number: normalizedIdNumber };
-      if (form.user_id) delete payload.password;
+      const payload = { ...form, first_name: normalizedFirstName, last_name: normalizedLastName, email: normalizedEmail, id_number: normalizedIdNumber.toUpperCase() };
+      ['first_name', 'last_name', 'id_number', 'contact_no'].forEach(key => {
+        if (unchangedAdminField(key)) delete payload[key];
+      });
       if (isDepartmentAdmin) payload.dept_id = fixedDeptId;
       if (String(form.role_id) === '1') delete payload.dept_id;
       if (String(form.role_id) !== '1' && !payload.dept_id) {
@@ -635,27 +678,66 @@ export default function UserIndex(){
       }
 
       if (form.user_id) {
+        const existingUser = users.find(user => String(user.user_id) === String(form.user_id));
+        const existingRoleId = Number(existingUser?.role_id || 0);
+        const targetRoleId = Number(payload.role_id || 0);
+        const deanDepartmentChanged = existingRoleId === 2
+          && targetRoleId === 2
+          && String(existingUser?.dept_id || '') !== String(payload.dept_id || '');
+        const programHeadProgramChanged = existingRoleId === 3
+          && targetRoleId === 3
+          && String(existingUser?.assigned_program_head_id || existingUser?.assigned_program_id || '') !== String(payload.assigned_program_head_id || '');
+        const accessAssignmentChanged = existingRoleId !== targetRoleId
+          || String(existingUser?.dept_id || '') !== String(payload.dept_id || '')
+          || String(existingUser?.assigned_program_head_id || existingUser?.assigned_program_id || '') !== String(payload.assigned_program_head_id || '');
+
+        if (deanDepartmentChanged || programHeadProgramChanged) {
+          const transferType = deanDepartmentChanged ? 'Dean' : 'Program Head';
+          const result = await safeSwal({
+            icon: 'warning',
+            title: `Transfer ${transferType}?`,
+            text: deanDepartmentChanged
+              ? 'This Dean will stop belonging to the previous department and will belong only to the selected department.'
+              : 'This Program Head will stop belonging to the previous program and will belong only to the selected program.',
+            showCancelButton: true,
+            confirmButtonText: 'Transfer',
+            cancelButtonText: 'Cancel',
+          });
+          if (!result?.isConfirmed) {
+            setLoading(false);
+            return;
+          }
+        }
+        if (accessAssignmentChanged && !deanDepartmentChanged && !programHeadProgramChanged) {
+          const result = await safeSwal({
+            icon: 'warning',
+            title: 'Change User Assignment?',
+            text: 'The user role, department, or program assignment will change and may affect available pages and future assignments.',
+            showCancelButton: true,
+            confirmButtonText: 'Save User',
+            cancelButtonText: 'Cancel'
+          });
+          if (!result?.isConfirmed) { setLoading(false); return; }
+        }
         await apiPut(`users/${form.user_id}`, payload);
       } else {
-        if (!form.password) { setError('Password is required for new user'); setLoading(false); return; }
-        const createResult = await apiPost('users', payload);
-        createdEmailNotification = createResult?.email_notification || null;
+        await apiPost('users', payload);
       }
 
       await fetchUsers();
       closeModal();
       try {
-        if (!form.user_id && createdEmailNotification && createdEmailNotification.sent === false) {
-          await safeSwal({
-            icon: 'warning',
-            title: 'User created',
-            text: 'User was created, but account email could not be sent. Please verify mail settings.',
-          });
-        } else {
-          await safeSwal({ icon:'success', title: form.user_id ? 'User updated' : 'User created', timer: 1400, showConfirmButton: false });
-        }
+        await safeSwal({ icon:'success', title: form.user_id ? 'User updated' : 'User created', timer: 1400, showConfirmButton: false });
       } catch(e){}
-    }catch(err){ console.error(err); setError(err.body?.error || err.message || 'Failed to create user'); }
+    }catch(err){
+      console.error(err);
+      const errorMsg = err.body?.message || err.body?.error || err.message || 'Failed to create user';
+      if (err.body?.error === 'contact_no_in_use' || errorMsg === 'Contact number already exists') {
+        setError('This contact number is already in use by another user. Please use a different number.');
+      } else {
+        setError(errorMsg);
+      }
+    }
     finally{ setLoading(false); }
   };
 
@@ -666,18 +748,24 @@ export default function UserIndex(){
       first_name: user.first_name || '',
       last_name: user.last_name || '',
       email: user.email || '',
-      password: '',
       contact_no: user.contact_no || '',
       role_id: user.role_id || '',
       id_number: user.id_number || '',
       dept_id: isDepartmentAdmin ? fixedDeptId : (user.dept_id || ''),
-      assigned_program_head_id: roleNeedsProgram(editRoleId) ? (user.assigned_program_head_id || user.assigned_program_id || '') : ''
+      assigned_program_head_id: roleNeedsProgram(editRoleId) ? (user.assigned_program_head_id || user.assigned_program_id || '') : '',
+      has_active_schedule: Number(user.has_active_schedule || 0) === 1,
+      active_schedule_label: user.active_schedule_label || ''
     });
     setEditImageUrl(user?.avatar || user?.image || '/src/assets/unknown.jpg');
     setError('');
     setShowModal(true);
   };
   const handleToggleActive = async (user)=>{
+    const nextStatus = String(user.status || '').toLowerCase() === 'active' ? 'inactive' : 'active';
+    const action = nextStatus === 'active' ? 'Activate' : 'Deactivate';
+    const label = `${user.first_name || ''} ${user.last_name || ''}`.trim() || 'this user';
+    const confirmation = await safeSwal({ title: `${action} user?`, text: `${label} will be ${nextStatus}${nextStatus === 'inactive' ? ' and unable to sign in or perform attendance.' : '.'}`, icon: 'question', showCancelButton: true, confirmButtonText: action });
+    if (!confirmation.isConfirmed) return;
     try{
       await apiPost(`users/${user.user_id}/toggle`, {});
       await fetchUsers();
@@ -685,74 +773,36 @@ export default function UserIndex(){
     }catch(err){ console.error(err); setError(err.message || 'Failed to toggle user'); }
   };
   const handleArchive = async (user)=>{
+    if (!isAdmin && !isDepartmentAdmin) {
+      setError('Only Admin and Department Admin can archive user accounts.');
+      return;
+    }
     try{
       const res = await safeSwal({ title: 'Archive user?', text: 'This will remove the user from the active list.', icon: 'warning', showCancelButton: true });
       if (!res.isConfirmed) return;
       await apiPost(`users/${user.user_id}/archive`, {});
       await fetchUsers();
       try { await safeSwal({ icon:'success', title: 'Archived', timer:1200, showConfirmButton:false }); } catch(e){}
-    }catch(err){ console.error(err); setError(err.body?.error || err.message || 'Failed to archive user'); try { await safeSwal({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to archive' }); } catch(e){} }
-  };
-
-  const openAddRoleModal = ()=>{
-    setAddRoleForm({ role_name: '' });
-    setAddRoleError('');
-    setShowAddRoleModal(true);
-  };
-
-  const closeAddRoleModal = ()=>{
-    setShowAddRoleModal(false);
-    setAddRoleForm({ role_name: '' });
-    setAddRoleError('');
-  };
-
-  const handleAddRoleChange = (e)=>{
-    const { value } = e.target;
-    setAddRoleForm({ role_name: value });
-    setAddRoleError('');
-  };
-
-  const handleAddRoleSubmit = async (e)=>{
-    e && e.preventDefault && e.preventDefault();
-    setAddRoleLoading(true);
-    setAddRoleError('');
-    try{
-      if (!addRoleForm.role_name || !addRoleForm.role_name.trim()) {
-        setAddRoleError('Role name is required');
-        setAddRoleLoading(false);
-        return;
-      }
-
-      const newRole = await apiPost('roles', { role_name: addRoleForm.role_name.trim() });
-      await fetchRoles();
-      closeAddRoleModal();
-      try {
-        await safeSwal({ icon:'success', title: 'Role created', text: `Role "${newRole.role_name}" has been added successfully.`, timer: 1400, showConfirmButton: false });
-      } catch(e){}
-    }catch(err){
-      console.error(err);
-      const errorMsg = err.body?.message || err.message || 'Failed to create role';
-      setAddRoleError(errorMsg);
-    }finally{
-      setAddRoleLoading(false);
-    }
+    }catch(err){ console.error(err); const message = err.body?.message || err.message || 'Failed to archive user'; setError(message); try { await safeSwal({ icon:'error', title:'Error', text: message }); } catch(e){} }
   };
 
   const openAddDeptModal = ()=>{
-    setAddDeptForm({ dept_name: '' });
+    setAddDeptForm({ sub_name: '', dept_name: '' });
     setAddDeptError('');
     setShowAddDeptModal(true);
   };
 
   const closeAddDeptModal = ()=>{
     setShowAddDeptModal(false);
-    setAddDeptForm({ dept_name: '' });
+    setAddDeptForm({ sub_name: '', dept_name: '' });
     setAddDeptError('');
   };
 
   const handleAddDeptChange = (e)=>{
-    const { value } = e.target;
-    setAddDeptForm({ dept_name: value });
+    const { name, value } = e.target;
+    setAddDeptForm(previous => name === 'dept_name'
+      ? { ...previous, dept_name: value, sub_name: generateSubName(value) }
+      : { ...previous, [name]: value });
     setAddDeptError('');
   };
 
@@ -762,13 +812,19 @@ export default function UserIndex(){
     setAddDeptError('');
     try{
       const deptName = String(addDeptForm.dept_name || '').trim();
+      const subName = String(addDeptForm.sub_name || '').trim();
+      if (!subName) {
+        setAddDeptError('Department sub name is required');
+        setAddDeptLoading(false);
+        return;
+      }
       if (!deptName) {
         setAddDeptError('Department name is required');
         setAddDeptLoading(false);
         return;
       }
 
-      const newDept = await apiPost('departments', { dept_name: deptName });
+      const newDept = await apiPost('departments', { sub_name: subName, dept_name: deptName });
       const list = await fetchDepartments();
       const newDeptId = newDept?.dept_id || (list || []).find(d => String(d.dept_name || '').toLowerCase() === deptName.toLowerCase())?.dept_id || '';
       if (newDeptId) {
@@ -784,6 +840,77 @@ export default function UserIndex(){
       setAddDeptError(errorMsg);
     }finally{
       setAddDeptLoading(false);
+    }
+  };
+
+  const openAddProgramModal = ()=>{
+    setAddProgramForm({
+      sub_name: '',
+      program_name: '',
+      dept_id: form.dept_id || (isDepartmentAdmin ? fixedDeptId : '')
+    });
+    setAddProgramError('');
+    setShowAddProgramModal(true);
+  };
+
+  const closeAddProgramModal = ()=>{
+    setShowAddProgramModal(false);
+    setAddProgramForm({ sub_name: '', program_name: '', dept_id: '' });
+    setAddProgramError('');
+  };
+
+  const handleAddProgramChange = (e)=>{
+    const { name, value } = e.target;
+    setAddProgramForm(previous => name === 'program_name'
+      ? { ...previous, program_name: value, sub_name: generateSubName(value) }
+      : { ...previous, [name]: value });
+    setAddProgramError('');
+  };
+
+  const handleAddProgramSubmit = async (e)=>{
+    e && e.preventDefault && e.preventDefault();
+    setAddProgramLoading(true);
+    setAddProgramError('');
+    try{
+      const programName = String(addProgramForm.program_name || '').trim();
+      const subName = String(addProgramForm.sub_name || '').trim();
+      const deptId = String(addProgramForm.dept_id || '').trim();
+      if (!subName) {
+        setAddProgramError('Program sub name is required');
+        return;
+      }
+      if (!programName) {
+        setAddProgramError('Program name is required');
+        return;
+      }
+      if (!deptId) {
+        setAddProgramError('Department is required');
+        return;
+      }
+
+      const newProgram = await apiPost('programs', {
+        sub_name: subName,
+        program_name: programName,
+        dept_id: Number(deptId)
+      });
+      const options = await fetchProgramHeads(deptId, form.role_id, form.user_id || '');
+      const newProgramId = newProgram?.program_id
+        || options.find(p => String(p.label || '').split(' (')[0].toLowerCase() === programName.toLowerCase())?.id
+        || '';
+      setForm(prev => ({
+        ...prev,
+        dept_id: deptId,
+        assigned_program_head_id: newProgramId || prev.assigned_program_head_id
+      }));
+      closeAddProgramModal();
+      try {
+        await safeSwal({ icon:'success', title: 'Program added', timer: 1400, showConfirmButton: false });
+      } catch(e){}
+    }catch(err){
+      console.error(err);
+      setAddProgramError(err.body?.message || err.message || 'Failed to create program');
+    }finally{
+      setAddProgramLoading(false);
     }
   };
 
@@ -821,7 +948,10 @@ export default function UserIndex(){
       role_id: 'Role',
       department: 'Department',
       dept_id: 'Department',
+      department_sub_name: 'Department',
+      dept_sub_name: 'Department',
       program: 'Program',
+      program_sub_name: 'Program',
       assigned_program_head_id: 'Program'
     };
     const raw = String(field || '').trim();
@@ -856,6 +986,44 @@ export default function UserIndex(){
     return out;
   };
 
+  const canonicalDepartmentImportValue = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const key = raw.toLowerCase();
+    const match = departments.find(department => [
+      String(department.sub_name || ''),
+      String(department.dept_name || ''),
+      formatDepartmentLabel(department)
+    ].some(candidate => candidate.trim().toLowerCase() === key));
+    return match ? formatDepartmentLabel(match, raw) : raw;
+  };
+
+  const resolveImportDepartment = (value) => {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return null;
+    return departments.find(department => [
+      String(department.sub_name || ''),
+      String(department.dept_name || ''),
+      formatDepartmentLabel(department)
+    ].some(candidate => candidate.trim().toLowerCase() === raw)) || null;
+  };
+
+  const canonicalProgramImportValue = (value, departmentValue = '') => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const key = raw.toLowerCase();
+    const department = resolveImportDepartment(isDepartmentAdmin ? fixedDeptLabel : departmentValue);
+    const candidates = department
+      ? academicPrograms.filter(program => String(program.dept_id) === String(department.dept_id))
+      : [];
+    const match = candidates.find(program => [
+      String(program.sub_name || ''),
+      String(program.program_name || ''),
+      formatProgramLabel(program)
+    ].some(candidate => candidate.trim().toLowerCase() === key));
+    return match ? formatProgramLabel(match, raw) : raw;
+  };
+
   const mapRowsToImportDraft = (rows) => {
     const pick = (normalized, keys) => {
       for (const key of keys) {
@@ -876,16 +1044,20 @@ export default function UserIndex(){
         if (!nk) return;
         normalized[nk] = typeof v === 'string' ? v.trim() : v;
       });
+      const department = isDepartmentAdmin
+        ? fixedDeptLabel
+        : canonicalDepartmentImportValue(pick(normalized, ['department', 'dept', 'dept_name', 'department_sub_name', 'dept_sub_name']));
+      const program = canonicalProgramImportValue(pick(normalized, ['program', 'program_name', 'program_sub_name']), department);
       return {
         _row: idx + 2,
         first_name: pick(normalized, ['first_name', 'firstname', 'first', 'given_name']),
         last_name: pick(normalized, ['last_name', 'lastname', 'last', 'family_name']),
         email: pick(normalized, ['email', 'email_address', 'mail']),
-        school_id: pick(normalized, ['school_id', 'schoolid', 'id_number', 'id_no', 'id', 'school_id_number']),
-        contact_no: pick(normalized, ['contact_no', 'contact', 'contact_number', 'phone', 'mobile']),
-        role: pick(normalized, ['role_id', 'role', 'role_name']),
-        department: isDepartmentAdmin ? fixedDeptId : pick(normalized, ['dept_id', 'department_id', 'department', 'dept', 'dept_name']),
-        program: pick(normalized, ['assigned_program_head_id', 'assigned_program_id', 'assigned_program', 'program_id', 'program', 'program_name', 'program_head_assigned'])
+        school_id: pick(normalized, ['school_id', 'schoolid', 'school_id_number']),
+        contact_no: normalizeImportContact(pick(normalized, ['contact_no', 'contact', 'contact_number', 'phone', 'mobile'])),
+        role: pick(normalized, ['role', 'role_name']),
+        department,
+        program
       };
     });
   };
@@ -896,9 +1068,9 @@ export default function UserIndex(){
       last_name: String(r?.last_name || '').trim(),
       email: String(r?.email || '').trim(),
       school_id: String(r?.school_id || '').trim(),
-      contact_no: String(r?.contact_no || '').trim(),
+      contact_no: normalizeImportContact(r?.contact_no),
       role: String(r?.role || '').trim(),
-      department: isDepartmentAdmin ? fixedDeptId : String(r?.department || '').trim(),
+      department: isDepartmentAdmin ? fixedDeptLabel : String(r?.department || '').trim(),
       program: String(r?.program || '').trim()
     }));
   };
@@ -917,13 +1089,19 @@ export default function UserIndex(){
   const buildAdminImportErrors = (rows) => {
     const errors = [];
     (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const roleId = resolveRoleIdValue(row?.role);
       if (isAdminRoleValue(row?.role)) {
         errors.push({ row: row?._row, message: 'Admin role is not allowed.' });
       }
+      if ([2, 3, 4, 5].includes(roleId) && !String(row?.program || '').trim()) {
+        errors.push({
+          row: row?._row,
+          message: roleId === 3 ? 'Owned Program is required for Program Head.' : 'Assigned Program is required for this role.'
+        });
+      }
       if (isDepartmentAdmin) {
-        const roleId = resolveRoleIdValue(row?.role);
-        if (roleId && ![3, 4, 5].includes(roleId)) {
-          errors.push({ row: row?._row, message: 'Department admin can only import Program Head, Secretary, and Teacher users.' });
+        if (roleId && ![2, 3, 4, 5].includes(roleId)) {
+          errors.push({ row: row?._row, message: 'Department admin can only import Dean, Program Head, Secretary, and Teacher users.' });
         }
         if (!fixedDeptId) {
           errors.push({ row: row?._row, message: 'Your account has no assigned department.' });
@@ -1027,8 +1205,72 @@ export default function UserIndex(){
   const handleImportCellChange = (rowIndex, field, value) => {
     let nextValue = value;
     if (field === 'contact_no') nextValue = String(value || '').replace(/\D/g, '').slice(0, 11);
-    if (field === 'school_id') nextValue = String(value || '').replace(/[^0-9\-]/g, '');
+    if (field === 'school_id') nextValue = String(value || '').replace(/[^0-9A-Za-z\-]/g, '').toUpperCase().slice(0, 8);
     setImportDraftRows(prev => prev.map((row, idx) => (idx === rowIndex ? { ...row, [field]: nextValue } : row)));
+  };
+
+  const handleImportDepartmentBlur = (rowIndex, value) => {
+    const department = canonicalDepartmentImportValue(value);
+    setImportDraftRows(prev => prev.map((row, idx) => idx === rowIndex
+      ? { ...row, department, program: canonicalProgramImportValue(row.program, department) }
+      : row));
+  };
+
+  const downloadUserImportTemplate = () => {
+    const fileName = 'user-import-template.xlsx';
+    if (!window.XLSX) {
+      const csv = `${USER_IMPORT_HEADERS.join(',')}\r\n`;
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'user-import-template.csv';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    const workbook = window.XLSX.utils.book_new();
+    const usersSheet = window.XLSX.utils.aoa_to_sheet([USER_IMPORT_HEADERS]);
+    usersSheet['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 34 }, { wch: 14 }, { wch: 16 }, { wch: 20 }, { wch: 32 }, { wch: 36 }];
+    const instructionsSheet = window.XLSX.utils.aoa_to_sheet([
+      ['Field', 'Requirement', 'Example'],
+      ['First Name', 'Required; letters and common name punctuation only', 'Juan'],
+      ['Last Name', 'Required; letters and common name punctuation only', 'Dela Cruz'],
+      ['Email', 'Required; valid email ending in .coc@phinmaed.com', 'juan.coc@phinmaed.com'],
+      ['School ID', 'Required; ##-###-letter; used as a login identifier', '24-018-F'],
+      ['Contact No', 'Optional; 11 digits beginning with 09 or 10 digits beginning with 9; missing leading zero is added automatically', '09123456789 or 9123456789'],
+      ['Role', 'Required; use a Role name from the Reference sheet', 'Teacher'],
+      ['Department', 'Required; use a Department label from the Reference sheet', 'CITE (College of Information Technology Education)'],
+      ['Program', 'Required for Dean, Program Head, Secretary, and Teacher; must belong to the Department', 'BSIT (BS Information Technology)']
+    ]);
+    instructionsSheet['!cols'] = [{ wch: 18 }, { wch: 72 }, { wch: 48 }];
+
+    const roleNames = roleFilterOptions.map(role => formatRoleName(role.role_name || role.name || role.role_id));
+    const departmentLabels = departments.map(department => formatDepartmentLabel(department, ''));
+    const programReferences = academicPrograms.map(program => {
+      const department = departments.find(item => String(item.dept_id) === String(program.dept_id));
+      return [formatProgramLabel(program, ''), department ? formatDepartmentLabel(department, '') : ''];
+    });
+    const referenceLength = Math.max(roleNames.length, departmentLabels.length, programReferences.length, 1);
+    const referenceRows = [['Roles', 'Departments', 'Programs', 'Program Department']];
+    for (let index = 0; index < referenceLength; index += 1) {
+      referenceRows.push([
+        roleNames[index] || '',
+        departmentLabels[index] || '',
+        programReferences[index]?.[0] || '',
+        programReferences[index]?.[1] || ''
+      ]);
+    }
+    const referenceSheet = window.XLSX.utils.aoa_to_sheet(referenceRows);
+    referenceSheet['!cols'] = [{ wch: 22 }, { wch: 48 }, { wch: 48 }, { wch: 48 }];
+
+    window.XLSX.utils.book_append_sheet(workbook, usersSheet, 'Users');
+    window.XLSX.utils.book_append_sheet(workbook, instructionsSheet, 'Instructions');
+    window.XLSX.utils.book_append_sheet(workbook, referenceSheet, 'Reference');
+    window.XLSX.writeFile(workbook, fileName);
   };
 
   React.useEffect(() => {
@@ -1094,8 +1336,6 @@ export default function UserIndex(){
       const total = Number(result?.total || payloadRows.length);
       const errs = Array.isArray(result?.errors) ? result.errors : [];
       const rowErrMap = buildImportErrorMap(errs);
-      const emailSent = Number(result?.email_notifications?.sent || 0);
-      const emailFailed = Number(result?.email_notifications?.failed || 0);
 
       setImportSummary({ mode: 'imported', inserted, skipped, total });
       setImportErrors(errs);
@@ -1111,25 +1351,24 @@ export default function UserIndex(){
       closeImportModal(true);
       if (inserted > 0) {
         try {
-          if (emailFailed > 0) {
-            await safeSwal({
-              icon: 'warning',
-              title: 'Import completed',
-              text: `${inserted} user(s) imported. ${emailSent} email(s) sent, ${emailFailed} failed. Default password is School ID.`,
-            });
-          } else {
-            await safeSwal({
-              icon: 'success',
-              title: 'Import completed',
-              text: `${inserted} user(s) imported. Default password is School ID.`,
-              timer: 1600,
-              showConfirmButton: false
-            });
-          }
+          await safeSwal({
+            icon: 'success',
+            title: 'Import completed',
+            text: `${inserted} user(s) imported. A random 6-character temporary password is emailed to each new user.`,
+            timer: 1600,
+            showConfirmButton: false
+          });
         } catch (e) {}
       }
     } catch (err) {
       console.error(err);
+      const serverErrors = Array.isArray(err?.body?.errors) ? err.body.errors : [];
+      if (serverErrors.length > 0) {
+        setImportErrors(serverErrors);
+        setImportRowErrors(buildImportErrorMap(serverErrors));
+        setImportDraftSummary({ mode: 'imported', inserted: 0, skipped: importDraftRows.length, total: importDraftRows.length });
+        await showImportIssuesSwal(serverErrors, 'Import cancelled');
+      }
       setError(err?.body?.message || err?.body?.error || err?.message || 'Failed to import users');
     } finally {
       setImportProcessing(false);
@@ -1171,62 +1410,36 @@ export default function UserIndex(){
     }
   };
 
-  React.useEffect(() => {
-    let timer = null;
-    let stopped = false;
-
-    const pollUsers = async () => {
-      if (stopped) return;
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      try { await fetchUsers(); } catch (e) { /* handled inside fetchUsers */ }
-    };
-
-    // Poll every 15 seconds for updates (HTTP/HTTPS polling)
-    timer = setInterval(pollUsers, 15000);
-
-    const onVisibility = () => { if (!stopped) pollUsers(); };
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', onVisibility);
-    }
-
-    return () => {
-      stopped = true;
-      if (timer) clearInterval(timer);
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', onVisibility);
-      }
-    };
-  }, []);
+  const directoryRoleStats = React.useMemo(() => {
+    const roleLookup = new Map((roles || []).map((role) => [Number(role.role_id), role.role_name || role.name]));
+    const counts = new Map(Object.entries(userRoleCounts || {})
+      .map(([roleId, value]) => [Number(roleId), Number(value) || 0])
+      .filter(([roleId, value]) => roleId > 0 && value > 0));
+    const total = Array.from(counts.values()).reduce((sum, value) => sum + value, 0);
+    return Array.from(counts.entries()).sort((left, right) => left[0] - right[0]).map(([roleId, value]) => ({
+      roleId,
+      value,
+      percentage: total > 0 ? value / total * 100 : 0,
+      label: formatRoleName(roleLookup.get(roleId) || ({ 2: 'Dean', 3: 'Program Head', 4: 'Secretary', 5: 'Teacher', 6: 'Department Admin' }[roleId] || `Role ${roleId}`)),
+      color: ROLE_COLORS[roleId] || '#4f46e5'
+    }));
+  }, [roles, userRoleCounts]);
 
   const filtersBar = React.useMemo(() => (
-    React.createElement('div', { className: 'flex flex-col sm:flex-row gap-3 mb-4 items-center user-management-filters' },
-      React.createElement('input', {
-        type: 'search',
-        placeholder: 'Search name, email or id...',
-        className: 'form-control w-full sm:w-1/3',
-        value: searchTerm,
-        onChange: e => setSearchTerm(e.target.value)
-      }),
-      React.createElement('select', {
-        className: 'form-select w-full sm:w-1/5',
-        value: roleFilter,
-        onChange: e => setRoleFilter(e.target.value)
-      },
-        React.createElement('option', { value: '' }, 'All roles'),
-        roleFilterOptions.map(r => React.createElement('option', { key: r.role_id, value: r.role_id }, r.role_name || r.name || r.role_id))
-      ),
-      React.createElement('select', {
-        className: 'form-select w-full sm:w-1/5',
-        value: deptFilter,
-        onChange: e => setDeptFilter(e.target.value),
-        disabled: hasFixedDepartmentScope
-      },
-        !hasFixedDepartmentScope && React.createElement('option', { value: '' }, 'Department'),
-        departmentFilterOptions.map(d => React.createElement('option', { key: d.dept_id, value: d.dept_id }, d.dept_name || d.name || d.dept_id))
-      ),
-      React.createElement('button', { type: 'button', className: 'btn btn-success', onClick: ()=>{ setSearchTerm(''); setRoleFilter(''); setDeptFilter(hasFixedDepartmentScope ? fixedDeptId : ''); } }, 'Clear')
-    )
-  ), [searchTerm, roleFilter, deptFilter, roleFilterOptions, departmentFilterOptions, hasFixedDepartmentScope, fixedDeptId]);
+    <MasterToolbar>
+      <MasterSearch value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="Search name, email, ID, department, or program..." />
+      <MasterSelect label="Status" value={effectiveStatusFilter} onChange={(event) => handleStatusSelect(event.target.value)}>
+        <option value="all">Active + Inactive</option><option value="active">Active</option><option value="inactive">Inactive</option>{(isAdmin || isDepartmentAdmin) ? <option value="archive">Archived</option> : null}
+      </MasterSelect>
+      <MasterSelect label="Role" value={roleFilter} onChange={(event) => { setUserPage(1); setRoleFilter(event.target.value); }}>
+        <option value="">All roles</option>{roleFilterOptions.map((role) => <option key={role.role_id} value={role.role_id}>{formatRoleName(role.role_name || role.name || role.role_id)}</option>)}
+      </MasterSelect>
+      <MasterSelect label="Department" value={deptFilter} onChange={(event) => { setUserPage(1); setDeptFilter(event.target.value); }} disabled={hasFixedDepartmentScope}>
+        {!hasFixedDepartmentScope ? <option value="">All departments</option> : null}{departmentFilterOptions.map((department) => <option key={department.dept_id} value={department.dept_id}>{formatDepartmentLabel(department, department.dept_id)}</option>)}
+      </MasterSelect>
+      <button type="button" className="mdp-secondary" onClick={() => { setUserPage(1); setSearchTerm(''); setRoleFilter(''); setDeptFilter(hasFixedDepartmentScope ? fixedDeptId : ''); }}><i className="bi bi-x-circle me-2" />Clear</button>
+    </MasterToolbar>
+  ), [searchTerm, roleFilter, deptFilter, roleFilterOptions, departmentFilterOptions, hasFixedDepartmentScope, fixedDeptId, effectiveStatusFilter, isAdmin, isDepartmentAdmin]);
 
   // --- EARLY RETURN: Block Teacher entirely ---
   if (isTeacher) {
@@ -1236,42 +1449,16 @@ export default function UserIndex(){
   }
 
   return (
-    React.createElement('div', { className: 'container py-3 user-management-page' },
-      React.createElement('div', { className: 'd-flex justify-content-between align-items-center mb-3 user-management-header' },
-        React.createElement('h2', { className: 'mb-0 fw-bold fs-3' }, 'User Management'),
-        
-        canManageUsers ? React.createElement('div', { className: 'd-flex gap-2 user-management-actions' },
-          canManageUsers && React.createElement('button', {
-            className: 'btn btn-outline-primary',
-            onClick: ()=> fileInputRef.current && fileInputRef.current.click(),
-            disabled: importing
-          }, importing ? 'Importing...' : 'Import Excel'),
-          React.createElement('button', { className: 'btn btn-success', onClick: openModal, disabled: importing }, 'Add New User'),
-          canManageUsers && React.createElement('input', {
-            ref: fileInputRef,
-            type: 'file',
-            accept: '.xlsx,.xls,.csv',
-            onChange: handleImportFile,
-            style: { display: 'none' }
-          })
-        ) : null
-      ),
-      (!isAdmin && isProgramHead) && React.createElement(
-        'div',
-        { className: 'alert alert-info py-2' },
-        'View-only access: You can only view teachers assigned to your program and department.'
-      ),
+    React.createElement('div', { className: 'mdp-page user-management-page' },
+      <MasterPageHeader eyebrow="Administration" title="Users" description="Manage identities, academic assignments, roles, and account access." action={canManageUsers ? <div className="flex flex-wrap justify-end gap-2 user-management-actions"><button type="button" className="mdp-secondary" onClick={downloadUserImportTemplate} disabled={importing}><i className="bi bi-download me-2" />Template</button><button type="button" className="mdp-secondary" onClick={() => fileInputRef.current?.click()} disabled={importing}><i className="bi bi-file-earmark-spreadsheet me-2" />{importing ? 'Importing...' : 'Import Excel'}</button><button type="button" className="mdp-primary" onClick={openModal} disabled={importing}><i className="bi bi-person-plus-fill me-2" />Add User</button><input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleImportFile} className="d-none" /></div> : null} />,
+      (!isAdmin && isProgramHead) ? <div className="mb-3 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800"><i className="bi bi-info-circle me-2" />View-only access is limited to secretaries and teachers assigned to your program.</div> : null,
+      error ? <div className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"><span><i className="bi bi-exclamation-circle me-2" />{error}</span><button type="button" className="btn-close btn-sm" aria-label="Dismiss error" onClick={() => setError('')} /></div> : null,
+      importSummary ? <div className={`mb-3 flex items-start justify-between gap-3 rounded-xl border px-3 py-2 text-sm ${importErrors.length ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}><span><i className={`bi ${importErrors.length ? 'bi-exclamation-triangle' : 'bi-check-circle'} me-2`} />{importSummary.inserted} valid, {importSummary.skipped} skipped, {importSummary.total} total. {importSummary.mode === 'preview' ? 'Preview only—nothing imported yet.' : 'Import completed; random temporary passwords are emailed to new users.'}</span><button type="button" className="btn-close btn-sm" aria-label="Dismiss import summary" onClick={() => setImportSummary(null)} /></div> : null,
 
-      error && React.createElement('div', { className: 'alert alert-danger py-2' }, error),
-      importSummary && React.createElement(
-        'div',
-        { className: `alert py-2 ${importErrors.length ? 'alert-warning' : 'alert-success'}` },
-        `${importSummary.mode === 'preview' ? 'Preview summary' : 'Import summary'}: ${importSummary.inserted} valid, ${importSummary.skipped} skipped, ${importSummary.total} total rows. ${importSummary.mode === 'preview' ? 'No rows imported yet.' : 'Default password is School ID.'}`
-      ),
-
-      React.createElement(StatisticsBoxs, { items: statsItems, activeKey: effectiveStatusFilter, onSelect: handleStatusSelect, className: 'mb-4' }),
+      <MasterStats loading={dataLoading} items={statsItems.map((item, index) => ({ label: item.label, value: item.value, help: item.subLabel, icon: item.key === 'all' ? 'U' : item.key === 'active' ? '\u2713' : item.key === 'inactive' ? 'I' : 'A', tone: item.key === 'inactive' ? 'red' : item.key === 'archive' ? 'amber' : index === 0 ? 'blue' : 'green', active: String(effectiveStatusFilter) === String(item.key), onClick: () => handleStatusSelect(item.key) }))} />,
+      <div className="mdp-toolbar"><div className="w-full"><div className="mb-2 flex items-center justify-between"><p className="mb-0 text-[10px] font-bold uppercase tracking-wide text-slate-500">Role distribution</p><span className="text-[10px] text-slate-400">Current directory</span></div><div className="flex h-3 overflow-hidden rounded-full bg-slate-100" role="img" aria-label={`Role distribution: ${directoryRoleStats.map((item) => `${item.label} ${item.value}`).join(', ') || 'No users'}`}>{directoryRoleStats.map((item) => <span key={item.roleId} style={{ width: `${item.percentage}%`, backgroundColor: item.color }} title={`${item.label}: ${item.value}`} />)}</div><div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">{directoryRoleStats.map((item) => <span key={item.roleId} className="inline-flex items-center gap-1.5 text-[10px] text-slate-500"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: item.color }} />{item.label} <strong className="text-slate-700">{item.value}</strong></span>)}</div></div></div>,
       filtersBar,
-      React.createElement(Table, { columns: columns, data: filteredUsers, pageSize: 10, loading: loading, emptyText: 'No users found', horizontalScroll: true, wrapCells: true, className: 'user-table responsive-table', onRowClick: canManageUsers ? (u) => handleEdit(u) : null }),
+      <MasterResults title={isArchiveView ? 'Archived Accounts' : 'User Directory'} count={Number(userPagination.total || 0)} loading={dataLoading} description="Account identity, role, assignment, contact, and status information."><Table columns={columns} data={filteredUsers} pageSize={Number(userPagination.page_size || 10)} loading={dataLoading} emptyText="No users match the selected status and filters." horizontalScroll wrapCells className="user-table responsive-table" onRowClick={canManageUsers && !isArchiveView ? (u) => handleEdit(u) : null} serverPagination totalItems={Number(userPagination.total || 0)} page={userPage} onPageChange={setUserPage} /></MasterResults>,
 
       React.createElement(Modal, { show: showImportModal, title: 'Import Users (Preview & Edit)', size: 'xxl', onClose: closeImportModal, closeOnBackdrop: !importProcessing },
         React.createElement('div', { className: 'd-flex flex-wrap justify-content-between align-items-start gap-3 mb-3' },
@@ -1285,6 +1472,9 @@ export default function UserIndex(){
         ),
         isDepartmentAdmin && React.createElement('div', { className: 'alert alert-info py-2 small mb-3' },
           `Department admin import is restricted to ${fixedDeptLabel || 'your assigned department'} and allowed roles only.`
+        ),
+        React.createElement('div', { className: 'alert alert-light border py-2 small mb-3' },
+          'All rows must pass validation before any user is created. Account emails are sent only after the full batch is saved.'
         ),
         React.createElement('div', { className: 'table-responsive border rounded', style: { maxHeight: '520px', overflow: 'auto' } },
           React.createElement('table', { className: 'table table-sm align-middle mb-0' },
@@ -1369,7 +1559,8 @@ export default function UserIndex(){
                           value: isDepartmentAdmin ? fixedDeptLabel : (row.department || ''),
                           disabled: isDepartmentAdmin,
                           title: isDepartmentAdmin ? 'Fixed to your assigned department' : undefined,
-                          onChange: (e) => handleImportCellChange(globalIndex, 'department', e.target.value)
+                          onChange: (e) => handleImportCellChange(globalIndex, 'department', e.target.value),
+                          onBlur: (e) => handleImportDepartmentBlur(globalIndex, e.target.value)
                         })
                       ),
                       React.createElement('td', null,
@@ -1377,7 +1568,8 @@ export default function UserIndex(){
                           type: 'text',
                           className: fieldClass('program'),
                           value: row.program || '',
-                          onChange: (e) => handleImportCellChange(globalIndex, 'program', e.target.value)
+                          onChange: (e) => handleImportCellChange(globalIndex, 'program', e.target.value),
+                          onBlur: (e) => handleImportCellChange(globalIndex, 'program', canonicalProgramImportValue(e.target.value, row.department))
                         })
                       ),
                       React.createElement('td', null,
@@ -1449,27 +1641,33 @@ export default function UserIndex(){
           ),
           React.createElement('div', { className: 'mb-3' },
             React.createElement('label', { className: 'form-label' }, 'ID Number'),
-            React.createElement('input', { type: 'text', name: 'id_number', value: form.id_number, onChange: handleChange, className: 'form-control', placeholder: 'e.g. 24-018-F', pattern: '\\d{2}-\\d{3}-[A-Za-z]', required: true })
+            React.createElement('input', { type: 'text', name: 'id_number', value: form.id_number, onChange: handleChange, className: 'form-control', placeholder: 'e.g. 24-018-F', pattern: form.user_id && String(form.role_id) === '1' ? undefined : '\\d{2}-\\d{3}-[A-Za-z]', required: !(form.user_id && String(form.role_id) === '1') })
           ),
           React.createElement('div', { className: 'mb-3' },
             React.createElement('label', { className: 'form-label' }, 'Email'),
-            React.createElement('input', { type: 'email', name: 'email', value: form.email, onChange: handleChange, className: 'form-control', required: true, pattern: '[A-Za-z0-9._%+\\-]+@phinmaed\\.com', title: 'Use a @phinmaed.com email address' })
+            React.createElement('input', { type: 'email', name: 'email', value: form.email, onChange: handleChange, className: 'form-control', required: true, pattern: '[^\\s@]+\\.coc@phinmaed\\.com', placeholder: 'juan.coc@phinmaed.com', title: 'Enter a valid email ending in .coc@phinmaed.com' })
           ),
           !form.user_id && React.createElement('div', { className: 'mb-3' },
-            React.createElement('label', { className: 'form-label' }, 'Password'),
-            React.createElement('input', { type: 'password', name: 'password', value: form.password, onChange: handleChange, className: 'form-control', required: true })
+            React.createElement('label', { className: 'form-label' }, 'Automatic password'),
+            React.createElement('div', { className: 'form-text' }, 'A random 6-character temporary password is generated and emailed. The user must change it on first login.')
           ),
           React.createElement('div', { className: 'mb-3' },
             React.createElement('label', { className: 'form-label' }, 'Contact No'),
-            React.createElement('input', { type: 'text', name: 'contact_no', value: form.contact_no, onChange: handleChange, className: 'form-control', placeholder: 'e.g. 09123456789', inputMode: 'numeric', pattern: '09[0-9]+' , maxLength: 11 })
+            React.createElement('input', { type: 'text', name: 'contact_no', value: form.contact_no, onChange: handleChange, className: 'form-control', placeholder: 'e.g. 09123456789', inputMode: 'numeric', pattern: '09[0-9]+' , maxLength: 11 }),
+            contactAvailability !== null && String(form.contact_no || '').replace(/\D/g, '').length === 11 && /^09\d{9}$/.test(String(form.contact_no || '').replace(/\D/g, '')) && React.createElement('div', { className: `mt-1 d-flex align-items-center gap-1 small fw-semibold ${contactAvailability ? 'text-success' : 'text-danger'}` },
+              React.createElement('span', { className: `d-inline-block rounded-circle`, style: { width: 8, height: 8, backgroundColor: contactAvailability ? '#28a745' : '#dc3545' } }),
+              contactAvailability ? 'Available' : 'Already in use by another user'
+            )
           ),
           React.createElement('div', { className: 'mb-3' },
             React.createElement('label', { className: 'form-label' }, 'Role'),
-            React.createElement('select', { name: 'role_id', value: form.role_id, onChange: handleChange, className: 'form-select', required: true },
+            React.createElement('select', { name: 'role_id', value: form.role_id, onChange: handleChange, className: 'form-select', required: true, disabled: Boolean(form.user_id) && String(form.role_id) === '1' },
               React.createElement('option', { value: '' }, 'Select role'),
-              roleFilterOptions.map(r => React.createElement('option', { key: r.role_id, value: r.role_id }, r.role_name))
-            ),
-            isAdmin && React.createElement('button', { type: 'button', className: 'btn btn-sm btn-outline-secondary mt-2 w-100', onClick: openAddRoleModal }, 'Add Role')
+              roleFilterOptions
+                .filter(r => Number(r.role_id) !== 1 || (form.user_id && String(form.role_id) === '1'))
+                .filter(r => !(isAdmin && form.user_id && form.has_active_schedule && Number(r.role_id) === 6))
+                .map(r => React.createElement('option', { key: r.role_id, value: r.role_id }, r.role_name))
+            )
           ),
           String(form.role_id) !== '1' && (
             React.createElement('div', { className: 'mb-3' },
@@ -1477,20 +1675,26 @@ export default function UserIndex(){
                 React.createElement('label', { className: 'form-label mb-0' }, 'Department'),
                 isAdmin && React.createElement('button', { type: 'button', className: 'btn btn-sm btn-outline-success', onClick: openAddDeptModal }, 'Add New Dept')
               ),
-              React.createElement('select', { value: form.dept_id || '', onChange: handleChange, name: 'dept_id', className: 'form-select', required: String(form.role_id) !== '1', disabled: isDepartmentAdmin },
+              React.createElement('select', { value: form.dept_id || '', onChange: handleChange, name: 'dept_id', className: 'form-select', required: String(form.role_id) !== '1', disabled: isDepartmentAdmin || Boolean(form.has_active_schedule), title: form.has_active_schedule ? 'Locked while this user has a schedule in the current active semester' : (isDepartmentAdmin ? 'Fixed to your assigned department' : undefined) },
                 React.createElement('option', { value: '' }, 'Select Department'),
-                (departmentOptionsForForm || []).map(d => React.createElement('option', { key: d.dept_id, value: d.dept_id }, d.dept_name || d.dept_id))
+                (departmentOptionsForForm || []).map(d => React.createElement('option', { key: d.dept_id, value: d.dept_id }, formatDepartmentLabel(d, d.dept_id)))
               )
             )
           ),
           roleNeedsProgram(form.role_id) && (
             React.createElement('div', { className: 'mb-3' },
-              React.createElement('label', { className: 'form-label' }, String(form.role_id) === '3' ? 'Owned Program' : 'Assigned Program'),
-              React.createElement('select', { value: form.assigned_program_head_id || '', onChange: handleChange, name: 'assigned_program_head_id', className: 'form-select', required: true, disabled: !form.dept_id },
+              React.createElement('div', { className: 'd-flex align-items-center justify-content-between gap-2 mb-1' },
+                React.createElement('label', { className: 'form-label mb-0' }, String(form.role_id) === '3' ? 'Owned Program' : 'Assigned Program'),
+                isAdmin && React.createElement('button', { type: 'button', className: 'btn btn-sm btn-outline-success', onClick: openAddProgramModal }, 'Add New Program')
+              ),
+              React.createElement('select', { value: form.assigned_program_head_id || '', onChange: handleChange, name: 'assigned_program_head_id', className: 'form-select', required: true, disabled: !form.dept_id || Boolean(form.has_active_schedule), title: form.has_active_schedule ? 'Locked while this user has a schedule in the current active semester' : undefined },
                 React.createElement('option', { value: '' }, form.dept_id ? 'Select Program' : 'Select Department first'),
                 (programHeads || []).map(ph => React.createElement('option', { key: ph.id, value: ph.id }, ph.label))
               )
             )
+          ),
+          form.user_id && form.has_active_schedule && React.createElement('div', { className: 'alert alert-warning py-2 small mb-3' },
+            `Can't change department or program because this user already has an active schedule for ${form.active_schedule_label || 'the current active semester'}.`
           ),
 
           error && React.createElement('div', { className: 'alert alert-danger py-2' }, error),
@@ -1502,22 +1706,12 @@ export default function UserIndex(){
         )
       ),
 
-      React.createElement(Modal, { show: showAddRoleModal, title: 'Add New Role', size: 'sm', onClose: closeAddRoleModal },
-        React.createElement('form', { onSubmit: handleAddRoleSubmit },
-          React.createElement('div', { className: 'mb-3' },
-            React.createElement('label', { className: 'form-label' }, 'Role Name'),
-            React.createElement('input', { type: 'text', name: 'role_name', value: addRoleForm.role_name, onChange: handleAddRoleChange, className: 'form-control', placeholder: 'e.g., Coordinator, Supervisor', required: true, autoFocus: true })
-          ),
-          addRoleError && React.createElement('div', { className: 'alert alert-danger py-2 mb-3' }, addRoleError),
-          React.createElement('div', { className: 'd-flex justify-content-end gap-2' },
-            React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: closeAddRoleModal, disabled: addRoleLoading }, 'Cancel'),
-            React.createElement('button', { type: 'submit', className: 'btn btn-success', disabled: addRoleLoading }, addRoleLoading ? 'Creating...' : 'Create Role')
-          )
-        )
-      ),
-
       React.createElement(Modal, { show: showAddDeptModal, title: 'Add New Department', size: 'sm', onClose: closeAddDeptModal },
         React.createElement('form', { onSubmit: handleAddDeptSubmit },
+          React.createElement('div', { className: 'mb-3' },
+            React.createElement('label', { className: 'form-label' }, 'Sub Name'),
+            React.createElement('input', { type: 'text', name: 'sub_name', value: addDeptForm.sub_name, onChange: handleAddDeptChange, className: 'form-control', placeholder: 'Automatically generated', maxLength: 30, required: true })
+          ),
           React.createElement('div', { className: 'mb-3' },
             React.createElement('label', { className: 'form-label' }, 'Department Name'),
             React.createElement('input', { type: 'text', name: 'dept_name', value: addDeptForm.dept_name, onChange: handleAddDeptChange, className: 'form-control', placeholder: 'e.g., Computer Studies', required: true, autoFocus: true })
@@ -1526,6 +1720,31 @@ export default function UserIndex(){
           React.createElement('div', { className: 'd-flex justify-content-end gap-2' },
             React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: closeAddDeptModal, disabled: addDeptLoading }, 'Cancel'),
             React.createElement('button', { type: 'submit', className: 'btn btn-success', disabled: addDeptLoading }, addDeptLoading ? 'Creating...' : 'Create Department')
+          )
+        )
+      ),
+
+      React.createElement(Modal, { show: showAddProgramModal, title: 'Add New Program', size: 'sm', onClose: closeAddProgramModal },
+        React.createElement('form', { onSubmit: handleAddProgramSubmit },
+          React.createElement('div', { className: 'mb-3' },
+            React.createElement('label', { className: 'form-label' }, 'Sub Name'),
+            React.createElement('input', { type: 'text', name: 'sub_name', value: addProgramForm.sub_name, onChange: handleAddProgramChange, className: 'form-control', placeholder: 'Automatically generated', maxLength: 30, required: true })
+          ),
+          React.createElement('div', { className: 'mb-3' },
+            React.createElement('label', { className: 'form-label' }, 'Program Name'),
+            React.createElement('input', { type: 'text', name: 'program_name', value: addProgramForm.program_name, onChange: handleAddProgramChange, className: 'form-control', placeholder: 'e.g., BS Information Technology', required: true, autoFocus: true })
+          ),
+          React.createElement('div', { className: 'mb-3' },
+            React.createElement('label', { className: 'form-label' }, 'Department'),
+            React.createElement('select', { name: 'dept_id', value: addProgramForm.dept_id, onChange: handleAddProgramChange, className: 'form-select', required: true },
+              React.createElement('option', { value: '' }, 'Select Department'),
+              (departmentOptionsForForm || []).map(d => React.createElement('option', { key: d.dept_id, value: d.dept_id }, formatDepartmentLabel(d, d.dept_id)))
+            )
+          ),
+          addProgramError && React.createElement('div', { className: 'alert alert-danger py-2 mb-3' }, addProgramError),
+          React.createElement('div', { className: 'd-flex justify-content-end gap-2' },
+            React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: closeAddProgramModal, disabled: addProgramLoading }, 'Cancel'),
+            React.createElement('button', { type: 'submit', className: 'btn btn-success', disabled: addProgramLoading }, addProgramLoading ? 'Creating...' : 'Create Program')
           )
         )
       )

@@ -1,56 +1,41 @@
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
 function SchoolIndex(){
   const [schools, setSchools] = React.useState([]);
   const [showModal, setShowModal] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ school_name: '', address: '' });
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState('');
+  const [showArchived, setShowArchived] = React.useState(false);
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
   };
 
-  const loadData = React.useCallback(async () => {
+  const loadData = React.useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
     try{
       const s = await apiGet('school');
-      const list = Array.isArray(s) ? s.filter(x => String(x.status || '').toLowerCase() !== 'archive') : [];
-      setSchools(list);
-    }catch(e){ console.error(e); setError('Failed to load schools'); }
+      setSchools(Array.isArray(s) ? s : []);
+    }catch(e){ console.error(e); if (!silent) setError('Failed to load schools'); }
+    finally { if (!silent) setLoading(false); }
   }, []);
 
   React.useEffect(() => {
     loadData();
   }, [loadData]);
 
-  React.useEffect(() => {
-    let timer = null;
-    let stopped = false;
-
-    const pollSchools = async () => {
-      if (stopped) return;
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      await loadData();
-    };
-
-    // HTTPS polling interval (30s) for schools updates
-    timer = setInterval(pollSchools, 30000);
-
-    const onVisibility = () => { if (!stopped) pollSchools(); };
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', onVisibility);
-    }
-
-    return () => {
-      stopped = true;
-      if (timer) clearInterval(timer);
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', onVisibility);
-      }
-    };
-  }, [loadData]);
+  useAutoRefresh({
+    refresh: () => loadData({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: !showModal,
+  });
 
   const openModal = (sch=null) => {
     setError('');
@@ -84,7 +69,7 @@ function SchoolIndex(){
         await apiPost('school', payload);
       }
       const s = await apiGet('school');
-      setSchools(Array.isArray(s)? s.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      setSchools(Array.isArray(s) ? s : []);
       closeModal();
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: editing ? 'School updated' : 'School added', timer:1400, showConfirmButton:false }); } catch(e){}
     } catch (err) {
@@ -103,7 +88,7 @@ function SchoolIndex(){
         () => apiPut(`school/${sch.school_id}`, { status: newStatus }),
         () => apiPost(`school/${sch.school_id}/update`, { status: newStatus })
       );
-      const s = await apiGet('school'); setSchools(Array.isArray(s)? s.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      const s = await apiGet('school'); setSchools(Array.isArray(s) ? s : []);
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Status updated', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) { console.error(err); try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to update status' }); else alert(err.body?.error || err.message || 'Failed to update status'); } catch(e){} }
   };
@@ -117,9 +102,26 @@ function SchoolIndex(){
         () => apiPut(`school/${sch.school_id}`, { status: 'archive' }),
         () => apiPost(`school/${sch.school_id}/update`, { status: 'archive' })
       );
-      const s = await apiGet('school'); setSchools(Array.isArray(s)? s.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      const s = await apiGet('school'); setSchools(Array.isArray(s) ? s : []);
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Archived', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) { console.error(err); try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to archive' }); else alert(err.body?.error || err.message || 'Failed to archive'); } catch(e){} }
+  };
+
+  const handleRestore = async (sch) => {
+    if (!sch?.school_id) return;
+    const res = window.Swal ? await window.Swal.fire({ title:'Restore school?', text:'The school will be restored as inactive so you can review it before activation.', icon:'question', showCancelButton:true }) : { isConfirmed: confirm('Restore school?') };
+    if (!res.isConfirmed) return;
+    try {
+      await runWithFallback(
+        () => apiPut(`school/${sch.school_id}`, { status:'inactive' }),
+        () => apiPost(`school/${sch.school_id}/update`, { status:'inactive' })
+      );
+      await loadData();
+      if (window.Swal) await window.Swal.fire({ icon:'success', title:'School restored', timer:1200, showConfirmButton:false });
+    } catch (err) {
+      const msg = err?.body?.message || err?.body?.error || err?.message || 'Failed to restore school';
+      if (window.Swal) await window.Swal.fire({ icon:'error', title:'Restore failed', text:msg });
+    }
   };
 
   const columns = [
@@ -132,12 +134,13 @@ function SchoolIndex(){
       const text = s === 'active' ? 'Active' : (s === 'inactive' ? 'Inactive' : (r.status || 'N/A'));
       return (<span className={`badge ${cls}`}>{text}</span>);
     }},
-    { key:'actions', label:'Actions', actions: [
-      { label:'Edit', onClick: (row) => openModal(row) },
-      { label:'Toggle', onClick: (row) => handleToggle(row) },
-      { label:'Archive', variant:'danger', onClick: (row) => handleArchive(row) }
-    ]}
+    { key:'actions', label:'Actions', actions: (row) => String(row.status || '').toLowerCase() === 'archive'
+      ? [{ label:'Restore', variant:'success', onClick: () => handleRestore(row) }]
+      : [{ label:'Edit', onClick: () => openModal(row) }, { label:'Toggle', onClick: () => handleToggle(row) }, { label:'Archive', variant:'danger', onClick: () => handleArchive(row) }]
+    }
   ];
+
+  const displayedSchools = schools.filter((school) => (String(school.status || '').toLowerCase() === 'archive') === showArchived);
 
   return (
     <div className="p-6">
@@ -145,12 +148,13 @@ function SchoolIndex(){
         <h2 className="text-2xl font-semibold">Schools</h2>
         <div className="flex gap-2">
           <button className="btn btn-success" onClick={()=>openModal()}>Add School</button>
+          <button className="btn btn-outline-secondary" onClick={() => setShowArchived(value => !value)}>{showArchived ? 'Show Current' : 'View Archive'}</button>
         </div>
       </div>
 
       {error && <div className="mb-3 text-red-600">{error}</div>}
 
-      <Table columns={columns} data={schools} pageSize={10} />
+      <Table columns={columns} data={displayedSchools} loading={loading} pageSize={10} />
 
       <Modal show={showModal} title={editing ? 'Edit School' : 'Add School'} onClose={closeModal} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">

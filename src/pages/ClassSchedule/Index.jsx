@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import LoadingState from "../../components/LoadingState.jsx";
 import { apiGet, apiPost, apiPut } from "../../services/api.js";
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from "../../utils/useAutoRefresh.js";
+import { formatDepartmentLabel, formatProgramLabel } from '../../utils/academicLabels.js';
 
 // Use global SweetAlert (window.Swal) when available, otherwise fallback to alert()
 const swalFire = async (optsOrTitle, text, icon) => {
@@ -21,15 +24,64 @@ const swalFire = async (optsOrTitle, text, icon) => {
   } catch (e) { return Promise.resolve({ isConfirmed: false }); }
 };
 
-const DAY_OPTIONS = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+const DAY_OPTIONS = ['monday','tuesday','wednesday','thursday','friday','saturday'];
+const ALL_DAY_OPTIONS = [...DAY_OPTIONS, 'sunday'];
+
+const parallelSessionKeyFor = (schedule) => {
+  const teacherId = schedule?.teacher_id ?? schedule?.user_id;
+  return `${schedule?.semester_id}|${teacherId}|${schedule?.subject_id}|${String(schedule?.day_of_week || '').toLowerCase()}|${String(schedule?.start_time || '').slice(0,5)}|${String(schedule?.end_time || '').slice(0,5)}`;
+};
+
+const keepParallelSchedulesTogether = (rows = []) => {
+  const indexedRows = rows.map((row, index) => ({ row, index, key: parallelSessionKeyFor(row) }));
+  const groups = new Map();
+  indexedRows.forEach((entry) => {
+    if (!groups.has(entry.key)) groups.set(entry.key, []);
+    groups.get(entry.key).push(entry);
+  });
+
+  const parallelKeys = new Set();
+  groups.forEach((entries, key) => {
+    const hasParallelPair = entries.some((entry, index) => entries.some((candidate, candidateIndex) => (
+      index !== candidateIndex
+      && Number(entry.row?.schedule_id) !== Number(candidate.row?.schedule_id)
+      && Number(entry.row?.room_id) !== Number(candidate.row?.room_id)
+      && Number(entry.row?.section_id) !== Number(candidate.row?.section_id)
+    )));
+    if (hasParallelPair) parallelKeys.add(key);
+  });
+
+  const firstGroupIndex = new Map();
+  indexedRows.forEach((entry) => {
+    if (parallelKeys.has(entry.key) && !firstGroupIndex.has(entry.key)) {
+      firstGroupIndex.set(entry.key, entry.index);
+    }
+  });
+
+  return indexedRows
+    .sort((left, right) => {
+      const leftPosition = parallelKeys.has(left.key) ? firstGroupIndex.get(left.key) : left.index;
+      const rightPosition = parallelKeys.has(right.key) ? firstGroupIndex.get(right.key) : right.index;
+      return leftPosition - rightPosition || left.index - right.index;
+    })
+    .map((entry) => entry.row);
+};
 
 function ClassScheduleIndex(){
   const [schedules,setSchedules] = useState([]);
+  const [scheduleConflictIndex, setScheduleConflictIndex] = useState([]);
+  const [schedulePage, setSchedulePage] = useState(1);
+  const [schedulePagination, setSchedulePagination] = useState({ page: 1, page_size: 10, total: 0, total_pages: 1 });
+  const [scheduleSummary, setScheduleSummary] = useState({ total: 0, teachers: 0, rooms: 0, sections: 0, days: {}, top_rooms: [], top_programs: [] });
   const [rooms,setRooms] = useState([]);
   const [teachers,setTeachers] = useState([]);
   const [semesters, setSemesters] = useState([]);
+  const [workingSemesterId, setWorkingSemesterId] = useState('');
   const [showModal,setShowModal] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState(null);
+  const [editImpact, setEditImpact] = useState(null);
+  const [editImpactLoading, setEditImpactLoading] = useState(false);
+  const [editStateHash, setEditStateHash] = useState('');
   const [showViewModal, setShowViewModal] = useState(false);
   const [viewingSchedule, setViewingSchedule] = useState(null);
   const [showHistoricalModal, setShowHistoricalModal] = useState(false);
@@ -44,7 +96,9 @@ function ClassScheduleIndex(){
   const [historicalLoading, setHistoricalLoading] = useState(false);
   const [form,setForm] = useState({ room_id:'', subject_id:'', section_id:'', user_id:'', semester_id:'', day_of_week:'monday', start_time:'', end_time:'' });
   const [loading,setLoading] = useState(false);
+  const [dataLoading, setDataLoading] = useState(true);
   const [error,setError] = useState('');
+  const [hoveredParallelGroupKey, setHoveredParallelGroupKey] = useState('');
   
   // States for Table UI Filters
   const [filterRoom, setFilterRoom] = useState('');
@@ -57,6 +111,10 @@ function ClassScheduleIndex(){
   const [filterProgram, setFilterProgram] = useState('');
   const [filterSubject, setFilterSubject] = useState('');
   const [filterSection, setFilterSection] = useState('');
+  const [mobileInsightsOpen, setMobileInsightsOpen] = useState(false);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const mobileSchedulePage = schedulePage;
+  const setMobileSchedulePage = setSchedulePage;
   
   const [importing, setImporting] = useState(false);
   const [importSummary, setImportSummary] = useState(null);
@@ -68,14 +126,15 @@ function ClassScheduleIndex(){
   const [submittingReviewedImport, setSubmittingReviewedImport] = useState(false);
   const [livePreviewing, setLivePreviewing] = useState(false);
   const livePreviewRequestRef = useRef(0);
+  const scheduleRequestRef = useRef(0);
   const fileInputRef = useRef(null);
-  const batchDefaultsInitializedRef = useRef(false);
 
   // Batch modal states
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchForm, setBatchForm] = useState({ isParallel: false, room_id:'', subject_id:'', section_id:'', user_id:'', day_of_week:'monday', start_time:'', end_time:'' });
   const [batchRows, setBatchRows] = useState([]);
   const [editingBatchIndex, setEditingBatchIndex] = useState(null);
+  const [batchValidationAttempted, setBatchValidationAttempted] = useState(false);
   const BATCH_PAGE_SIZE = 10;
   const [batchPage, setBatchPage] = useState(1);
 
@@ -83,6 +142,7 @@ function ClassScheduleIndex(){
   const [departments, setDepartments] = useState([]);
   const [programs, setPrograms] = useState([]);
   const [buildings, setBuildings] = useState([]);
+  const [schools, setSchools] = useState([]);
   const [floors, setFloors] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [sections, setSections] = useState([]);
@@ -102,21 +162,28 @@ function ClassScheduleIndex(){
   // Authentication & Role Check logic
   const user = (() => { try { return JSON.parse(localStorage.getItem('user') || 'null'); } catch(e) { return null; } })();
   const isAdmin = Number(user?.role_id) === 1;
-  const isDean = [2, 6].includes(Number(user?.role_id));
+  const isDean = Number(user?.role_id) === 2;
+  const isDepartmentAdmin = Number(user?.role_id) === 6;
+  const isDepartmentScopedRole = isDean || isDepartmentAdmin;
   const isProgramHead = Number(user?.role_id) === 3;
   const isSecretary = Number(user?.role_id) === 4;
-  const canManageSchedules = isAdmin || isDean || isProgramHead;
-  const canEdit = canManageSchedules;
-  const canUseBulkScheduleTools = isAdmin || isDean;
-  const bulkToolsDisabledMessage = 'Batch add and spreadsheet import are temporarily disabled for Program Head accounts.';
+  const canManageSchedules = isAdmin || isDepartmentAdmin || isProgramHead;
+  const canEdit = canManageSchedules || isDean;
+  const canUseBulkScheduleTools = isAdmin || isDepartmentAdmin || isProgramHead;
+  const bulkToolsDisabledMessage = 'Your role has read-only access to class schedules.';
+  const editIdentityLocked = Boolean(editImpact && (
+    Number(editImpact.historical_records || 0) > 0
+    || Number(editImpact.scanned_records || 0) > 0
+    || Number(editImpact.protected_current_future_records || 0) > 0
+  ));
 
   const ensureBulkToolsAllowed = useCallback((showNotice = false) => {
     if (canUseBulkScheduleTools) return true;
-    if (showNotice && isProgramHead) {
-      swalFire({ icon: 'info', title: 'Temporarily Disabled', text: bulkToolsDisabledMessage });
+    if (showNotice) {
+      swalFire({ icon: 'info', title: 'Read-only Access', text: bulkToolsDisabledMessage });
     }
     return false;
-  }, [canUseBulkScheduleTools, isProgramHead]);
+  }, [canUseBulkScheduleTools]);
 
   const normalizeStatusValue = (value) => String(value ?? '').trim().toLowerCase();
   const isStatusActive = (value) => {
@@ -124,7 +191,8 @@ function ClassScheduleIndex(){
     if (!s) return true;
     return s === 'active' || s === '1' || s === 'true';
   };
-  const isEntityActive = (entity) => isStatusActive(entity?.status);
+  const isEntityActive = (entity) => Boolean(entity)
+    && ['active', '1', 'true'].includes(normalizeStatusValue(entity.status));
 
   // Program-head scope for Batch Add: force own department/program context.
   const programHeadProgram = useMemo(() => {
@@ -137,7 +205,10 @@ function ClassScheduleIndex(){
       const byHead = programs.find(p => String(p.head_id) === String(user.user_id));
       if (byHead) return byHead;
     }
-    return null;
+    // The programs API is already scoped to the signed-in Program Head, so
+    // this also supports multiple heads sharing the same program when the
+    // legacy single head_id points at a different representative.
+    return programs[0] || null;
   }, [isProgramHead, programs, user]);
 
   const programHeadDeptId = useMemo(() => {
@@ -155,17 +226,17 @@ function ClassScheduleIndex(){
   }, [isProgramHead, user, programHeadProgram]);
 
   const deanDeptId = useMemo(() => {
-    if (!isDean) return '';
+    if (!isDepartmentScopedRole) return '';
     return user?.dept_id ? String(user.dept_id) : '';
-  }, [isDean, user]);
+  }, [isDepartmentScopedRole, user]);
 
   const fixedScheduleDeptId = useMemo(() => {
     if (isProgramHead) return String(programHeadDeptId || '');
-    if (isDean) return String(deanDeptId || '');
+    if (isDepartmentScopedRole) return String(deanDeptId || '');
     return '';
-  }, [isProgramHead, programHeadDeptId, isDean, deanDeptId]);
+  }, [isProgramHead, programHeadDeptId, isDepartmentScopedRole, deanDeptId]);
 
-  const effectiveHeaderDept = (isProgramHead || isDean) ? String(fixedScheduleDeptId || '') : String(headerDept || '');
+  const effectiveHeaderDept = (isProgramHead || isDepartmentScopedRole) ? String(fixedScheduleDeptId || '') : String(headerDept || '');
   const effectiveHeaderProgram = isProgramHead ? String(programHeadProgramId || '') : String(headerProgram || '');
 
   // helper: format 24h time to 12h AM/PM
@@ -191,7 +262,7 @@ function ClassScheduleIndex(){
     String(aStart || '').slice(0,5) === String(bStart || '').slice(0,5)
     && String(aEnd || '').slice(0,5) === String(bEnd || '').slice(0,5)
   );
-  const parallelSubjectTimeMessage = 'This subject already has an overlapping schedule on the selected day. Parallel classes for the same subject must use the exact same start and end time.';
+  const parallelSubjectTimeMessage = 'This teacher already has an overlapping class for the same subject. Parallel classes must use the exact same start and end time.';
 
   // Error message mapping for backend validation errors (professionalized)
   const scheduleErrorMessages = {
@@ -201,23 +272,32 @@ function ClassScheduleIndex(){
     'teacher_conflict': { title: 'Teacher Availability Conflict', text: 'The instructor is already scheduled to teach a different subject during this timeframe.', icon: 'error' },
     'parallel_time_mismatch': { title: 'Parallel Class Time Mismatch', text: 'For parallel classes (same subject, same teacher), start and end times must match the existing session exactly.', icon: 'error' },
     'parallel_subject_time_conflict': { title: 'Parallel Subject Conflict', text: parallelSubjectTimeMessage, icon: 'error' },
-    'duplicate_section_subject': { title: 'Duplicate Section-Subject', text: 'This section is already enrolled in this subject today. Each section can only have one session per subject daily.', icon: 'warning' },
+    'duplicate_section_subject': { title: 'Duplicate Section-Subject', text: 'This section already has this subject on the selected weekday. Each section can only have one session per subject per weekday.', icon: 'warning' },
     'no_active_semester': { title: 'No Active Semester', text: 'No active semester is available for today. Please activate a semester first.', icon: 'error' },
+    'no_schedule_semester': { title: 'No Working Semester', text: 'Select a current or upcoming semester before saving schedules.', icon: 'warning', useServerMessage: true },
+    'semester_not_plannable': { title: 'Semester Is Read-only', text: 'This semester cannot receive schedule changes.', icon: 'warning', useServerMessage: true },
+    'inactive_schedule_dependency': { title: 'Inactive Schedule Selection', text: 'One or more selected schedule records are inactive or archived. Choose active records and try again.', icon: 'warning', useServerMessage: true },
     'missing_fields': { title: 'Incomplete Form', text: 'All required fields must be filled in before saving.', icon: 'warning' },
-    'validation': { title: 'Validation Error', text: 'Please review your input and correct any issues before resubmitting.', icon: 'warning' },
-    'forbidden': { title: 'Access Restricted', text: 'You do not have permission to perform this action. Contact your administrator.', icon: 'error' },
+    'validation': { title: 'Validation Error', text: 'Please review your input and correct any issues before resubmitting.', icon: 'warning', useServerMessage: true },
+    'forbidden': { title: 'Access Restricted', text: 'You do not have permission to perform this action. Contact your administrator.', icon: 'error', useServerMessage: true },
     'schedule_not_found': { title: 'Schedule Not Found', text: 'The requested schedule could not be located. It may have been deleted.', icon: 'error' },
     'schedule_in_use': { title: 'Schedule In Use', text: 'This schedule has attendance records or substitutions linked to it. Remove those first before deleting.', icon: 'error' },
+    'schedule_busy': { title: 'Schedule Save in Progress', text: 'Another schedule is currently being saved for this weekday. Please try again in a few seconds.', icon: 'warning' },
+    'schedule_lock_failed': { title: 'Schedule Save Unavailable', text: 'The schedule safety check could not start. Please try again. If the problem continues, contact the administrator.', icon: 'error' },
+    'schedule_version_required': { title: 'Historical Attendance Protected', text: 'This schedule already has protected attendance. Keep the instructor, semester, subject, and section unchanged, or create a new class schedule for the new assignment.', icon: 'warning', useServerMessage: true },
+    'schedule_session_active': { title: 'Class Currently in Progress', text: 'Wait until the class ends before editing its schedule so live attendance remains unchanged.', icon: 'warning', useServerMessage: true },
+    'schedule_changed_while_editing': { title: 'Schedule Changed', text: 'Another user changed this schedule while the edit form was open. Close and reopen it before applying your changes.', icon: 'warning', useServerMessage: true },
   };
 
   const handleApiError = async (err, customMessage) => {
-    const data = err?.response?.data || err?.data || {};
+    const data = err?.body || err?.response?.data || err?.data || {};
     const errorType = data?.error || '';
     const message = data?.message || customMessage || 'An unexpected error occurred. Please try again.';
     
     const mapped = scheduleErrorMessages[errorType];
     if (mapped) {
-      return await swalFire({ icon: mapped.icon, title: mapped.title, text: mapped.text || message });
+      const text = mapped.useServerMessage && data?.message ? data.message : (mapped.text || message);
+      return await swalFire({ icon: mapped.icon, title: mapped.title, text });
     }
     return await swalFire({ icon: 'error', title: 'Error', text: message });
   };
@@ -234,10 +314,7 @@ function ClassScheduleIndex(){
       return today >= start && today <= end;
     };
 
-    return semesters.find(s => isActiveStatus(s) && isInDateRange(s))
-      || semesters.find(s => isInDateRange(s))
-      || semesters.find(s => isActiveStatus(s))
-      || null;
+    return semesters.find(s => isActiveStatus(s) && isInDateRange(s)) || null;
   }, [semesters]);
   const activeSemesterId = activeSemester?.semester_id ? Number(activeSemester.semester_id) : null;
   const activeSemesterLabel = useMemo(() => {
@@ -251,60 +328,148 @@ function ClassScheduleIndex(){
     return [title, range].filter(Boolean).join(' | ') || 'Current active semester';
   }, [activeSemester]);
 
+  const todayDateKey = useMemo(() => {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }, []);
+  const workingSemesterOptions = useMemo(() => (
+    semesters
+      .filter((semester) => {
+        const status = String(semester?.status || '').trim().toLowerCase();
+        if (!semester?.semester_id || !semester?.start_date || !semester?.end_date) return false;
+        if (['archive', 'archived'].includes(status)) return false;
+        const startDate = String(semester.start_date).slice(0, 10);
+        const endDate = String(semester.end_date).slice(0, 10);
+        const isCurrent = startDate <= todayDateKey && todayDateKey <= endDate && status === 'active';
+        const isUpcoming = startDate > todayDateKey;
+        return isCurrent || isUpcoming;
+      })
+      .sort((left, right) => String(left.start_date).localeCompare(String(right.start_date)))
+  ), [semesters, todayDateKey]);
+  useEffect(() => {
+    setWorkingSemesterId((current) => {
+      if (workingSemesterOptions.some((semester) => String(semester.semester_id) === String(current))) return current;
+      if (activeSemesterId && workingSemesterOptions.some((semester) => Number(semester.semester_id) === Number(activeSemesterId))) {
+        return String(activeSemesterId);
+      }
+      const upcoming = workingSemesterOptions.find((semester) => String(semester.start_date).slice(0, 10) > todayDateKey);
+      return upcoming ? String(upcoming.semester_id) : (workingSemesterOptions[0] ? String(workingSemesterOptions[0].semester_id) : '');
+    });
+  }, [workingSemesterOptions, activeSemesterId, todayDateKey]);
+  const workingSemesterIdNumber = workingSemesterId
+    ? Number(workingSemesterId)
+    : (activeSemesterId ? Number(activeSemesterId) : null);
+  const workingSemester = useMemo(() => (
+    workingSemesterOptions.find((semester) => Number(semester.semester_id) === Number(workingSemesterIdNumber)) || null
+  ), [workingSemesterOptions, workingSemesterIdNumber]);
+  const formatSemesterLabel = useCallback((semester) => {
+    if (!semester) return '';
+    const schoolYear = semester.session_name || semester.school_year || semester.school_year_name || '';
+    const term = semester.term || semester.semester_name || semester.semester || '';
+    const title = [schoolYear, term].filter(Boolean).join(' - ') || `Semester ${semester.semester_id}`;
+    const range = semester.start_date && semester.end_date ? `${semester.start_date} to ${semester.end_date}` : '';
+    return [title, range].filter(Boolean).join(' | ');
+  }, []);
+  const workingSemesterLabel = useMemo(() => formatSemesterLabel(workingSemester), [workingSemester, formatSemesterLabel]);
+  const isPlanningSemester = Boolean(
+    workingSemesterIdNumber && (!activeSemesterId || Number(workingSemesterIdNumber) !== Number(activeSemesterId))
+  );
+
+  const loadSchedulePage = useCallback(async ({ silent = false, page = schedulePage } = {}) => {
+    const requestId = ++scheduleRequestRef.current;
+    if (!silent) {
+      setDataLoading(true);
+      setError('');
+    }
+    try {
+      const params = new URLSearchParams({
+        paginate: '1',
+        include_avatar: '0',
+        page: String(page),
+        page_size: '10',
+      });
+      if (workingSemesterIdNumber) params.set('semester_id', String(workingSemesterIdNumber));
+      else params.set('current', '1');
+      const filters = {
+        day: filterDay,
+        teacher_id: filterTeacher,
+        room_id: filterRoom,
+        campus_id: filterCampus,
+        building_id: filterBuilding,
+        floor_id: filterFloor,
+        dept_id: filterDept,
+        program_id: filterProgram,
+        subject_id: filterSubject,
+        section_id: filterSection,
+      };
+      Object.entries(filters).forEach(([key, value]) => {
+        if (value !== '' && value !== null && value !== undefined) params.set(key, String(value));
+      });
+      const response = await apiGet(`class-schedules?${params.toString()}`);
+      if (requestId !== scheduleRequestRef.current) return;
+      const rows = Array.isArray(response?.rows) ? response.rows : (Array.isArray(response) ? response : []);
+      const pagination = response?.pagination || { page: 1, page_size: 10, total: rows.length, total_pages: 1 };
+      setSchedules(rows);
+      setSchedulePagination(pagination);
+      setScheduleSummary(response?.summary || { total: rows.length, teachers: 0, rooms: 0, sections: 0, days: {}, top_rooms: [], top_programs: [] });
+      if (Number(pagination.page) !== Number(schedulePage)) setSchedulePage(Number(pagination.page) || 1);
+    } catch (e) {
+      if (requestId !== scheduleRequestRef.current) return;
+      console.error(e);
+      if (!silent) setError('Failed to load schedules');
+    } finally {
+      if (!silent && requestId === scheduleRequestRef.current) setDataLoading(false);
+    }
+  }, [schedulePage, workingSemesterIdNumber, filterDay, filterTeacher, filterRoom, filterCampus, filterBuilding, filterFloor, filterDept, filterProgram, filterSubject, filterSection]);
+
+  const loadScheduleConflictIndex = useCallback(async () => {
+    try {
+      const semesterQuery = workingSemesterIdNumber
+        ? `semester_id=${workingSemesterIdNumber}`
+        : 'current=1';
+      const response = await apiGet(`class-schedules?${semesterQuery}&compact=1&include_avatar=0`);
+      setScheduleConflictIndex(Array.isArray(response) ? response : []);
+    } catch (e) {
+      console.error('Failed to refresh the schedule conflict index', e);
+    }
+  }, [workingSemesterIdNumber]);
+
   const loadData = useCallback(async () => {
     try { 
-      const [s,r,u,sem, deps, progs, blds, fls, subs, secs] = await Promise.all([
-        apiGet('class-schedules'),
+      const [r,u,sem, deps, progs, blds, fls, subs, secs, campuses] = await Promise.all([
         apiGet('rooms'),
-        apiGet('users'),
+        // Schedules keep inactive teachers visible in historical filters and
+        // labels; add/edit controls use availableActiveTeachers below.
+        apiGet('users?list=1&teaching_roles=1&include_inactive=1'),
         apiGet('semesters'),
         apiGet('departments'),
         apiGet('programs'),
         apiGet('buildings'),
         apiGet('floors'),
         apiGet('subjects'),
-        apiGet('sections')
+        apiGet('sections'),
+        apiGet('school')
       ]);
-      setSchedules(Array.isArray(s)?s:[]);
       setRooms(Array.isArray(r)?r:[]);
       setSemesters(Array.isArray(sem)?sem:[]);
       setDepartments(Array.isArray(deps)?deps:[]);
       setPrograms(Array.isArray(progs)?progs:[]);
       setBuildings(Array.isArray(blds)?blds:[]);
+      setSchools(Array.isArray(campuses)?campuses:[]);
       setFloors(Array.isArray(fls)?fls:[]);
       setSubjects(Array.isArray(subs)?subs:[]);
       setSections(Array.isArray(secs)?secs:[]);
-      // All non-admin accounts can be scheduled (teacher, dean, program head, secretary).
-      const teachersList = Array.isArray(u) ? u.filter(t => Number(t.role_id) !== 1) : [];
+      // Only teaching staff can be scheduled: dean, program head, secretary, and teacher.
+      const teachersList = Array.isArray(u) ? u.filter(t => [2, 3, 4, 5].includes(Number(t.role_id))) : [];
       setTeachers(teachersList);
 
-      // Debug: log fetched lists so we can verify API responses
-      console.debug('API load: schedules', Array.isArray(s)?s.length:0, 'rooms', Array.isArray(r)?r.length:0, 'users', Array.isArray(u)?u.length:0);
-      console.debug('Lookups: departments', Array.isArray(deps)?deps.length:0, 'programs', Array.isArray(progs)?progs.length:0, 'buildings', Array.isArray(blds)?blds.length:0, 'floors', Array.isArray(fls)?fls.length:0, 'subjects', Array.isArray(subs)?subs.length:0, 'sections', Array.isArray(secs)?secs.length:0);
-
-      const pickFirstActiveId = (list, idKey) => {
-        if (!Array.isArray(list)) return '';
-        const active = list.find((item) => {
-          const s = String(item?.status ?? '').trim().toLowerCase();
-          return s === '' || s === 'active' || s === '1' || s === 'true';
-        });
-        if (active && active[idKey] !== undefined && active[idKey] !== null) return active[idKey];
-        return list[0]?.[idKey] ?? '';
-      };
-
-      // Initialize batch defaults only once.
-      // This prevents "All" selections from being reset on every data refresh.
-      if (!batchDefaultsInitializedRef.current) {
-        setHeaderDept(h => h || pickFirstActiveId(deps, 'dept_id'));
-        setHeaderProgram(h => h || pickFirstActiveId(progs, 'program_id'));
-        setHeaderBuilding(h => h || pickFirstActiveId(blds, 'building_id'));
-        setHeaderFloor(h => h || pickFirstActiveId(fls, 'floor_id'));
-        setBatchForm(prev => ({ ...prev, room_id: prev.room_id || pickFirstActiveId(r, 'room_id') }));
-        batchDefaultsInitializedRef.current = true;
-      }
-    } catch(e) { 
-      console.error(e); setError('Failed to load schedules'); 
-    } 
+    } catch(e) {
+      console.error(e);
+      setError('Failed to load schedule filters');
+    }
   }, []);
 
   useEffect(() => {
@@ -312,31 +477,21 @@ function ClassScheduleIndex(){
   }, [loadData]);
 
   useEffect(() => {
-    let timer = null;
-    let stopped = false;
+    loadScheduleConflictIndex();
+  }, [loadScheduleConflictIndex]);
 
-    const pollSchedules = async () => {
-      if (stopped) return;
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      await loadData();
-    };
+  useEffect(() => {
+    loadSchedulePage({ page: schedulePage });
+  }, [loadSchedulePage, schedulePage]);
 
-    // HTTPS polling interval (30s) for schedule updates
-    timer = setInterval(pollSchedules, 2000);
-
-    const onVisibility = () => { if (!stopped) pollSchedules(); };
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', onVisibility);
-    }
-
-    return () => {
-      stopped = true;
-      if (timer) clearInterval(timer);
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', onVisibility);
-      }
-    };
-  }, [loadData]);
+  useAutoRefresh({
+    // Only the visible table page is live-refreshed. The compact conflict index
+    // is loaded once and after mutations; the API remains the final authority
+    // for conflicts when a schedule is saved.
+    refresh: () => loadSchedulePage({ silent: true, page: schedulePage }),
+    intervalMs: AUTO_REFRESH_INTERVALS.WORKFLOW,
+    enabled: !showModal && !showBatchModal,
+  });
 
   useEffect(() => {
     if (!isProgramHead) return;
@@ -345,9 +500,9 @@ function ClassScheduleIndex(){
   }, [isProgramHead, programHeadDeptId, programHeadProgramId]);
 
   useEffect(() => {
-    if (!isDean || !deanDeptId) return;
+    if (!isDepartmentScopedRole || !deanDeptId) return;
     setHeaderDept(String(deanDeptId));
-  }, [isDean, deanDeptId]);
+  }, [isDepartmentScopedRole, deanDeptId]);
 
   // Compute available teachers early so batchTeachers can use it
   const availableTeachers = useMemo(() => {
@@ -363,31 +518,53 @@ function ClassScheduleIndex(){
     [departments]
   );
   const activePrograms = useMemo(
-    () => programs.filter(isEntityActive),
-    [programs]
+    () => {
+      const departmentIds = new Set(activeDepartments.map(d => String(d.dept_id)));
+      return programs.filter(p => isEntityActive(p) && departmentIds.has(String(p.dept_id)));
+    },
+    [programs, activeDepartments]
   );
   const activeBuildings = useMemo(
-    () => buildings.filter(isEntityActive),
-    [buildings]
+    () => {
+      const schoolIds = new Set(schools.filter(isEntityActive).map(s => String(s.school_id)));
+      return buildings.filter(b => isEntityActive(b) && (!b.school_id || schoolIds.has(String(b.school_id))));
+    },
+    [buildings, schools]
   );
   const activeFloors = useMemo(
-    () => floors.filter(isEntityActive),
-    [floors]
+    () => {
+      const buildingIds = new Set(activeBuildings.map(b => String(b.building_id)));
+      return floors.filter(f => isEntityActive(f) && buildingIds.has(String(f.building_id)));
+    },
+    [floors, activeBuildings]
   );
   const activeSubjects = useMemo(
-    () => subjects.filter(isEntityActive),
-    [subjects]
+    () => {
+      const programIds = new Set(activePrograms.map(p => String(p.program_id)));
+      return subjects.filter(s => isEntityActive(s) && programIds.has(String(s.program_id)));
+    },
+    [subjects, activePrograms]
   );
   const activeSections = useMemo(
-    () => sections.filter(isEntityActive),
-    [sections]
+    () => {
+      const programIds = new Set(activePrograms.map(p => String(p.program_id)));
+      return sections.filter(s => isEntityActive(s) && programIds.has(String(s.program_id)));
+    },
+    [sections, activePrograms]
   );
   const activeRooms = useMemo(
-    () => rooms.filter(isEntityActive),
-    [rooms]
+    () => {
+      const floorById = new Map(activeFloors.map(f => [String(f.floor_id), f]));
+      const buildingIds = new Set(activeBuildings.map(b => String(b.building_id)));
+      return rooms.filter(r => {
+        const floor = floorById.get(String(r.floor_id));
+        return isEntityActive(r) && floor && buildingIds.has(String(r.building_id ?? floor.building_id));
+      });
+    },
+    [rooms, activeFloors, activeBuildings]
   );
   const activeTeachers = useMemo(
-    () => teachers.filter(t => Number(t?.role_id) !== 1 && isEntityActive(t)),
+    () => teachers.filter(t => [2, 3, 4, 5].includes(Number(t?.role_id)) && isEntityActive(t)),
     [teachers]
   );
   const availableActiveTeachers = useMemo(() => {
@@ -398,38 +575,32 @@ function ClassScheduleIndex(){
     return list;
   }, [activeTeachers, isAdmin, user]);
 
+  const scheduleValidationRows = scheduleConflictIndex.length ? scheduleConflictIndex : schedules;
+
   // Derived lists for header-dependent selects (ensure these exist before JSX uses them)
   const filteredPrograms = useMemo(() => {
     if (isProgramHead) {
       if (!effectiveHeaderProgram) return [];
       return activePrograms.filter(p => String(p.program_id) === String(effectiveHeaderProgram));
     }
-    if (!effectiveHeaderDept) return activePrograms;
+    if (!effectiveHeaderDept) return [];
     return activePrograms.filter(p => String(p.dept_id) === String(effectiveHeaderDept));
   }, [activePrograms, isProgramHead, effectiveHeaderDept, effectiveHeaderProgram]);
 
   useEffect(() => {
-    if (!isDean || isProgramHead) return;
-    if (!headerProgram) {
-      const firstProgramId = filteredPrograms[0]?.program_id ? String(filteredPrograms[0].program_id) : '';
-      if (firstProgramId) setHeaderProgram(firstProgramId);
-      return;
-    }
+    if (!isDepartmentScopedRole || isProgramHead) return;
+    if (!headerProgram) return;
     const valid = filteredPrograms.some(p => String(p.program_id) === String(headerProgram));
-    if (!valid) {
-      setHeaderProgram(filteredPrograms[0]?.program_id ? String(filteredPrograms[0].program_id) : '');
-    }
-  }, [isDean, isProgramHead, filteredPrograms, headerProgram]);
+    if (!valid) setHeaderProgram('');
+  }, [isDepartmentScopedRole, isProgramHead, filteredPrograms, headerProgram]);
 
   const filteredSubjects = useMemo(() => {
-    if (isProgramHead && !effectiveHeaderProgram) return [];
-    if (!effectiveHeaderProgram) return activeSubjects;
+    if (!effectiveHeaderProgram) return [];
     return activeSubjects.filter(s => String(s.program_id) === String(effectiveHeaderProgram));
   }, [activeSubjects, isProgramHead, effectiveHeaderProgram]);
 
   const filteredSections = useMemo(() => {
-    if (isProgramHead && !effectiveHeaderProgram) return [];
-    if (!effectiveHeaderProgram) return activeSections;
+    if (!effectiveHeaderProgram) return [];
     return activeSections.filter(s => String(s.program_id) === String(effectiveHeaderProgram));
   }, [activeSections, isProgramHead, effectiveHeaderProgram]);
 
@@ -440,13 +611,13 @@ function ClassScheduleIndex(){
 
   const filteredRooms = useMemo(() => {
     if (headerFloor) return activeRooms.filter(r => String(r.floor_id) === String(headerFloor));
-    if (headerBuilding) return activeRooms.filter(r => String(r.building_id) === String(headerBuilding));
+    if (headerBuilding) return activeRooms.filter(r => String(r.building_id ?? activeFloors.find(f => String(f.floor_id) === String(r.floor_id))?.building_id) === String(headerBuilding));
     return activeRooms;
-  }, [activeRooms, headerBuilding, headerFloor]);
+  }, [activeRooms, activeFloors, headerBuilding, headerFloor]);
 
   const teacherProgramIdsByUser = useMemo(() => {
     const map = new Map();
-    schedules.forEach(sch => {
+    scheduleValidationRows.forEach(sch => {
       const teacherId = sch?.teacher_id ?? sch?.user_id;
       const programId = sch?.program_id;
       if (!teacherId || !programId) return;
@@ -456,7 +627,7 @@ function ClassScheduleIndex(){
       map.get(key).add(value);
     });
     return map;
-  }, [schedules]);
+  }, [scheduleValidationRows]);
 
   const programDeptIdByProgramId = useMemo(() => {
     const map = new Map();
@@ -533,6 +704,7 @@ function ClassScheduleIndex(){
 
   // Batch-specific teacher list filtered by department header
   const batchTeachers = useMemo(() => {
+    if (!effectiveHeaderProgram) return [];
     if (isProgramHead) {
       const allowedRoles = new Set([2, 3, 4, 5]); // dean, program head, secretary, teacher
       return availableActiveTeachers.filter(t => {
@@ -574,9 +746,9 @@ function ClassScheduleIndex(){
   // --- STRICT ROLE-BASED VISIBILITY & FILTERING ---
   const roleScopedDeptId = useMemo(() => {
     if (isProgramHead) return String(programHeadDeptId || '');
-    if (isDean || isSecretary) return String(user?.dept_id || '');
+    if (isDepartmentScopedRole || isSecretary) return String(user?.dept_id || '');
     return '';
-  }, [isProgramHead, programHeadDeptId, isDean, isSecretary, user]);
+  }, [isProgramHead, programHeadDeptId, isDepartmentScopedRole, isSecretary, user]);
 
   const visibleSchedules = useMemo(() => {
     const scopedProgramId = programHeadProgramId ? String(programHeadProgramId) : '';
@@ -590,7 +762,7 @@ function ClassScheduleIndex(){
         return true;
       }
 
-      if (isDean || isSecretary) {
+      if (isDepartmentScopedRole || isSecretary) {
         const schDeptId = getScheduleDeptId(sch);
         if (!roleScopedDeptId) return false;
         if (schDeptId === String(roleScopedDeptId)) return true;
@@ -598,34 +770,35 @@ function ClassScheduleIndex(){
 
       return false;
     });
-  }, [schedules, isAdmin, isProgramHead, isDean, isSecretary, programHeadProgramId, roleScopedDeptId, getScheduleDeptId]);
+  }, [schedules, isAdmin, isProgramHead, isDepartmentScopedRole, isSecretary, programHeadProgramId, roleScopedDeptId, getScheduleDeptId]);
 
   const departmentFilterOptions = useMemo(() => {
     if (isAdmin && Array.isArray(departments) && departments.length) {
       return departments
         .filter(d => d?.dept_id !== undefined && d?.dept_id !== null)
-        .map(d => ({ id: String(d.dept_id), label: d.dept_name || `Department ${d.dept_id}` }));
+        .map(d => ({ id: String(d.dept_id), label: formatDepartmentLabel(d, `Department ${d.dept_id}`) }));
     }
 
     if (roleScopedDeptId) {
       const matchedDept = departments.find(d => String(d.dept_id) === String(roleScopedDeptId));
       if (matchedDept) {
-        return [{ id: String(matchedDept.dept_id), label: matchedDept.dept_name || `Department ${matchedDept.dept_id}` }];
+        return [{ id: String(matchedDept.dept_id), label: formatDepartmentLabel(matchedDept, `Department ${matchedDept.dept_id}`) }];
       }
-      const fallbackLabel = visibleSchedules.find(s => getScheduleDeptId(s) === String(roleScopedDeptId))?.dept_name || `Department ${roleScopedDeptId}`;
+      const fallbackSchedule = visibleSchedules.find(s => getScheduleDeptId(s) === String(roleScopedDeptId));
+      const fallbackLabel = formatDepartmentLabel({ sub_name: fallbackSchedule?.department_sub_name, dept_name: fallbackSchedule?.dept_name }, `Department ${roleScopedDeptId}`);
       return [{ id: String(roleScopedDeptId), label: fallbackLabel }];
     }
 
     if (Array.isArray(departments) && departments.length) {
       return departments
         .filter(d => d?.dept_id !== undefined && d?.dept_id !== null)
-        .map(d => ({ id: String(d.dept_id), label: d.dept_name || `Department ${d.dept_id}` }));
+        .map(d => ({ id: String(d.dept_id), label: formatDepartmentLabel(d, `Department ${d.dept_id}`) }));
     }
 
     const map = new Map();
     visibleSchedules.forEach(s => {
       const id = getScheduleDeptId(s);
-      const label = s.dept_name || '';
+      const label = formatDepartmentLabel({ sub_name: s.department_sub_name, dept_name: s.dept_name });
       if (id) map.set(id, label || `Department ${id}`);
     });
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
@@ -712,12 +885,12 @@ function ClassScheduleIndex(){
     if (Array.isArray(list) && list.length) {
       return list
         .filter(p => p?.program_id !== undefined && p?.program_id !== null)
-        .map(p => ({ id: String(p.program_id), label: p.program_name || `Program ${p.program_id}` }));
+        .map(p => ({ id: String(p.program_id), label: formatProgramLabel(p, `Program ${p.program_id}`) }));
     }
 
     const map = new Map();
     visibleSchedules.forEach(s => {
-      if (s.program_id && s.program_name) map.set(String(s.program_id), s.program_name);
+      if (s.program_id && s.program_name) map.set(String(s.program_id), formatProgramLabel({ sub_name: s.program_sub_name, program_name: s.program_name }, s.program_name));
     });
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
   }, [programs, isProgramHead, programHeadProgramId, filterDept, roleScopedDeptId, visibleSchedules]);
@@ -830,33 +1003,32 @@ function ClassScheduleIndex(){
   const modalPrograms = useMemo(() => {
     if (isProgramHead) {
       if (!programHeadProgramId) return [];
-      return programs.filter(p => String(p.program_id) === String(programHeadProgramId));
+      return activePrograms.filter(p => String(p.program_id) === String(programHeadProgramId));
     }
-    if (!modalDept) return programs;
-    return programs.filter(p => String(p.dept_id) === String(modalDept));
-  }, [programs, modalDept, isProgramHead, programHeadProgramId]);
+    if (!modalDept) return [];
+    return activePrograms.filter(p => String(p.dept_id) === String(modalDept));
+  }, [activePrograms, modalDept, isProgramHead, programHeadProgramId]);
 
   const modalSubjects = useMemo(() => {
     const scopedProgram = isProgramHead ? (programHeadProgramId || modalProgram) : modalProgram;
-    if (!scopedProgram) return isProgramHead ? [] : subjects;
-    return subjects.filter(s => String(s.program_id) === String(scopedProgram));
-  }, [subjects, modalProgram, isProgramHead, programHeadProgramId]);
+    if (!scopedProgram) return [];
+    return activeSubjects.filter(s => String(s.program_id) === String(scopedProgram));
+  }, [activeSubjects, modalProgram, isProgramHead, programHeadProgramId]);
 
   const modalSections = useMemo(() => {
     const scopedProgram = isProgramHead ? (programHeadProgramId || modalProgram) : modalProgram;
-    if (!scopedProgram) return isProgramHead ? [] : sections;
-    return sections.filter(s => String(s.program_id) === String(scopedProgram));
-  }, [sections, modalProgram, isProgramHead, programHeadProgramId]);
+    if (!scopedProgram) return [];
+    return activeSections.filter(s => String(s.program_id) === String(scopedProgram));
+  }, [activeSections, modalProgram, isProgramHead, programHeadProgramId]);
 
   const modalTeachers = useMemo(() => {
-    let list = availableTeachers;
+    const scopedProgram = isProgramHead ? (programHeadProgramId || modalProgram) : modalProgram;
+    if (!scopedProgram) return [];
+    let list = availableActiveTeachers;
     if (modalDept) {
       list = list.filter(t => String(t.dept_id) === String(modalDept));
     }
-    const scopedProgram = isProgramHead ? (programHeadProgramId || modalProgram) : modalProgram;
-    if (scopedProgram) {
-      list = list.filter(t => teacherMatchesProgram(t, scopedProgram));
-    }
+    list = list.filter(t => teacherMatchesProgram(t, scopedProgram));
     if (isProgramHead) {
       if (!scopedProgram) return [];
       const allowedRoles = new Set([2, 3, 4, 5]);
@@ -867,7 +1039,7 @@ function ClassScheduleIndex(){
       });
     }
     return list;
-  }, [availableTeachers, modalDept, isProgramHead, programHeadProgramId, modalProgram, teacherMatchesProgram, user]);
+  }, [availableActiveTeachers, modalDept, isProgramHead, programHeadProgramId, modalProgram, teacherMatchesProgram, user]);
 
   const modalProgramTeacherCountText = useMemo(() => {
     if (!modalProgram) return '';
@@ -888,80 +1060,77 @@ function ClassScheduleIndex(){
   }, [effectiveHeaderProgram, batchTeachers.length, programs]);
 
   const modalFloors = useMemo(() => {
-    if (!modalBuilding) return floors;
-    return floors.filter(f => String(f.building_id) === String(modalBuilding));
-  }, [floors, modalBuilding]);
+    if (!modalBuilding) return activeFloors;
+    return activeFloors.filter(f => String(f.building_id) === String(modalBuilding));
+  }, [activeFloors, modalBuilding]);
 
   const modalRooms = useMemo(() => {
-    if (modalFloor) return rooms.filter(r => String(r.floor_id) === String(modalFloor));
-    if (modalBuilding) return rooms.filter(r => String(r.building_id) === String(modalBuilding));
-    return rooms;
-  }, [rooms, modalBuilding, modalFloor]);
+    if (modalFloor) return activeRooms.filter(r => String(r.floor_id) === String(modalFloor));
+    if (modalBuilding) return activeRooms.filter(r => String(r.building_id ?? activeFloors.find(f => String(f.floor_id) === String(r.floor_id))?.building_id) === String(modalBuilding));
+    return activeRooms;
+  }, [activeRooms, activeFloors, modalBuilding, modalFloor]);
 
   useEffect(() => {
+    if (modalBuilding && !activeBuildings.some(b => String(b.building_id) === String(modalBuilding))) {
+      setModalBuilding('');
+    }
+  }, [activeBuildings, modalBuilding]);
+
+  useEffect(() => {
+    if (!modalProgram) return;
     const valid = modalPrograms.some(p => String(p.program_id) === String(modalProgram));
     if (valid) return;
-    setModalProgram(modalPrograms[0]?.program_id ? String(modalPrograms[0].program_id) : '');
+    setModalProgram('');
   }, [modalPrograms, modalProgram]);
 
   useEffect(() => {
     setForm(prev => {
-      if (!prev.subject_id) {
-        const first = modalSubjects[0]?.subject_id ? String(modalSubjects[0].subject_id) : '';
-        return first ? { ...prev, subject_id: first } : prev;
-      }
+      if (!prev.subject_id) return prev;
       const valid = modalSubjects.some(s => String(s.subject_id) === String(prev.subject_id));
       if (valid) return prev;
-      return { ...prev, subject_id: modalSubjects[0]?.subject_id ? String(modalSubjects[0].subject_id) : '' };
+      return { ...prev, subject_id: '' };
     });
   }, [modalSubjects]);
 
   useEffect(() => {
     setForm(prev => {
-      if (!prev.section_id) {
-        const first = modalSections[0]?.section_id ? String(modalSections[0].section_id) : '';
-        return first ? { ...prev, section_id: first } : prev;
-      }
+      if (!prev.section_id) return prev;
       const valid = modalSections.some(s => String(s.section_id) === String(prev.section_id));
       if (valid) return prev;
-      return { ...prev, section_id: modalSections[0]?.section_id ? String(modalSections[0].section_id) : '' };
+      return { ...prev, section_id: '' };
     });
   }, [modalSections]);
 
   useEffect(() => {
     setForm(prev => {
-      if (!prev.user_id) {
-        const first = modalTeachers[0]?.user_id ? String(modalTeachers[0].user_id) : '';
-        return first ? { ...prev, user_id: first } : prev;
-      }
+      if (!prev.user_id) return prev;
       const valid = modalTeachers.some(t => String(t.user_id) === String(prev.user_id));
       if (valid) return prev;
-      return { ...prev, user_id: modalTeachers[0]?.user_id ? String(modalTeachers[0].user_id) : '' };
+      return { ...prev, user_id: '' };
     });
   }, [modalTeachers]);
 
   useEffect(() => {
+    if (!modalFloor) return;
     const valid = modalFloors.some(f => String(f.floor_id) === String(modalFloor));
     if (valid) return;
-    setModalFloor(modalFloors[0]?.floor_id ? String(modalFloors[0].floor_id) : '');
+    setModalFloor('');
   }, [modalFloors, modalFloor]);
 
   useEffect(() => {
     setForm(prev => {
-      if (!prev.room_id) {
-        const first = modalRooms[0]?.room_id ? String(modalRooms[0].room_id) : '';
-        return first ? { ...prev, room_id: first } : prev;
-      }
+      if (!prev.room_id) return prev;
       const valid = modalRooms.some(r => String(r.room_id) === String(prev.room_id));
       if (valid) return prev;
-      return { ...prev, room_id: modalRooms[0]?.room_id ? String(modalRooms[0].room_id) : '' };
+      return { ...prev, room_id: '' };
     });
   }, [modalRooms]);
 
   const displayedAndFiltered = useMemo(() => {
+    if (!workingSemesterIdNumber) return [];
     return visibleSchedules.filter(sch => {
-      // Filter by active semester — only current semester schedules shown in main table
-      if (activeSemesterId && Number(sch.semester_id) !== Number(activeSemesterId)) return false;
+      // The main table follows the page-wide working semester.
+      if (Number(sch.semester_id) !== Number(workingSemesterIdNumber)) return false;
       if (filterDept) {
         const deptVal = getScheduleDeptId(sch);
         if (String(deptVal) !== String(filterDept)) return false;
@@ -987,14 +1156,24 @@ function ClassScheduleIndex(){
       if (filterDay && String(sch.day_of_week || '').toLowerCase() !== String(filterDay).toLowerCase()) return false;
       return true;
     });
-  }, [visibleSchedules, activeSemesterId, filterDept, getScheduleDeptId, filterCampus, filterBuilding, filterFloor, filterProgram, filterSubject, filterSection, filterRoom, filterTeacher, filterDay]);
+  }, [visibleSchedules, workingSemesterIdNumber, filterDept, getScheduleDeptId, filterCampus, filterBuilding, filterFloor, filterProgram, filterSubject, filterSection, filterRoom, filterTeacher, filterDay]);
   const displayData = useMemo(() => {
-    return displayedAndFiltered.map((sch, i) => ({
+    return keepParallelSchedulesTogether(displayedAndFiltered).map((sch, i) => ({
       ...sch,
       id: sch.schedule_id || `sch-${i}`, 
-      display_index: i + 1
+      display_index: ((Number(schedulePagination.page || schedulePage) - 1) * Number(schedulePagination.page_size || 10)) + i + 1
     }));
-  }, [displayedAndFiltered]);
+  }, [displayedAndFiltered, schedulePagination.page, schedulePagination.page_size, schedulePage]);
+  const mobileScheduleTotalPages = Math.max(1, Number(schedulePagination.total_pages || 1));
+  const mobileScheduleRows = displayData;
+
+  useEffect(() => {
+    setMobileSchedulePage(1);
+  }, [filterDay, filterTeacher, filterRoom, filterCampus, filterBuilding, filterFloor, filterDept, filterProgram, filterSubject, filterSection]);
+
+  useEffect(() => {
+    if (mobileSchedulePage > mobileScheduleTotalPages) setMobileSchedulePage(mobileScheduleTotalPages);
+  }, [mobileSchedulePage, mobileScheduleTotalPages]);
 
   const checkProgramHeadPermission = (schedule) => {
     if (isAdmin) return true;
@@ -1015,6 +1194,9 @@ function ClassScheduleIndex(){
 
   const openModal = async (schedule=null) => {
     setError('');
+    setEditImpact(null);
+    setEditStateHash('');
+    setEditImpactLoading(Boolean(schedule));
     
     if (schedule) {
       if (!checkProgramHeadPermission(schedule)) return;
@@ -1040,42 +1222,47 @@ function ClassScheduleIndex(){
         subject_id: schedule.subject_id ? String(schedule.subject_id) : '',
         section_id: schedule.section_id ? String(schedule.section_id) : '',
         user_id: (schedule.teacher_id || schedule.user_id) ? String(schedule.teacher_id || schedule.user_id) : '',
-        semester_id: schedule.semester_id || activeSemesterId || '',
+        semester_id: schedule.semester_id || workingSemesterIdNumber || '',
         day_of_week: schedule.day_of_week || 'monday',
         start_time: schedule.start_time ? String(schedule.start_time).slice(0,5) : '',
         end_time: schedule.end_time ? String(schedule.end_time).slice(0,5) : ''
       });
+      try {
+        const impactResponse = await apiGet(`class-schedules/${schedule.schedule_id}/edit-impact`);
+        setEditImpact(impactResponse?.edit_impact || null);
+        setEditStateHash(String(impactResponse?.state_hash || ''));
+      } catch (impactError) {
+        console.error('Failed to load schedule edit impact', impactError);
+        setEditImpact(null);
+      } finally {
+        setEditImpactLoading(false);
+      }
     } else {
+      setEditImpactLoading(false);
+      if (!workingSemesterIdNumber) {
+        swalFire('No Working Semester', 'Select a current or upcoming semester before adding a schedule.', 'warning');
+        return;
+      }
       if (isProgramHead && !programHeadProgramId) {
         swalFire('Unauthorized', 'Your account has no assigned program. Please contact the administrator.', 'error');
         return;
       }
       const defaultDept = isProgramHead
-        ? (programHeadDeptId || user?.dept_id || departments[0]?.dept_id || '')
-        : (user?.dept_id || departments[0]?.dept_id || '');
-      const deptPrograms = programs.filter(p => !defaultDept || String(p.dept_id) === String(defaultDept));
-      const defaultProgram = isProgramHead
-        ? (programHeadProgramId || deptPrograms[0]?.program_id || '')
-        : (deptPrograms[0]?.program_id || programs[0]?.program_id || '');
-      const programSubjects = subjects.filter(s => !defaultProgram || String(s.program_id) === String(defaultProgram));
-      const programSections = sections.filter(s => !defaultProgram || String(s.program_id) === String(defaultProgram));
-      const deptTeachers = availableTeachers.filter(t => !defaultDept || String(t.dept_id) === String(defaultDept));
-      const defaultBuilding = buildings[0]?.building_id || '';
-      const buildingFloors = floors.filter(f => !defaultBuilding || String(f.building_id) === String(defaultBuilding));
-      const defaultFloor = buildingFloors[0]?.floor_id || floors[0]?.floor_id || '';
-      const scopedRooms = rooms.filter(r => !defaultFloor || String(r.floor_id) === String(defaultFloor));
+        ? (programHeadDeptId || user?.dept_id || '')
+        : (isDepartmentScopedRole ? (deanDeptId || user?.dept_id || '') : '');
+      const defaultProgram = isProgramHead ? (programHeadProgramId || '') : '';
 
       setEditingSchedule(null);
       setModalDept(defaultDept ? String(defaultDept) : '');
       setModalProgram(defaultProgram ? String(defaultProgram) : '');
-      setModalBuilding(defaultBuilding ? String(defaultBuilding) : '');
-      setModalFloor(defaultFloor ? String(defaultFloor) : '');
+      setModalBuilding('');
+      setModalFloor('');
       setForm({
-        room_id: scopedRooms[0]?.room_id ? String(scopedRooms[0].room_id) : (rooms[0]?.room_id ? String(rooms[0].room_id) : ''),
-        subject_id: programSubjects[0]?.subject_id ? String(programSubjects[0].subject_id) : (subjects[0]?.subject_id ? String(subjects[0].subject_id) : ''),
-        section_id: programSections[0]?.section_id ? String(programSections[0].section_id) : (sections[0]?.section_id ? String(sections[0].section_id) : ''),
-        user_id: deptTeachers[0]?.user_id ? String(deptTeachers[0].user_id) : (availableTeachers[0]?.user_id ? String(availableTeachers[0].user_id) : ''),
-        semester_id: activeSemesterId || '',
+        room_id: '',
+        subject_id: '',
+        section_id: '',
+        user_id: '',
+        semester_id: workingSemesterIdNumber || '',
         day_of_week:'monday',
         start_time:'',
         end_time:''
@@ -1084,7 +1271,7 @@ function ClassScheduleIndex(){
     setShowModal(true);
   };
   
-  const closeModal=()=>{ setShowModal(false); setEditingSchedule(null); };
+  const closeModal=()=>{ setShowModal(false); setEditingSchedule(null); setEditImpact(null); setEditImpactLoading(false); setEditStateHash(''); };
   const openViewModal = (schedule) => { setViewingSchedule(schedule || null); setShowViewModal(true); };
   const closeViewModal = () => { setShowViewModal(false); setViewingSchedule(null); };
 
@@ -1094,14 +1281,22 @@ function ClassScheduleIndex(){
     setHistoricalSchedules([]);
     // Default to active semester filter
     setHistoricalFilterSemester(activeSemesterId ? String(activeSemesterId) : '');
-    setHistoricalFilterDept(isProgramHead ? String(programHeadDeptId || '') : (isDean ? String(deanDeptId || '') : ''));
+    setHistoricalFilterDept(isProgramHead ? String(programHeadDeptId || '') : (isDepartmentScopedRole ? String(deanDeptId || '') : ''));
     setHistoricalFilterProgram(isProgramHead ? String(programHeadProgramId || '') : '');
     setHistoricalFilterTeacher('');
     setHistoricalFilterDay('');
     setHistoricalFilterSubject('');
     setHistoricalFilterSection('');
     setShowHistoricalModal(true);
-    setHistoricalLoading(false);
+    try {
+      const response = await apiGet('class-schedules?include_avatar=0');
+      setHistoricalSchedules(Array.isArray(response) ? response : []);
+    } catch (e) {
+      console.error(e);
+      swalFire({ icon: 'error', title: 'History Load Failed', text: 'Failed to load historical schedules.' });
+    } finally {
+      setHistoricalLoading(false);
+    }
   };
   const closeHistoricalModal = () => {
     setShowHistoricalModal(false);
@@ -1121,8 +1316,8 @@ function ClassScheduleIndex(){
 
   // Visible schedules including historical ones (all semesters, filtered by role scope)
   const allVisibleSchedules = useMemo(() => {
-    return visibleSchedules; // Already includes schedules from all semesters via role-scoped visibility
-  }, [visibleSchedules]);
+    return historicalSchedules;
+  }, [historicalSchedules]);
 
   // Apply historical filter to get filtered historical schedules
   const historicalFilteredSchedules = useMemo(() => {
@@ -1154,7 +1349,7 @@ function ClassScheduleIndex(){
     if (historicalFilterSection) {
       list = list.filter(sch => String(sch.section_id) === String(historicalFilterSection));
     }
-    return list.map((sch, i) => ({
+    return keepParallelSchedulesTogether(list).map((sch, i) => ({
       ...sch,
       id: sch.schedule_id || `hsch-${i}`,
       display_index: i + 1
@@ -1165,8 +1360,15 @@ function ClassScheduleIndex(){
     const { name, value } = e.target;
     setForm(p=> ({ ...p, [name]: value }));
   };
-  const handleModalDeptChange = (e) => setModalDept(e.target.value);
-  const handleModalProgramChange = (e) => setModalProgram(e.target.value);
+  const handleModalDeptChange = (e) => {
+    setModalDept(e.target.value);
+    setModalProgram('');
+    setForm(prev => ({ ...prev, subject_id: '', section_id: '', user_id: '' }));
+  };
+  const handleModalProgramChange = (e) => {
+    setModalProgram(e.target.value);
+    setForm(prev => ({ ...prev, subject_id: '', section_id: '', user_id: '' }));
+  };
   const handleModalBuildingChange = (e) => setModalBuilding(e.target.value);
   const handleModalFloorChange = (e) => setModalFloor(e.target.value);
 
@@ -1185,13 +1387,19 @@ function ClassScheduleIndex(){
     e.preventDefault();
     setLoading(true);
     setError('');
+
+    if (!modalDept || !modalProgram) {
+      swalFire({ icon:'warning', title:'Program Scope Required', text:'Select a Department and Program before saving the schedule.' });
+      setLoading(false);
+      return;
+    }
     
     const resolvedSemesterId = editingSchedule
-      ? Number(form.semester_id || activeSemesterId)
-      : Number(activeSemesterId);
+      ? Number(form.semester_id || workingSemesterIdNumber)
+      : Number(workingSemesterIdNumber);
 
     if (!resolvedSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'No active semester is available for the current date.' });
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before saving the schedule.' });
       setLoading(false);
       return;
     }
@@ -1206,6 +1414,7 @@ function ClassScheduleIndex(){
       start_time: form.start_time,
       end_time: form.end_time
     };
+    if (editingSchedule && editStateHash) payload.expected_state_hash = editStateHash;
 
     // Extract extra details for deeper conflict validation
     const selectedSectionId = payload.section_id || null;
@@ -1213,6 +1422,10 @@ function ClassScheduleIndex(){
 
     if (!payload.room_id || !payload.subject_id || !payload.section_id || !payload.user_id || !payload.day_of_week || !payload.start_time || !payload.end_time) {
       swalFire({ icon:'warning', title:'Validation Error', text:'Please fill all required fields.' });
+      setLoading(false); return;
+    }
+    if (!DAY_OPTIONS.includes(payload.day_of_week)) {
+      swalFire({ icon:'warning', title:'Sunday Not Allowed', text:'Class schedules can only be created or moved to Monday through Saturday.' });
       setLoading(false); return;
     }
     if (String(payload.start_time) >= String(payload.end_time)) {
@@ -1229,7 +1442,7 @@ function ClassScheduleIndex(){
     const sEnd = toMinutes(payload.end_time);
 
     // Deep Client-Side Validation against existing schedules
-    for (const sch of schedules) {
+    for (const sch of scheduleValidationRows) {
       if (!sch) continue;
       // Skip comparing against itself when editing
       if (editingSchedule && Number(sch.schedule_id) === Number(editingSchedule.schedule_id)) continue; 
@@ -1259,15 +1472,16 @@ function ClassScheduleIndex(){
         && Number(sch.section_id) === selectedSectionId
         && Number(sch.subject_id) === selectedSubjectId;
       if (sameSectionSameSubject) {
-        swalFire({ icon:'error', title:'Scheduling Conflict', text:'This section is already enrolled in this subject today. Each section can only have one session per subject daily.' });
+        swalFire({ icon:'error', title:'Duplicate Section-Subject', text:'This section already has this subject on the selected weekday. Each section can only have one session per subject per weekday.' });
         setLoading(false); return;
       }
 
       // Time Overlap Check
       if (overlap(sStart, sEnd, schStart, schEnd)) {
+        const sameTeacher = Number(sch.teacher_id ?? sch.user_id) === payload.user_id;
         const sameSubject = selectedSubjectId && Number(sch.subject_id) === selectedSubjectId;
         const exactParallelTime = sameTimeRange(sch.start_time, sch.end_time, payload.start_time, payload.end_time);
-        if (sameSubject && !exactParallelTime) {
+        if (sameTeacher && sameSubject && !exactParallelTime) {
           swalFire({ icon:'warning', title:'Parallel Class Mismatch', text:'For parallel classes (same subject, same teacher), start and end times must be identical to the original session.' });
           setLoading(false); return;
         }
@@ -1280,19 +1494,43 @@ function ClassScheduleIndex(){
       }
     }
 
+    const selectedSubject = subjects.find(item => Number(item.subject_id) === payload.subject_id);
+    const selectedSection = sections.find(item => Number(item.section_id) === payload.section_id);
+    const selectedTeacher = teachers.find(item => Number(item.user_id) === payload.user_id);
+    const selectedRoom = rooms.find(item => Number(item.room_id) === payload.room_id);
+    const teacherName = selectedTeacher ? `${selectedTeacher.first_name || ''} ${selectedTeacher.last_name || ''}`.trim() : 'Selected teacher';
+    const confirmation = await swalFire({
+      title: editingSchedule ? 'Update Schedule?' : 'Create Schedule?',
+      text: `${selectedSubject?.subject_code || selectedSubject?.subject_name || 'Subject'} · ${selectedSection?.section_name || 'Section'} · ${teacherName} · ${selectedRoom?.room_name || 'Room'} · ${payload.day_of_week} ${payload.start_time}-${payload.end_time}`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonText: editingSchedule ? 'Update Schedule' : 'Save Schedule',
+      confirmButtonColor: '#198754'
+    });
+    if (confirmation && confirmation.isConfirmed === false) { setLoading(false); return; }
+
     try{
+      let saveResult = null;
       if (editingSchedule) {
-        await runWithFallback(
+        saveResult = await runWithFallback(
           () => apiPut(`class-schedules/${editingSchedule.schedule_id}`, payload),
           () => apiPost(`class-schedules/${editingSchedule.schedule_id}/update`, payload)
         );
       } else {
-        await apiPost('class-schedules', payload);
+        saveResult = await apiPost('class-schedules', payload);
       }
-      const s = await apiGet('class-schedules');
-      setSchedules(Array.isArray(s)?s:[]);
+      setSchedulePage(1);
+      await Promise.all([loadSchedulePage({ page: 1 }), loadScheduleConflictIndex()]);
       closeModal();
-      swalFire({ icon:'success', title: editingSchedule ? 'Schedule updated' : 'Schedule created', timer: 1500, showConfirmButton: false });
+      const rebuilt = Number(saveResult?.attendance_sync?.generated_rows || 0);
+      const preserved = Number(saveResult?.edit_impact?.historical_records || 0) + Number(saveResult?.edit_impact?.protected_current_future_records || 0);
+      const resultText = editingSchedule
+        ? `${rebuilt} future attendance placeholder${rebuilt === 1 ? '' : 's'} rebuilt. ${preserved} protected record${preserved === 1 ? '' : 's'} preserved.`
+        : '';
+      const planningText = saveResult?.planning_only || saveResult?.attendance_sync?.planning_only
+        ? 'Saved for the upcoming semester. Attendance records will be created only after that semester becomes active.'
+        : resultText;
+      swalFire({ icon:'success', title: editingSchedule ? 'Schedule updated' : 'Schedule created', text: planningText, timer: editingSchedule ? 2600 : 1800, showConfirmButton: false });
     }catch(err){
       console.error(err);
       await handleApiError(err, 'Failed to save schedule.');
@@ -1347,30 +1585,82 @@ function ClassScheduleIndex(){
     return '';
   };
 
+  const getScheduleImportRoomLabel = (room) => {
+    const roomName = String(room?.room_name || '').trim();
+    const buildingName = String(room?.building_name || '').trim();
+    const floorName = String(room?.floor_name || '').trim();
+    return [buildingName, floorName, roomName].filter(Boolean).join(' — ') || roomName;
+  };
+
+  const downloadScheduleImportTemplate = () => {
+    if (!window.XLSX) {
+      swalFire({ icon: 'error', title: 'Template unavailable', text: 'Spreadsheet tools are not available. Please reload the page.' });
+      return;
+    }
+
+    const scheduleSheet = window.XLSX.utils.aoa_to_sheet([
+      ['First Name', 'Last Name', 'Teacher Email', 'Subject Code', 'Section', 'Room', 'Day', 'Start Time', 'End Time']
+    ]);
+    scheduleSheet['!cols'] = [{ wch: 20 }, { wch: 20 }, { wch: 34 }, { wch: 18 }, { wch: 18 }, { wch: 42 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+
+    const instructionsSheet = window.XLSX.utils.aoa_to_sheet([
+      ['CLASS SCHEDULE IMPORT INSTRUCTIONS'],
+      ['Use the Schedules sheet and keep its nine headers unchanged. Column order may change because fields are matched by header name.'],
+      ['There is intentionally no Building column. Copy the complete value from the Room column in Reference.'],
+      ['Teacher Email is looked up first. First Name and Last Name must match the account that owns that email.'],
+      ['Subject Code and Section must belong to the instructor\'s assigned program.'],
+      ['Allowed days: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday. Sunday class schedules are not allowed.'],
+      ['Use 24-hour times such as 07:30 and 09:00. Start Time must be earlier than End Time.'],
+      ['Every row must pass validation. If one row fails, no schedules or attendance records are created.']
+    ]);
+    instructionsSheet['!cols'] = [{ wch: 115 }];
+
+    const referenceLength = Math.max(activeRooms.length, activeSubjects.length, activeSections.length, availableActiveTeachers.length, 1);
+    const referenceRows = Array.from({ length: referenceLength }, (_, index) => ({
+      'First Name': availableActiveTeachers[index]?.first_name || '',
+      'Last Name': availableActiveTeachers[index]?.last_name || '',
+      'Teacher Email': availableActiveTeachers[index]?.email || '',
+      'Subject Code': activeSubjects[index]?.subject_code || '',
+      'Subject Name': activeSubjects[index]?.subject_name || '',
+      Section: activeSections[index]?.section_name || '',
+      Room: activeRooms[index] ? getScheduleImportRoomLabel(activeRooms[index]) : ''
+    }));
+    const referenceSheet = window.XLSX.utils.json_to_sheet(referenceRows);
+    referenceSheet['!cols'] = [{ wch: 20 }, { wch: 20 }, { wch: 34 }, { wch: 18 }, { wch: 28 }, { wch: 18 }, { wch: 42 }];
+
+    const workbook = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(workbook, scheduleSheet, 'Schedules');
+    window.XLSX.utils.book_append_sheet(workbook, instructionsSheet, 'Instructions');
+    window.XLSX.utils.book_append_sheet(workbook, referenceSheet, 'Reference');
+    window.XLSX.writeFile(workbook, 'class_schedule_import_template.xlsx');
+  };
+
   const mapImportRowsToDraft = (rows) => (
     (rows || []).map((row, idx) => {
       const normalized = normalizeImportRow(row);
       return {
-        _row: idx + 1,
-        room: getImportCell(normalized, ['room_name', 'room', 'room_no', 'room_number', 'room_id', 'roomid']),
-        subject: getImportCell(normalized, ['subject_code', 'subject', 'subject_name', 'subject_id', 'subjectid']),
-        section: getImportCell(normalized, ['section_name', 'section', 'sectionname', 'section_id', 'sectionid']),
-        teacher: getImportCell(normalized, ['teacher', 'teacher_email', 'teacher_id', 'user_id']),
-        teacher_name: getImportCell(normalized, ['teacher_name', 'teachername', 'name']),
-        day_of_week: getImportCell(normalized, ['day_of_week', 'day', 'weekday', 'dow']).toLowerCase(),
-        start_time: getImportCell(normalized, ['start_time', 'start', 'time_start', 'from']),
-        end_time: getImportCell(normalized, ['end_time', 'end', 'time_end', 'to']),
+        _row: idx + 2,
+        first_name: getImportCell(normalized, ['first_name']),
+        last_name: getImportCell(normalized, ['last_name']),
+        teacher: getImportCell(normalized, ['teacher_email']),
+        subject: getImportCell(normalized, ['subject_code']),
+        section: getImportCell(normalized, ['section']),
+        room: getImportCell(normalized, ['room']),
+        day_of_week: getImportCell(normalized, ['day_of_week', 'day']).toLowerCase(),
+        start_time: getImportCell(normalized, ['start_time']),
+        end_time: getImportCell(normalized, ['end_time']),
       };
     })
   );
 
   const buildScheduleImportPayloadRows = (rows) => (
     (rows || []).map((row) => ({
-      room: String(row?.room || '').trim(),
+      first_name: String(row?.first_name || '').trim(),
+      last_name: String(row?.last_name || '').trim(),
+      teacher: String(row?.teacher || '').trim(),
       subject: String(row?.subject || '').trim(),
       section: String(row?.section || '').trim(),
-      teacher: String(row?.teacher || '').trim(),
-      teacher_name: String(row?.teacher_name || '').trim(),
+      room: String(row?.room || '').trim(),
       day_of_week: String(row?.day_of_week || '').trim().toLowerCase(),
       start_time: String(row?.start_time || '').trim(),
       end_time: String(row?.end_time || '').trim(),
@@ -1379,7 +1669,12 @@ function ClassScheduleIndex(){
 
   const runScheduleImportPreview = async (draftRows) => {
     const payloadRows = buildScheduleImportPayloadRows(draftRows);
-    const preview = await apiPost('class-schedules', { rows: payloadRows, preview: true });
+    const preview = await apiPost('class-schedules', {
+      rows: payloadRows,
+      semester_id: workingSemesterIdNumber,
+      preview: true,
+      spreadsheet_import: true
+    });
     const errs = Array.isArray(preview?.errors) ? preview.errors : [];
     setImportPreviewResult({
       inserted: Number(preview?.inserted || 0),
@@ -1408,8 +1703,9 @@ function ClassScheduleIndex(){
       if (issue.includes('section')) fields.add('section');
       if (issue.includes('teacher') || issue.includes('instructor')) {
         fields.add('teacher');
-        fields.add('teacher_name');
       }
+      if (issue.includes('first name')) fields.add('first_name');
+      if (issue.includes('last name')) fields.add('last_name');
       if (issue.includes('day_of_week') || issue.includes('day') || issue.includes('weekday')) fields.add('day_of_week');
       if (issue.includes('start_time') || issue.includes('start time')) fields.add('start_time');
       if (issue.includes('end_time') || issue.includes('end time')) fields.add('end_time');
@@ -1476,70 +1772,47 @@ function ClassScheduleIndex(){
     return fields;
   };
 
-  // Client-side import validation: check required fields, name format, and teacher existence
+  // Fast local feedback; the backend remains authoritative for scope and conflicts.
   const localImportErrors = useMemo(() => {
     const errors = {};
     importPreviewRows.forEach((row, idx) => {
-      const rowNumber = row._row || (idx + 1);
+      const rowNumber = row._row || (idx + 2);
       const rowErrors = [];
-
-      // TEACHER NAME IS ALWAYS REQUIRED.
-      // Even if a Gmail/email is provided, the full name must be filled in.
-      const hasTeacherName = (row.teacher_name || '').trim() !== '';
-      const hasTeacherEmail = (row.teacher || '').trim() !== '';
-
-      // Teacher name is mandatory — no exceptions
-      if (!hasTeacherName) {
-        rowErrors.push('Teacher Name is required. Enter the full name (first and last name).');
-      }
-
-      // Validate teacher name if provided
-      if (hasTeacherName) {
-        const teacherName = (row.teacher_name || '').trim();
-        const nameParts = teacherName.split(/\s+/);
-        
-        // Must have at least first + last name (minimum 2 parts)
-        if (nameParts.length < 2) {
-          rowErrors.push('Teacher name must include both first and last name (e.g. "Jessie James Parajes")');
-        }
-
-        // Check if teacher exists in database by matching first_name + last_name (case-insensitive)
-        // Normalize: lowercase, collapse multiple spaces, trim
-        const nameLower = teacherName.toLowerCase().replace(/\s+/g, ' ').trim();
-        const foundTeacher = teachers.some(t => {
-          const dbName = ((t.first_name || '') + ' ' + (t.last_name || '')).toLowerCase().replace(/\s+/g, ' ').trim();
-          return dbName === nameLower;
-        });
-
-        if (!foundTeacher) {
-          rowErrors.push('Teacher name does not match any registered instructor. Check spelling and ensure first + last name format (e.g. "Jessie James Parajes")');
+      const firstName = String(row.first_name || '').trim();
+      const lastName = String(row.last_name || '').trim();
+      const normalizeTeacherName = (value) => String(value || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+      if (!firstName) rowErrors.push('First Name is required.');
+      if (!lastName) rowErrors.push('Last Name is required.');
+      if (!String(row.teacher || '').trim()) {
+        rowErrors.push('Teacher Email is required.');
+      } else {
+        const teacherEmail = String(row.teacher).trim().toLowerCase();
+        const matchedTeacher = availableActiveTeachers.find((teacher) => String(teacher.email || '').trim().toLowerCase() === teacherEmail);
+        if (!matchedTeacher) {
+          rowErrors.push('Teacher Email does not match an active instructor in your allowed scope.');
+        } else {
+          if (firstName && normalizeTeacherName(firstName) !== normalizeTeacherName(matchedTeacher.first_name)) {
+            rowErrors.push('First Name does not match the account for this Teacher Email.');
+          }
+          if (lastName && normalizeTeacherName(lastName) !== normalizeTeacherName(matchedTeacher.last_name)) {
+            rowErrors.push('Last Name does not match the account for this Teacher Email.');
+          }
         }
       }
-
-      // Email validation is secondary/helper — it does NOT replace the need for a name
-      if (hasTeacherEmail) {
-        const teacherEmail = (row.teacher || '').trim();
-        const emailLower = teacherEmail.toLowerCase().trim();
-        const foundByEmail = teachers.some(t => 
-          (t.email || '').toLowerCase().trim() === emailLower
-        );
-        if (!foundByEmail && !hasTeacherName) {
-          rowErrors.push('Teacher email does not match any registered instructor');
-        }
-        if (!foundByEmail && hasTeacherName) {
-          rowErrors.push('Warning: Teacher email not found in system. The system will use the name for lookup instead.');
-        }
-      }
-
-      // If only email was provided but no name, we already flagged the missing name above
-      // so no additional block needed here — the email can serve as supplementary lookup
+      if (!String(row.subject || '').trim()) rowErrors.push('Subject Code is required.');
+      if (!String(row.section || '').trim()) rowErrors.push('Section is required.');
+      if (!String(row.room || '').trim()) rowErrors.push('Room is required.');
+      if (!String(row.day_of_week || '').trim()) rowErrors.push('Day is required.');
+      else if (!DAY_OPTIONS.includes(String(row.day_of_week).trim().toLowerCase())) rowErrors.push('Day must be Monday through Saturday. Sunday is not allowed.');
+      if (!String(row.start_time || '').trim()) rowErrors.push('Start Time is required.');
+      if (!String(row.end_time || '').trim()) rowErrors.push('End Time is required.');
 
       if (rowErrors.length > 0) {
         errors[rowNumber] = (errors[rowNumber] || []).concat(rowErrors);
       }
     });
     return errors;
-  }, [importPreviewRows, teachers]);
+  }, [importPreviewRows, availableActiveTeachers]);
 
   const previewErrorsByRow = useMemo(() => {
     const result = {};
@@ -1571,8 +1844,8 @@ function ClassScheduleIndex(){
       });
       return;
     }
-    if (!activeSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'Cannot validate because there is no active semester for today.' });
+    if (!workingSemesterIdNumber) {
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before validating.' });
       return;
     }
     setSubmittingReviewedImport(true);
@@ -1580,14 +1853,14 @@ function ClassScheduleIndex(){
       await runScheduleImportPreview(importPreviewRows);
     } catch (err) {
       console.error(err);
-      swalFire({ icon:'error', title:'Validation Failed', text: err.body?.error || err.message || 'Failed to validate reviewed rows' });
+      swalFire({ icon:'error', title:'Validation Failed', text: err.body?.message || err.body?.error || err.message || 'Failed to validate reviewed rows' });
     } finally {
       setSubmittingReviewedImport(false);
     }
   };
 
   useEffect(() => {
-    if (!showImportReviewModal || !activeSemesterId || !importPreviewRows.length) return;
+    if (!showImportReviewModal || !workingSemesterIdNumber || !importPreviewRows.length) return;
     if (submittingReviewedImport) return;
 
     const timer = setTimeout(async () => {
@@ -1596,7 +1869,12 @@ function ClassScheduleIndex(){
       setLivePreviewing(true);
       try {
         const payloadRows = buildScheduleImportPayloadRows(importPreviewRows);
-        const preview = await apiPost('class-schedules', { rows: payloadRows, preview: true });
+        const preview = await apiPost('class-schedules', {
+          rows: payloadRows,
+          semester_id: workingSemesterIdNumber,
+          preview: true,
+          spreadsheet_import: true
+        });
         if (requestId !== livePreviewRequestRef.current) return;
         setImportPreviewResult({
           inserted: Number(preview?.inserted || 0),
@@ -1615,7 +1893,7 @@ function ClassScheduleIndex(){
     }, 450);
 
     return () => clearTimeout(timer);
-  }, [showImportReviewModal, activeSemesterId, importPreviewRows, submittingReviewedImport]);
+  }, [showImportReviewModal, workingSemesterIdNumber, importPreviewRows, submittingReviewedImport]);
 
   const handleImportFile = async (e) => {
     const file = e.target.files && e.target.files[0];
@@ -1638,8 +1916,8 @@ function ClassScheduleIndex(){
       if (e.target) e.target.value = '';
       return;
     }
-    if (!activeSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'Cannot import because there is no active semester for today.' });
+    if (!workingSemesterIdNumber) {
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before importing.' });
       if (e.target) e.target.value = '';
       return;
     }
@@ -1663,7 +1941,7 @@ function ClassScheduleIndex(){
       setShowImportReviewModal(true);
     } catch (err) {
       console.error(err);
-      swalFire({ icon:'error', title:'Import Failed', text: err.body?.error || err.message || 'Failed to import spreadsheet' });
+      swalFire({ icon:'error', title:'Import Failed', text: err.body?.message || err.body?.error || err.message || 'Failed to import spreadsheet' });
     } finally {
       setImporting(false);
       if (e.target) e.target.value = '';
@@ -1694,8 +1972,8 @@ function ClassScheduleIndex(){
       swalFire({ icon:'error', title:'Unauthorized', text:'Your account has no assigned program. Please contact the administrator.' });
       return;
     }
-    if (!activeSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'Cannot import because there is no active semester for today.' });
+    if (!workingSemesterIdNumber) {
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before importing.' });
       return;
     }
     // Final safety check: block submit if there are any unresolved validation errors
@@ -1720,7 +1998,11 @@ function ClassScheduleIndex(){
       }
 
       const payloadRows = buildScheduleImportPayloadRows(importPreviewRows);
-      const result = await apiPost('class-schedules', { rows: payloadRows });
+      const result = await apiPost('class-schedules', {
+        rows: payloadRows,
+        semester_id: workingSemesterIdNumber,
+        spreadsheet_import: true
+      });
       setImportSummary({
         inserted: Number(result?.inserted || 0),
         skipped: Number(result?.skipped || 0),
@@ -1736,16 +2018,30 @@ function ClassScheduleIndex(){
           skipped: Number(result?.skipped || 0),
           total: payloadRows.length,
         });
-        swalFire({ icon:'warning', title:'Import Completed with Errors', text: 'Some rows failed due to duplicate or conflict checks. Fix highlighted rows and resubmit.' });
+        const firstImportIssue = errs[0]?.message ? ` First issue: ${errs[0].message}` : '';
+        swalFire({
+          icon: 'warning',
+          title: 'Import Rejected',
+          text: `No schedules were created.${firstImportIssue} Fix every highlighted row before resubmitting.`
+        });
       } else {
         closeImportReviewModal();
-        swalFire({ icon:'success', title:'Import Successful', text: `${result.inserted} schedules imported.`, timer: 1800, showConfirmButton: false });
+        const attendanceGenerated = Number(result?.attendance_sync?.generated_rows || 0);
+        swalFire({
+          icon:'success',
+          title:'Import Successful',
+          text: result?.planning_only
+            ? `${result.inserted} schedule(s) were saved for the upcoming semester. Attendance records are not generated until it becomes active.`
+            : `${result.inserted} schedule(s) and ${attendanceGenerated} attendance record(s) were created.`,
+          timer: 2200,
+          showConfirmButton: false
+        });
       }
-      const s = await apiGet('class-schedules');
-      setSchedules(Array.isArray(s)?s:[]);
+      setSchedulePage(1);
+      await Promise.all([loadSchedulePage({ page: 1 }), loadScheduleConflictIndex()]);
     } catch (err) {
       console.error(err);
-      swalFire({ icon:'error', title:'Import Submit Failed', text: err.body?.error || err.message || 'Failed to import reviewed rows' });
+      swalFire({ icon:'error', title:'Import Submit Failed', text: err.body?.message || err.body?.error || err.message || 'Failed to import reviewed rows' });
     } finally {
       setSubmittingReviewedImport(false);
     }
@@ -1778,6 +2074,10 @@ function ClassScheduleIndex(){
   // Batch modal helpers
   const openBatchModal = () => {
     if (!ensureBulkToolsAllowed(true)) return;
+    if (!workingSemesterIdNumber) {
+      swalFire('No Working Semester', 'Select a current or upcoming semester before opening Batch Add.', 'warning');
+      return;
+    }
     if (isProgramHead && !programHeadProgramId) {
       swalFire('Unauthorized', 'Your account has no assigned program. Please contact the administrator.', 'error');
       return;
@@ -1790,74 +2090,62 @@ function ClassScheduleIndex(){
       });
       return;
     }
-    const scopedDeptId = isProgramHead ? (programHeadDeptId || '') : (isDean ? (deanDeptId || '') : '');
+    const scopedDeptId = isProgramHead ? (programHeadDeptId || '') : (isDepartmentScopedRole ? (deanDeptId || '') : '');
     const scopedProgramId = isProgramHead ? (programHeadProgramId || '') : '';
 
-    // If headers are empty, set sensible defaults from loaded lists - do not overwrite if user already set filters
-    setHeaderDept(h => {
-      if (isProgramHead || isDean) return scopedDeptId || h || '';
-      return h || (activeDepartments[0]?.dept_id ?? '');
-    });
-
-    // Choose a default program within the chosen/default department without relying on filteredPrograms
-    setHeaderProgram(h => {
-      if (isProgramHead) return scopedProgramId || h || '';
-      if (isDean) {
-        if (h) {
-          const valid = activePrograms.some(pp => String(pp.program_id) === String(h) && String(pp.dept_id) === String(scopedDeptId || ''));
-          if (valid) return h;
-        }
-        const p = activePrograms.find(pp => String(pp.dept_id) === String(scopedDeptId || ''));
-        if (p) return p.program_id;
-      }
-      if (h) return h;
-      const depId = headerDept || (activeDepartments[0]?.dept_id ?? null);
-      if (depId) {
-        const p = activePrograms.find(pp => String(pp.dept_id) === String(depId));
-        if (p) return p.program_id;
-      }
-      return activePrograms[0]?.program_id ?? '';
-    });
-
-    setHeaderBuilding(h => h || (activeBuildings[0]?.building_id ?? ''));
-
-    // Choose default floor within the chosen/default building without relying on filteredFloors
-    setHeaderFloor(h => {
-      if (h) return h;
-      const bId = activeBuildings[0]?.building_id ?? null;
-      if (bId) {
-        const f = activeFloors.find(ff => String(ff.building_id) === String(bId));
-        if (f) return f.floor_id;
-      }
-      return activeFloors[0]?.floor_id ?? '';
-    });
-
-    // Default room based on chosen/default floor/building (avoid using filteredRooms before init)
-    const defaultFloorId = activeFloors.find(ff => String(ff.building_id) === String(activeBuildings[0]?.building_id))?.floor_id || activeFloors[0]?.floor_id;
-    const defaultRoom = activeRooms.find(rr => String(rr.floor_id) === String(defaultFloorId)) || activeRooms[0];
+    // Start at the broadest scope allowed for the signed-in role.
+    // Admin: all four filters. Department Admin: fixed department, all others.
+    // Program Head: fixed department/program, all buildings and floors.
+    setHeaderDept((isProgramHead || isDepartmentScopedRole) ? String(scopedDeptId || '') : '');
+    setHeaderProgram(isProgramHead ? String(scopedProgramId || '') : '');
+    setHeaderBuilding('');
+    setHeaderFloor('');
 
     setBatchForm(prev => ({
       ...prev,
-      room_id: prev.room_id || (defaultRoom?.room_id ?? ''),
-      subject_id: prev.subject_id || '',
-      section_id: prev.section_id || '',
-      user_id: prev.user_id || '',
+      room_id: '',
+      subject_id: '',
+      section_id: '',
+      user_id: '',
       day_of_week: prev.day_of_week || 'monday',
       start_time: prev.start_time || '',
       end_time: prev.end_time || ''
     }));
     setEditingBatchIndex(null);
+    setBatchValidationAttempted(false);
     setBatchPage(1);
     setShowBatchModal(true);
   };
-  const closeBatchModal = () => { setShowBatchModal(false); setEditingBatchIndex(null); setBatchPage(1); };
+  const closeBatchModal = () => { setShowBatchModal(false); setEditingBatchIndex(null); setBatchValidationAttempted(false); setBatchPage(1); };
 
   const handleBatchChange = (e) => {
     const { name, value } = e.target;
     setBatchForm(f => ({ ...f, [name]: value }));
   };
 
-  const getConflictMessage = (candidate, sourceRows, { isScheduleSource = false, skipBatchIndex = null } = {}) => {
+  const handleHeaderDeptChange = (e) => {
+    setHeaderDept(e.target.value);
+    setHeaderProgram('');
+    setBatchForm(prev => ({ ...prev, subject_id: '', section_id: '', user_id: '' }));
+  };
+
+  const handleHeaderProgramChange = (e) => {
+    setHeaderProgram(e.target.value);
+    setBatchForm(prev => ({ ...prev, subject_id: '', section_id: '', user_id: '' }));
+  };
+
+  const handleHeaderBuildingChange = (e) => {
+    setHeaderBuilding(e.target.value);
+    setHeaderFloor('');
+    setBatchForm(prev => ({ ...prev, room_id: '' }));
+  };
+
+  const handleHeaderFloorChange = (e) => {
+    setHeaderFloor(e.target.value);
+    setBatchForm(prev => ({ ...prev, room_id: '' }));
+  };
+
+  const getConflictDetails = (candidate, sourceRows, { isScheduleSource = false, skipBatchIndex = null } = {}) => {
     const cDay = String(candidate.day_of_week || '').toLowerCase();
     const cStart = toMinutes(candidate.start_time);
     const cEnd = toMinutes(candidate.end_time);
@@ -1879,31 +2167,56 @@ function ClassScheduleIndex(){
       const subjectId = Number(row.subject_id || 0);
       const sectionId = Number(row.section_id || 0);
       const teacherId = Number((row.teacher_id ?? row.user_id) || 0);
-      const rowSemesterId = Number(row.semester_id || activeSemesterId || 0);
-      if (Number(activeSemesterId) && rowSemesterId && rowSemesterId !== Number(activeSemesterId)) continue;
+      const rowSemesterId = Number(row.semester_id || workingSemesterIdNumber || 0);
+      if (Number(workingSemesterIdNumber) && rowSemesterId && rowSemesterId !== Number(workingSemesterIdNumber)) continue;
 
       const isExact = roomId === Number(candidate.room_id)
         && subjectId === Number(candidate.subject_id)
         && sectionId === Number(candidate.section_id)
         && teacherId === Number(candidate.user_id)
-        && rowSemesterId === Number(activeSemesterId || rowSemesterId)
+        && rowSemesterId === Number(workingSemesterIdNumber || rowSemesterId)
         && String(row.start_time).slice(0,5) === String(candidate.start_time).slice(0,5)
         && String(row.end_time).slice(0,5) === String(candidate.end_time).slice(0,5);
       const sameSectionSameSubject = sectionId === Number(candidate.section_id)
         && subjectId === Number(candidate.subject_id);
 
-      if (isExact) return 'Duplicate schedule already exists.';
+      const conflictBase = {
+        source: isScheduleSource ? 'Working semester' : 'Current batch',
+        row,
+        teacher: row.teacher_name || `${row.first_name || ''} ${row.last_name || ''}`.trim()
+          || (() => {
+              const teacher = teachers.find((item) => Number(item.user_id) === teacherId);
+              return teacher ? `${teacher.first_name || ''} ${teacher.last_name || ''}`.trim() : `User ${teacherId}`;
+            })(),
+        subject: row.subject_code
+          ? `${row.subject_code}${row.subject_name ? ` — ${row.subject_name}` : ''}`
+          : (() => {
+              const subject = subjects.find((item) => Number(item.subject_id) === subjectId);
+              return subject ? `${subject.subject_code || ''}${subject.subject_name ? ` — ${subject.subject_name}` : ''}` : `Subject ${subjectId}`;
+            })(),
+        section: row.section_name || sections.find((item) => Number(item.section_id) === sectionId)?.section_name || `Section ${sectionId}`,
+        room: row.room_name || rooms.find((item) => Number(item.room_id) === roomId)?.room_name || `Room ${roomId}`,
+        day: day ? day.charAt(0).toUpperCase() + day.slice(1) : '',
+        time: `${formatToAmPm(String(row.start_time || '').slice(0,5))} – ${formatToAmPm(String(row.end_time || '').slice(0,5))}`,
+      };
+
+      if (isExact) return { ...conflictBase, type: 'duplicate', label: 'Duplicate', fields: ['subject_id', 'section_id'], message: 'Duplicate schedule already exists.' };
       if (sameSectionSameSubject) {
-        return 'Duplicate not allowed: this section already has this subject on the selected day.';
+        return { ...conflictBase, type: 'duplicate_subject', label: 'Duplicate', fields: ['subject_id', 'section_id'], message: 'This section already has this subject on the selected day.' };
       }
       if (!overlap(cStart, cEnd, start, end)) continue;
+      const sameTeacher = teacherId === Number(candidate.user_id ?? candidate.teacher_id);
       const sameSubject = subjectId === Number(candidate.subject_id);
       const exactParallelTime = sameTimeRange(row.start_time, row.end_time, candidate.start_time, candidate.end_time);
-      if (sameSubject && !exactParallelTime) return parallelSubjectTimeMessage;
-      if (roomId === Number(candidate.room_id)) return 'Room conflict: room already has a class during this time.';
+      if (roomId === Number(candidate.room_id)) return { ...conflictBase, type: 'room', label: 'Room conflict', fields: ['room_id'], message: 'Room already has a class during this time.' };
+      if (sectionId === Number(candidate.section_id)) return { ...conflictBase, type: 'section', label: 'Section conflict', fields: ['section_id'], message: 'Section already has another class during this time.' };
+      if (sameTeacher && !sameSubject) return { ...conflictBase, type: 'teacher', label: 'Teacher conflict', fields: ['user_id'], message: 'Teacher is already assigned to a different subject during this time.' };
+      if (sameTeacher && sameSubject && !exactParallelTime) return { ...conflictBase, type: 'parallel_time', label: 'Parallel time', fields: ['start_time', 'end_time'], message: parallelSubjectTimeMessage };
     }
     return null;
   };
+
+  const getConflictMessage = (candidate, sourceRows, options = {}) => getConflictDetails(candidate, sourceRows, options)?.message || null;
 
   const getInactiveDependencyIssues = useCallback((candidate) => {
     const issues = new Set();
@@ -1982,7 +2295,7 @@ function ClassScheduleIndex(){
       }
     }
 
-    if (isDean) {
+    if (isDepartmentScopedRole) {
       const scopedDeptId = String(deanDeptId || '');
       if (!scopedDeptId) {
         issues.push('Your account has no assigned department.');
@@ -2003,10 +2316,19 @@ function ClassScheduleIndex(){
     }
 
     return issues;
-  }, [isProgramHead, programHeadProgramId, isDean, deanDeptId, programDeptIdByProgramId, subjects, sections, teachers, resolveTeacherProgramId]);
+  }, [isProgramHead, programHeadProgramId, isDepartmentScopedRole, deanDeptId, programDeptIdByProgramId, subjects, sections, teachers, resolveTeacherProgramId]);
 
   const handleBatchAdd = () => {
     if (!ensureBulkToolsAllowed(true)) return;
+    if (!effectiveHeaderDept || !effectiveHeaderProgram) {
+      swalFire({
+        icon: 'warning',
+        title: 'Program Scope Required',
+        text: 'Select a Department and Program before adding a batch row.'
+      });
+      return;
+    }
+    setBatchValidationAttempted(true);
     // validate minimal fields
     const r = Number(batchForm.room_id) || null;
     const subj = Number(batchForm.subject_id) || null;
@@ -2019,12 +2341,16 @@ function ClassScheduleIndex(){
       swalFire({ icon:'warning', title:'Batch Add', text:'room, subject, section, teacher, day, start_time and end_time are required.' });
       return;
     }
-    if (st >= et) { swalFire({ icon:'warning', title:'Validation', text:'Start time must be before end time.' }); return; }
-    if (!activeSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'Cannot add row because there is no active semester for today.' });
+    if (!DAY_OPTIONS.includes(day)) {
+      swalFire({ icon:'warning', title:'Sunday Not Allowed', text:'Batch schedules can only use Monday through Saturday.' });
       return;
     }
-    const row = { room_id: r, subject_id: subj, section_id: sec, user_id: usr, day_of_week: day, start_time: st, end_time: et };
+    if (st >= et) { swalFire({ icon:'warning', title:'Validation', text:'Start time must be before end time.' }); return; }
+    if (!workingSemesterIdNumber) {
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before adding a batch row.' });
+      return;
+    }
+    const row = { room_id: r, subject_id: subj, section_id: sec, user_id: usr, semester_id: workingSemesterIdNumber, day_of_week: day, start_time: st, end_time: et };
     const inactiveIssues = getInactiveDependencyIssues(row);
     if (inactiveIssues.length > 0) {
       swalFire({
@@ -2049,7 +2375,7 @@ function ClassScheduleIndex(){
       swalFire({ icon:'error', title:'Batch Validation', text: localConflict });
       return;
     }
-    const scheduleConflict = getConflictMessage(row, schedules, { isScheduleSource: true });
+    const scheduleConflict = getConflictMessage(row, scheduleValidationRows, { isScheduleSource: true });
     if (scheduleConflict) {
       swalFire({ icon:'error', title:'Batch Validation', text: scheduleConflict });
       return;
@@ -2066,6 +2392,7 @@ function ClassScheduleIndex(){
       return next;
     });
     setEditingBatchIndex(null);
+    setBatchValidationAttempted(false);
     setBatchForm(prev => ({ ...prev, start_time: prev.isParallel ? prev.start_time : '', end_time: prev.isParallel ? prev.end_time : '' }));
   };
 
@@ -2081,7 +2408,16 @@ function ClassScheduleIndex(){
   const handleBatchEdit = (idx) => {
     const row = batchRows[idx];
     if (!row) return;
+    const rowSubject = subjects.find(subject => String(subject.subject_id) === String(row.subject_id || ''));
+    const rowSection = sections.find(section => String(section.section_id) === String(row.section_id || ''));
+    const rowProgramId = String(rowSubject?.program_id || rowSection?.program_id || '');
+    const rowDeptId = String(programDeptIdByProgramId.get(rowProgramId) || '');
+    if (!isProgramHead) {
+      if (!isDepartmentScopedRole && rowDeptId) setHeaderDept(rowDeptId);
+      if (rowProgramId) setHeaderProgram(rowProgramId);
+    }
     setBatchForm({
+      isParallel: Boolean(row.isParallel),
       room_id: String(row.room_id || ''),
       subject_id: String(row.subject_id || ''),
       section_id: String(row.section_id || ''),
@@ -2091,10 +2427,12 @@ function ClassScheduleIndex(){
       end_time: String(row.end_time || '').slice(0,5)
     });
     setEditingBatchIndex(idx);
+    setBatchValidationAttempted(false);
     setBatchPage(Math.max(1, Math.floor(Number(idx) / BATCH_PAGE_SIZE) + 1));
   };
   const handleBatchCancelEdit = () => {
     setEditingBatchIndex(null);
+    setBatchValidationAttempted(false);
     setBatchForm(prev => ({ ...prev, start_time: '', end_time: '' }));
   };
 
@@ -2109,8 +2447,8 @@ function ClassScheduleIndex(){
       });
       return;
     }
-    if (!activeSemesterId) {
-      swalFire({ icon:'warning', title:'No Active Semester', text:'Cannot submit batch because there is no active semester for today.' });
+    if (!workingSemesterIdNumber) {
+      swalFire({ icon:'warning', title:'No Working Semester', text:'Select a current or upcoming semester before submitting the batch.' });
       return;
     }
     for (let i = 0; i < batchRows.length; i++) {
@@ -2124,21 +2462,32 @@ function ClassScheduleIndex(){
         return;
       }
     }
+    const confirmation = await swalFire({ title:'Submit Batch?', text:`Create ${batchRows.length} reviewed schedule row${batchRows.length === 1 ? '' : 's'} for the selected semester?`, icon:'question', showCancelButton:true, confirmButtonText:'Submit Batch', confirmButtonColor:'#198754' });
+    if (confirmation && confirmation.isConfirmed === false) return;
     setImporting(true);
     try {
-      const res = await apiPost('class-schedules', { rows: batchRows });
+      const res = await apiPost('class-schedules', { rows: batchRows, semester_id: workingSemesterIdNumber });
+      const batchErrors = Array.isArray(res?.errors) ? res.errors : [];
       setImportSummary({ inserted: Number(res?.inserted||0), skipped: Number(res?.skipped||0), total: batchRows.length });
-      setImportErrors(Array.isArray(res?.errors)?res.errors:[]);
-      swalFire({ icon: (res?.errors && res.errors.length) ? 'warning' : 'success', title: 'Batch Import', text: `Inserted ${res?.inserted || 0}, skipped ${res?.skipped || 0}` });
-      const s = await apiGet('class-schedules');
-      setSchedules(Array.isArray(s)?s:[]);
+      setImportErrors(batchErrors);
+      const firstBatchError = batchErrors[0]?.message ? ` First issue: ${batchErrors[0].message}` : '';
+      swalFire({
+        icon: batchErrors.length ? 'warning' : 'success',
+        title: batchErrors.length ? 'Batch Add Completed with Issues' : 'Batch Schedules Added',
+        text: res?.planning_only && !batchErrors.length
+          ? `Saved ${res?.inserted || 0} schedule(s) for the upcoming semester. Attendance records are not generated yet.`
+          : `Added ${res?.inserted || 0}; skipped ${res?.skipped || 0}.${firstBatchError}`
+      });
+      setSchedulePage(1);
+      await Promise.all([loadSchedulePage({ page: 1 }), loadScheduleConflictIndex()]);
       setBatchRows([]);
       setShowBatchModal(false);
       setEditingBatchIndex(null);
+      setBatchValidationAttempted(false);
       setBatchPage(1);
     } catch (err) {
       console.error(err);
-      swalFire({ icon:'error', title:'Batch Submit Failed', text: err.body?.error || err.message || 'Failed to submit batch' });
+      swalFire({ icon:'error', title:'Batch Submit Failed', text: err.body?.message || err.body?.error || err.message || 'Failed to submit batch' });
     } finally { setImporting(false); }
   };
 
@@ -2163,6 +2512,149 @@ function ClassScheduleIndex(){
     return map;
   }, [rooms]);
 
+  const batchFieldValidation = useMemo(() => {
+    const fieldNames = ['subject_id', 'section_id', 'user_id', 'room_id', 'day_of_week', 'start_time', 'end_time'];
+    const errors = Object.fromEntries(fieldNames.map((field) => [field, []]));
+    const candidate = {
+      subject_id: Number(batchForm.subject_id) || null,
+      section_id: Number(batchForm.section_id) || null,
+      user_id: Number(batchForm.user_id) || null,
+      room_id: Number(batchForm.room_id) || null,
+      day_of_week: String(batchForm.day_of_week || '').toLowerCase(),
+      start_time: String(batchForm.start_time || '').slice(0, 5),
+      end_time: String(batchForm.end_time || '').slice(0, 5),
+    };
+    const requiredLabels = {
+      subject_id: 'Subject', section_id: 'Section', user_id: 'Teacher', room_id: 'Room',
+      day_of_week: 'Day', start_time: 'Start Time', end_time: 'End Time'
+    };
+    const hasAllRequiredValues = fieldNames.every((field) => Boolean(candidate[field]));
+
+    if (candidate.start_time && candidate.end_time && candidate.start_time >= candidate.end_time) {
+      const timeError = { label: 'Invalid time', message: 'End Time must be later than Start Time.' };
+      errors.start_time.push(timeError);
+      errors.end_time.push(timeError);
+    }
+
+    const selectedDependencyIssues = getInactiveDependencyIssues(candidate);
+    const dependencyFieldMap = { Subject: 'subject_id', Section: 'section_id', Teacher: 'user_id', Room: 'room_id' };
+    selectedDependencyIssues.forEach((issue) => {
+      const field = dependencyFieldMap[issue];
+      if (field) errors[field].push({ label: 'Inactive', message: `${issue} or one of its linked records is inactive/archived.` });
+    });
+
+    if (candidate.subject_id && candidate.section_id && candidate.user_id) {
+      const scopeIssues = getProgramScopeIssues(candidate);
+      scopeIssues.forEach((message) => {
+        const issue = { label: 'Scope mismatch', message };
+        errors.subject_id.push(issue);
+        errors.section_id.push(issue);
+        errors.user_id.push(issue);
+      });
+    }
+
+    let conflict = null;
+    const hasCompleteConflictInput = candidate.subject_id && candidate.section_id && candidate.user_id
+      && candidate.room_id && candidate.day_of_week && candidate.start_time && candidate.end_time
+      && candidate.start_time < candidate.end_time;
+    if (hasCompleteConflictInput) {
+      conflict = getConflictDetails(candidate, batchRows, { skipBatchIndex: editingBatchIndex })
+        || getConflictDetails(candidate, scheduleValidationRows, { isScheduleSource: true });
+      if (conflict) {
+        conflict.fields.forEach((field) => {
+          if (errors[field]) errors[field].push({ label: conflict.label, message: conflict.message, conflict });
+        });
+      }
+    }
+
+    return Object.fromEntries(fieldNames.map((field) => {
+      const value = candidate[field];
+      const firstError = errors[field][0] || null;
+      if (!value) {
+        return [field, {
+          status: 'required',
+          label: 'Required',
+          message: `${requiredLabels[field]} is required.`
+        }];
+      }
+      if (!hasAllRequiredValues) {
+        return [field, { status: 'neutral', label: '', message: '' }];
+      }
+      return [field, firstError
+        ? { status: 'invalid', ...firstError }
+        : { status: 'valid', label: 'Valid', message: '' }];
+    }));
+  }, [batchForm, batchRows, scheduleValidationRows, editingBatchIndex, batchValidationAttempted, getInactiveDependencyIssues, getProgramScopeIssues]);
+
+  const batchRowValidationStatus = useMemo(() => {
+    const states = Object.values(batchFieldValidation);
+    const firstInvalid = states.find((state) => state.status === 'invalid' && state.conflict)
+      || states.find((state) => state.status === 'invalid');
+    if (firstInvalid) return {
+      status: 'invalid',
+      label: firstInvalid.label || 'Needs attention',
+      message: firstInvalid.message || '',
+      conflict: firstInvalid.conflict || null
+    };
+    if (states.some((state) => state.status === 'required')) {
+      return { status: 'required', label: 'Complete required fields' };
+    }
+    if (states.length > 0 && states.every((state) => state.status === 'valid')) {
+      return { status: 'valid', label: 'Ready to add' };
+    }
+    return { status: 'neutral', label: 'Complete the row' };
+  }, [batchFieldValidation]);
+
+  const batchFieldClass = (field) => {
+    const status = batchFieldValidation[field]?.status || 'neutral';
+    const stateClass = status === 'invalid'
+      ? 'border-rose-400 bg-rose-50 text-rose-900 focus:border-rose-500 focus:ring-2 focus:ring-rose-100'
+      : status === 'valid'
+        ? 'border-emerald-400 bg-emerald-50/60 text-slate-800 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100'
+        : status === 'required'
+          ? 'border-amber-400 bg-amber-50 text-amber-900 focus:border-amber-500 focus:ring-2 focus:ring-amber-100'
+          : 'border-gray-200 bg-white text-slate-800 focus:border-blue-400 focus:ring-2 focus:ring-blue-100';
+    return `block w-full rounded border px-3 py-2 outline-none transition ${stateClass} disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-500`;
+  };
+
+  const renderBatchValidatedField = (field, label, renderControl) => {
+    const validation = batchFieldValidation[field] || { status: 'neutral', label: '', message: '' };
+    const invalid = validation.status === 'invalid';
+    const valid = validation.status === 'valid';
+    const required = validation.status === 'required';
+    const conflict = validation.conflict;
+    return (
+      <div className="group relative min-w-0">
+        <label className="mb-1 flex min-h-5 items-center justify-between gap-2 text-sm font-medium text-gray-700">
+          <span>{label}</span>
+          {valid && <span className="text-[10px] font-semibold text-emerald-700">✓ Valid</span>}
+          {invalid && <span className="truncate text-[10px] font-semibold text-rose-700">⚠ {validation.label}</span>}
+          {required && <span className="text-[10px] font-semibold text-amber-700">Required</span>}
+        </label>
+        {renderControl(batchFieldClass(field))}
+        <div className={`mt-1 min-h-4 truncate text-[10px] ${invalid ? 'text-rose-700' : required ? 'text-amber-700' : 'text-transparent'}`}>
+          {(invalid || required) ? validation.message : '.'}
+        </div>
+        {(invalid || required) && (
+          <div className={`pointer-events-none absolute left-0 top-full z-[100] mt-1 hidden w-80 rounded-xl border bg-white p-3 text-xs text-slate-700 shadow-xl group-hover:block group-focus-within:block ${required ? 'border-amber-200' : 'border-rose-200'}`} role="tooltip">
+            <div className={`font-semibold ${required ? 'text-amber-700' : 'text-rose-700'}`}>{validation.label}</div>
+            <div className="mt-1 text-slate-600">{validation.message}</div>
+            {conflict && (
+              <dl className="mt-2 grid grid-cols-[72px_1fr] gap-x-2 gap-y-1">
+                <dt className="text-slate-400">Source</dt><dd>{conflict.source}</dd>
+                <dt className="text-slate-400">Teacher</dt><dd>{conflict.teacher}</dd>
+                <dt className="text-slate-400">Subject</dt><dd>{conflict.subject}</dd>
+                <dt className="text-slate-400">Section</dt><dd>{conflict.section}</dd>
+                <dt className="text-slate-400">Room</dt><dd>{conflict.room}</dd>
+                <dt className="text-slate-400">Schedule</dt><dd>{conflict.day}, {conflict.time}</dd>
+              </dl>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const pagedBatchRows = useMemo(() => {
     const start = (batchPage - 1) * BATCH_PAGE_SIZE;
     return batchRows.slice(start, start + BATCH_PAGE_SIZE);
@@ -2186,21 +2678,30 @@ function ClassScheduleIndex(){
       saturday: 'Sat',
       sunday: 'Sun'
     };
-    const counts = DAY_OPTIONS.map(day => ({ key: day, label: labels[day] || day.slice(0, 3), count: 0 }));
+    const counts = ALL_DAY_OPTIONS.map(day => ({ key: day, label: labels[day] || day.slice(0, 3), count: 0 }));
     const byDay = new Map(counts.map(entry => [entry.key, entry]));
-    displayedAndFiltered.forEach((row) => {
-      const key = String(row?.day_of_week || '').toLowerCase();
-      if (!byDay.has(key)) return;
-      byDay.get(key).count += 1;
-    });
+    const serverDays = scheduleSummary?.days || {};
+    const hasServerDays = Object.keys(serverDays).length > 0;
+    if (hasServerDays) {
+      counts.forEach((entry) => { entry.count = Number(serverDays[entry.key] || 0); });
+    } else {
+      displayedAndFiltered.forEach((row) => {
+        const key = String(row?.day_of_week || '').toLowerCase();
+        if (!byDay.has(key)) return;
+        byDay.get(key).count += 1;
+      });
+    }
     const peak = counts.reduce((max, entry) => Math.max(max, entry.count), 0);
     return counts.map(entry => ({
       ...entry,
       width: peak > 0 ? Math.max(8, Math.round((entry.count / peak) * 100)) : 0
     }));
-  }, [DAY_OPTIONS, displayedAndFiltered]);
+  }, [displayedAndFiltered, scheduleSummary]);
 
   const topRooms = useMemo(() => {
+    if (Array.isArray(scheduleSummary?.top_rooms)) {
+      return scheduleSummary.top_rooms.map((room) => ({ label: room.label || 'Unassigned Room', count: Number(room.count || 0) }));
+    }
     const byRoom = new Map();
     displayedAndFiltered.forEach((row) => {
       const roomKey = String(row?.room_id || row?.room_name || '');
@@ -2209,19 +2710,25 @@ function ClassScheduleIndex(){
       byRoom.set(roomKey, { label, count: (byRoom.get(roomKey)?.count || 0) + 1 });
     });
     return Array.from(byRoom.values()).sort((a, b) => b.count - a.count).slice(0, 5);
-  }, [displayedAndFiltered]);
+  }, [displayedAndFiltered, scheduleSummary]);
 
   const topPrograms = useMemo(() => {
+    if (Array.isArray(scheduleSummary?.top_programs)) {
+      return scheduleSummary.top_programs.map((program) => ({
+        label: formatProgramLabel({ sub_name: program.program_sub_name, program_name: program.program_name }, 'Unassigned Program'),
+        count: Number(program.count || 0),
+      }));
+    }
     const byProgram = new Map();
     displayedAndFiltered.forEach((row) => {
-      const label = row?.program_name || 'Unassigned Program';
+      const label = formatProgramLabel({ sub_name: row?.program_sub_name, program_name: row?.program_name }, 'Unassigned Program');
       byProgram.set(label, (byProgram.get(label) || 0) + 1);
     });
     return Array.from(byProgram.entries())
       .map(([label, count]) => ({ label, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
-  }, [displayedAndFiltered]);
+  }, [displayedAndFiltered, scheduleSummary]);
 
   const statsCards = useMemo(() => {
     const uniqueTeachers = new Set();
@@ -2237,26 +2744,26 @@ function ClassScheduleIndex(){
     return [
       {
         title: 'Schedules In View',
-        value: displayData.length,
-        note: `${visibleSchedules.length} total records in your scope`
+        value: Number(scheduleSummary?.total ?? schedulePagination.total ?? displayData.length),
+        note: `${Number(schedulePagination.total || 0)} total records in your scope`
       },
       {
         title: 'Teachers Assigned',
-        value: uniqueTeachers.size,
+        value: Number(scheduleSummary?.teachers ?? uniqueTeachers.size),
         note: 'Distinct teachers in current filter'
       },
       {
         title: 'Rooms Utilized',
-        value: uniqueRooms.size,
+        value: Number(scheduleSummary?.rooms ?? uniqueRooms.size),
         note: 'Unique rooms currently displayed'
       },
       {
         title: 'Sections Covered',
-        value: uniqueSections.size,
+        value: Number(scheduleSummary?.sections ?? uniqueSections.size),
         note: 'Sections with scheduled classes'
       }
     ];
-  }, [displayData.length, displayedAndFiltered, visibleSchedules.length]);
+  }, [displayData.length, displayedAndFiltered, schedulePagination, scheduleSummary]);
 
   const topRoomPeak = useMemo(() => topRooms.reduce((max, room) => Math.max(max, room.count), 0), [topRooms]);
 
@@ -2274,25 +2781,57 @@ function ClassScheduleIndex(){
 
   const filterSelectClass = "w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-700 shadow-sm transition focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-100";
   const filterLabelClass = "block text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-1.5";
-  const quickActionButtonClass = "inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
+  const quickActionButtonClass = "inline-flex h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl px-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
 
   // Memoized parallel session detection for performance
+  const getParallelSessionKey = useCallback((s) => {
+    return parallelSessionKeyFor(s);
+  }, []);
+
   const parallelSessionMap = useMemo(() => {
     const map = new Map();
-    schedules.forEach(sch => {
-      const key = `${sch.user_id}|${sch.subject_id}|${sch.day_of_week}|${sch.start_time}|${sch.end_time}`;
+    [...scheduleValidationRows, ...historicalSchedules].forEach(sch => {
+      const key = getParallelSessionKey(sch);
       if (!map.has(key)) map.set(key, []);
       map.get(key).push(sch);
     });
     return map;
-  }, [schedules]);
+  }, [scheduleValidationRows, historicalSchedules, getParallelSessionKey]);
 
   const isParallelSession = useCallback((s) => {
-    const key = `${s.user_id}|${s.subject_id}|${s.day_of_week}|${s.start_time}|${s.end_time}`;
+    const key = getParallelSessionKey(s);
     const group = parallelSessionMap.get(key);
     if (!group || group.length < 2) return false;
-    return group.some(sch => Number(sch.room_id) !== Number(s.room_id));
-  }, [parallelSessionMap]);
+    return group.some(sch => (
+      Number(sch.schedule_id) !== Number(s.schedule_id)
+      && Number(sch.room_id) !== Number(s.room_id)
+      && Number(sch.section_id) !== Number(s.section_id)
+    ));
+  }, [parallelSessionMap, getParallelSessionKey]);
+
+  const parallelRowStyle = useCallback((s) => {
+    if (!hoveredParallelGroupKey || !isParallelSession(s) || getParallelSessionKey(s) !== hoveredParallelGroupKey) return undefined;
+    return {
+      backgroundColor: '#dbeafe',
+      boxShadow: 'inset 4px 0 0 #2563eb'
+    };
+  }, [hoveredParallelGroupKey, isParallelSession, getParallelSessionKey]);
+
+  const parallelRowClassName = useCallback((s) => (
+    hoveredParallelGroupKey
+    && isParallelSession(s)
+    && getParallelSessionKey(s) === hoveredParallelGroupKey
+      ? 'parallel-group-highlight'
+      : ''
+  ), [hoveredParallelGroupKey, isParallelSession, getParallelSessionKey]);
+
+  const handleParallelRowMouseEnter = useCallback((s) => {
+    setHoveredParallelGroupKey(isParallelSession(s) ? getParallelSessionKey(s) : '');
+  }, [isParallelSession, getParallelSessionKey]);
+
+  const handleParallelRowMouseLeave = useCallback(() => {
+    setHoveredParallelGroupKey('');
+  }, []);
 
   const columns=[
     { key:'display_index', label:'#', render: (s) => <span>{s.display_index}</span> },
@@ -2307,7 +2846,10 @@ function ClassScheduleIndex(){
       render: (s) => {
         const isParallel = isParallelSession(s);
         return isParallel ? (
-          <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
+          <span
+            className="inline-flex cursor-help items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800"
+            title="Hover anywhere on this row to highlight its parallel group"
+          >
             Parallel Session
           </span>
         ) : (
@@ -2333,22 +2875,65 @@ function ClassScheduleIndex(){
 
   return (
     <div className="p-6 class-schedule-page class-schedule-dashboard">
-      <div className="mb-6 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
-        <div className="grid gap-6 p-5 lg:grid-cols-[1.6fr_1fr] lg:p-7">
-          <div>
+      <div className="cs-overview-card mb-6 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+        <div className="cs-overview-layout grid gap-6 p-5 lg:grid-cols-[1.6fr_1fr] lg:p-7">
+          <div className="cs-overview-main">
             <h2 className="text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">Class Schedule Control Center</h2>
 
-            <div className={`mt-4 inline-flex rounded-xl border px-3 py-2 text-xs font-medium ${
-              activeSemesterId ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-800'
+            <div className={`cs-active-semester mt-4 max-w-2xl rounded-xl border p-3 ${
+              !workingSemesterIdNumber
+                ? 'border-rose-200 bg-rose-50 text-rose-800'
+                : isPlanningSemester
+                  ? 'border-amber-200 bg-amber-50 text-amber-900'
+                  : 'border-emerald-200 bg-emerald-50 text-emerald-800'
             }`}>
-              {activeSemesterId
-                ? `Active semester: ${activeSemesterLabel || 'Current term'}`
-                : 'No active semester found for today. Import and batch submit stay blocked.'}
+              <label htmlFor="working-semester" className="block text-[11px] font-semibold uppercase tracking-wider">Working Semester</label>
+              <select
+                id="working-semester"
+                value={workingSemesterId || (workingSemesterIdNumber ? String(workingSemesterIdNumber) : '')}
+                onChange={(event) => {
+                  setWorkingSemesterId(event.target.value);
+                  setSchedulePage(1);
+                  setSchedules([]);
+                  setScheduleConflictIndex([]);
+                  setImportSummary(null);
+                  setImportErrors([]);
+                }}
+                disabled={loading || importing || showModal || showBatchModal || showImportReviewModal}
+                className="mt-1 block w-full rounded-lg border border-current bg-white px-3 py-2 text-sm font-semibold text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {!workingSemesterOptions.length && <option value="">No current or upcoming semester</option>}
+                {workingSemesterOptions.map((semester) => {
+                  const current = activeSemesterId && Number(semester.semester_id) === Number(activeSemesterId);
+                  return (
+                    <option key={semester.semester_id} value={semester.semester_id}>
+                      {formatSemesterLabel(semester)} ({current ? 'Current' : 'Upcoming'})
+                    </option>
+                  );
+                })}
+              </select>
+              <div className="mt-2 text-xs font-medium">
+                {!workingSemesterIdNumber
+                  ? 'No schedulable semester is available. Past and archived semesters are read-only.'
+                  : isPlanningSemester
+                    ? `Planning only: attendance records will begin when this semester becomes active on ${workingSemester?.start_date || 'its start date'}.`
+                    : 'Current semester: schedule changes continue to synchronize attendance records.'}
+              </div>
             </div>
 
-            <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <button
+              type="button"
+              className="cs-mobile-disclosure mt-3"
+              aria-expanded={mobileInsightsOpen}
+              onClick={() => setMobileInsightsOpen(value => !value)}
+            >
+              <i className={`bi ${mobileInsightsOpen ? 'bi-chevron-up' : 'bi-bar-chart'}`} aria-hidden="true" />
+              {mobileInsightsOpen ? 'Hide schedule insights' : 'Show schedule insights'}
+            </button>
+
+            <div className="cs-stats-grid mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               {statsCards.map((card) => (
-                <div key={card.title} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div key={card.title} className="cs-stat-card rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{card.title}</div>
                   <div className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">{card.value}</div>
                   <div className="mt-1 text-xs text-slate-500">{card.note}</div>
@@ -2367,7 +2952,7 @@ function ClassScheduleIndex(){
             )}
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className={`cs-insights-panel rounded-2xl border border-slate-200 bg-white p-4${mobileInsightsOpen ? ' is-mobile-open' : ''}`}>
             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Static Weekly Distribution</div>
             <div className="mt-4 space-y-3">
               {dayDistribution.map((entry) => (
@@ -2388,7 +2973,7 @@ function ClassScheduleIndex(){
         </div>
       </div>
 
-      <div className="mb-5 grid gap-4 lg:grid-cols-2">
+      <div className={`cs-insights-grid mb-5 grid gap-4 lg:grid-cols-2${mobileInsightsOpen ? ' is-mobile-open' : ''}`}>
         <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Top Room Load</div>
           {topRooms.length === 0 ? (
@@ -2430,54 +3015,48 @@ function ClassScheduleIndex(){
         </div>
       </div>
 
-      <div className="mb-5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div className="cs-filter-card mb-5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="cs-filter-header mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Quick Filters</div>
             <div className="mt-1 text-xs text-slate-500">Refine schedules by schedule day, faculty, and location.</div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="cs-quick-actions flex flex-wrap items-center gap-2">
             {canManageSchedules && (
-              <>
               <button
                 type="button"
                 onClick={() => openModal(null)}
-                className={`${quickActionButtonClass} bg-emerald-600 text-white hover:bg-emerald-700`}
+                disabled={!workingSemesterIdNumber}
+                className={`${quickActionButtonClass} bg-emerald-600 text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-400`}
               >
                 Add Schedule
               </button>
-              <button
-                type="button"
-                onClick={openHistoricalModal}
-                className={`${quickActionButtonClass} border border-slate-300 bg-white text-slate-700 hover:bg-slate-100`}
-              >
-                View Historical Schedules
-              </button>
-              </>
             )}
-            <button
-              type="button"
-              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-600 transition hover:bg-slate-100"
-              onClick={() => {
-                setFilterDay('');
-                setFilterTeacher('');
-              setFilterRoom('');
-              setFilterCampus('');
-              setFilterBuilding('');
-              setFilterFloor('');
-              setFilterDept(isProgramHead ? String(roleScopedDeptId || '') : '');
-              setFilterProgram(isProgramHead ? String(programHeadProgramId || '') : '');
-              setFilterSubject('');
-              setFilterSection('');
-            }}
-            >
-              Clear Filters
-            </button>
             {canUseBulkScheduleTools && (
               <>
                 <button
                   type="button"
+                  onClick={openBatchModal}
+                  disabled={importing || hasSchedulingDependencyBlockers || !workingSemesterIdNumber}
+                  className={`${quickActionButtonClass} bg-slate-900 text-white hover:bg-slate-800`}
+                >
+                  Batch Add
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadScheduleImportTemplate}
+                  disabled={importing}
+                  className={`${quickActionButtonClass} border border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100`}
+                >
+                  Download Template
+                </button>
+                <button
+                  type="button"
                   onClick={() => {
+                    if (!workingSemesterIdNumber) {
+                      swalFire({ icon: 'warning', title: 'No Working Semester', text: 'Select a current or upcoming semester before importing.' });
+                      return;
+                    }
                     if (hasSchedulingDependencyBlockers) {
                       swalFire({
                         icon: 'warning',
@@ -2488,30 +3067,58 @@ function ClassScheduleIndex(){
                     }
                     if (fileInputRef.current) fileInputRef.current.click();
                   }}
-                  disabled={importing || hasSchedulingDependencyBlockers}
+                  disabled={importing || hasSchedulingDependencyBlockers || !workingSemesterIdNumber}
                   className={`${quickActionButtonClass} border border-slate-300 bg-white text-slate-700 hover:bg-slate-100`}
                 >
                   {importing ? 'Processing...' : 'Import Spreadsheet'}
                 </button>
-                <button
-                  type="button"
-                  onClick={openBatchModal}
-                  disabled={importing || hasSchedulingDependencyBlockers}
-                  className={`${quickActionButtonClass} bg-slate-900 text-white hover:bg-slate-800`}
-                >
-                  Batch Add
-                </button>
               </>
             )}
+            {canManageSchedules && (
+              <button
+                type="button"
+                onClick={openHistoricalModal}
+                className={`${quickActionButtonClass} border border-slate-300 bg-white text-slate-700 hover:bg-slate-100`}
+              >
+                View History
+              </button>
+            )}
+            <button
+              type="button"
+              className={`${quickActionButtonClass} border border-slate-300 bg-white text-slate-600 hover:bg-slate-100`}
+              onClick={() => {
+                setFilterDay('');
+                setFilterTeacher('');
+                setFilterRoom('');
+                setFilterCampus('');
+                setFilterBuilding('');
+                setFilterFloor('');
+                setFilterDept(isProgramHead ? String(roleScopedDeptId || '') : '');
+                setFilterProgram(isProgramHead ? String(programHeadProgramId || '') : '');
+                setFilterSubject('');
+                setFilterSection('');
+              }}
+            >
+              Clear Filters
+            </button>
+            <button
+              type="button"
+              className="cs-mobile-disclosure"
+              aria-expanded={mobileFiltersOpen}
+              onClick={() => setMobileFiltersOpen(value => !value)}
+            >
+              <i className={`bi ${mobileFiltersOpen ? 'bi-chevron-up' : 'bi-funnel'}`} aria-hidden="true" />
+              {mobileFiltersOpen ? 'Hide Filters' : 'Show Filters'}
+            </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-5">
+        <div className={`cs-filter-grid grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-5${mobileFiltersOpen ? ' is-mobile-open' : ''}`}>
           <div>
             <label className={filterLabelClass}>Day</label>
             <select className={filterSelectClass} value={filterDay} onChange={e=>setFilterDay(e.target.value)}>
               <option value="">All Days</option>
-              {DAY_OPTIONS.map(d => <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}
+              {ALL_DAY_OPTIONS.map(d => <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}
             </select>
           </div>
           <div>
@@ -2631,11 +3238,13 @@ function ClassScheduleIndex(){
             <div className="text-xs text-slate-500">Filtered and role-scoped records for daily operations.</div>
           </div>
           <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-600">
-            {displayData.length} record(s)
+            {dataLoading ? 'Loading…' : `${Number(schedulePagination.total || 0)} record(s)`}
           </div>
         </div>
         <div className="p-3 sm:p-4">
-          {displayData.length === 0 ? (
+          {dataLoading ? (
+            <LoadingState label="Loading schedules..." />
+          ) : displayData.length === 0 ? (
             <div className="text-center py-14 border-2 border-dashed border-slate-200 rounded-2xl">
               <div className="text-slate-400 mb-2 text-lg font-medium">
                 🗓️ No schedules found
@@ -2645,36 +3254,135 @@ function ClassScheduleIndex(){
               </p>
             </div>
           ) : (
-            <Table columns={columns} data={displayData} pageSize={10} loading={false} horizontalScroll={true} wrapCells className="class-schedule-table responsive-table" />
+            <>
+              <div className="cs-desktop-schedule-table">
+                <Table
+                  columns={columns}
+                  data={displayData}
+                  pageSize={10}
+                  serverPagination
+                  totalItems={Number(schedulePagination.total || 0)}
+                  page={schedulePage}
+                  onPageChange={setSchedulePage}
+                  loading={false}
+                  horizontalScroll={true}
+                  wrapCells
+                  className="class-schedule-table responsive-table"
+                  rowClassName={parallelRowClassName}
+                  rowStyle={parallelRowStyle}
+                  onRowMouseEnter={handleParallelRowMouseEnter}
+                  onRowMouseLeave={handleParallelRowMouseLeave}
+                />
+              </div>
+
+              <div className="cs-mobile-schedule-list">
+                {mobileScheduleRows.map((schedule) => {
+                  const subjectLabel = `${schedule.subject_code || 'No subject code'}${schedule.subject_name ? ` - ${schedule.subject_name}` : ''}`;
+                  const dayLabel = schedule.day_of_week
+                    ? schedule.day_of_week.charAt(0).toUpperCase() + schedule.day_of_week.slice(1)
+                    : 'Day not set';
+                  const timeLabel = `${formatToAmPm(schedule.start_time?.slice(0,5) || '') || '--'} - ${formatToAmPm(schedule.end_time?.slice(0,5) || '') || '--'}`;
+                  const locationLabel = [schedule.campus_name, schedule.building_name, schedule.floor_name, schedule.room_name].filter(Boolean).join(' • ') || 'Location not set';
+                  return (
+                    <article key={schedule.id} className="cs-mobile-schedule-card">
+                      <header className="cs-mobile-schedule-head">
+                        <div className="min-w-0">
+                          <div className="cs-mobile-schedule-number">Schedule #{schedule.display_index}</div>
+                          <h3>{subjectLabel}</h3>
+                          <p>{schedule.section_name || 'No section assigned'}</p>
+                        </div>
+                        {isParallelSession(schedule) ? <span className="cs-mobile-parallel-badge">Parallel</span> : null}
+                      </header>
+
+                      <div className="cs-mobile-schedule-time">
+                        <span><i className="bi bi-calendar3" aria-hidden="true" /> {dayLabel}</span>
+                        <strong><i className="bi bi-clock" aria-hidden="true" /> {timeLabel}</strong>
+                      </div>
+
+                      <dl className="cs-mobile-schedule-details">
+                        <div><dt>Teacher</dt><dd>{schedule.teacher_name || (schedule.first_name ? `${schedule.first_name} ${schedule.last_name || ''}`.trim() : 'Not assigned')}</dd></div>
+                        <div><dt>Location</dt><dd>{locationLabel}</dd></div>
+                      </dl>
+
+                      <footer className="cs-mobile-schedule-actions">
+                        <button type="button" onClick={() => openViewModal(schedule)}>View details</button>
+                        {canEdit ? <button type="button" className="is-primary" onClick={() => openModal(schedule)}>Edit</button> : null}
+                      </footer>
+                    </article>
+                  );
+                })}
+
+                {mobileScheduleTotalPages > 1 ? (
+                  <nav className="cs-mobile-pagination" aria-label="Schedule pages">
+                    <button type="button" disabled={mobileSchedulePage <= 1} onClick={() => setMobileSchedulePage(page => Math.max(1, page - 1))}>Previous</button>
+                    <span>Page {mobileSchedulePage} of {mobileScheduleTotalPages}</span>
+                    <button type="button" disabled={mobileSchedulePage >= mobileScheduleTotalPages} onClick={() => setMobileSchedulePage(page => Math.min(mobileScheduleTotalPages, page + 1))}>Next</button>
+                  </nav>
+                ) : null}
+              </div>
+            </>
           )}
         </div>
       </div>
 
       <Modal show={showModal} title={editingSchedule ? "Edit Class Schedule" : "Add New Class Schedule"} onClose={closeModal} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">
+          <div className={`rounded-xl border px-4 py-3 text-sm ${isPlanningSemester ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-emerald-200 bg-emerald-50 text-emerald-900'}`}>
+            <div className="text-xs font-semibold uppercase tracking-wide">{editingSchedule ? 'Schedule Semester' : 'Working Semester'}</div>
+            <div className="mt-1 font-semibold">
+              {editingSchedule
+                ? formatSemesterLabel(semesters.find((semester) => Number(semester.semester_id) === Number(form.semester_id)))
+                : workingSemesterLabel}
+            </div>
+            {!editingSchedule && isPlanningSemester ? <div className="mt-1 text-xs">Planning only; attendance is not generated yet.</div> : null}
+          </div>
+          {editingSchedule ? (
+            <div className={`rounded-xl border px-4 py-3 text-sm ${editIdentityLocked ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-emerald-200 bg-emerald-50 text-emerald-900'}`}>
+              {editImpactLoading ? (
+                <div className="font-semibold">Checking attendance impact...</div>
+              ) : editImpact ? (
+                <>
+                  <div className="font-bold">Attendance impact</div>
+                  <div className="mt-1 leading-relaxed">
+                    {Number(editImpact.rebuildable_placeholders || 0)} untouched current/future placeholder(s) can be rebuilt.{' '}
+                    {Number(editImpact.historical_records || 0)} historical and {Number(editImpact.protected_current_future_records || 0)} protected current/future record(s) will be preserved.
+                  </div>
+                  {editImpact.next_effective_date ? <div className="mt-1">Next matching class date: <strong>{editImpact.next_effective_date}</strong>.</div> : null}
+                  {editImpact.active_session_now ? <div className="mt-2 font-semibold text-red-700">This class is currently in progress. Editing is blocked until it ends to protect live attendance.</div> : null}
+                  {editIdentityLocked ? <div className="mt-2 font-semibold">Instructor, subject, section, and semester are locked because attendance history exists. Create a new schedule to change the class assignment.</div> : null}
+                </>
+              ) : (
+                <div className="font-semibold">Impact preview is unavailable. Backend safety checks will still protect attendance records.</div>
+              )}
+            </div>
+          ) : null}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Department Scope</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Department {!modalDept && <span className="text-amber-700">(Required)</span>}</label>
               <select
                 value={modalDept}
                 onChange={handleModalDeptChange}
-                disabled={isProgramHead || isDean}
-                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${(isProgramHead || isDean) ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
+                disabled={isProgramHead || isDepartmentScopedRole || (editingSchedule && editIdentityLocked)}
+                required
+                aria-required="true"
+                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${(isProgramHead || isDepartmentScopedRole || (editingSchedule && editIdentityLocked)) ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
               >
-                <option value="">All Departments</option>
-                {departments.map(d => <option key={d.dept_id} value={d.dept_id}>{d.dept_name}</option>)}
+                <option value="">Select department</option>
+                {activeDepartments.map(d => <option key={d.dept_id} value={d.dept_id}>{formatDepartmentLabel(d, d.dept_id)}</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Program Scope</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Program {!modalProgram && <span className="text-amber-700">(Required)</span>}</label>
               <select
                 value={modalProgram}
                 onChange={handleModalProgramChange}
-                disabled={isProgramHead}
-                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${isProgramHead ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
+                disabled={isProgramHead || !modalDept || (editingSchedule && editIdentityLocked)}
+                required
+                aria-required="true"
+                className={`block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 ${(isProgramHead || !modalDept || (editingSchedule && editIdentityLocked)) ? 'bg-gray-100 text-gray-600 cursor-not-allowed' : 'bg-white'}`}
               >
-                <option value="">All Programs</option>
-                {modalPrograms.map(p => <option key={p.program_id} value={p.program_id}>{p.program_name}</option>)}
+                <option value="">{modalDept ? 'Select program' : 'Select department first'}</option>
+                {modalPrograms.map(p => <option key={p.program_id} value={p.program_id}>{formatProgramLabel(p, p.program_id)}</option>)}
               </select>
             </div>
           </div>
@@ -2683,9 +3391,14 @@ function ClassScheduleIndex(){
               Department and program are fixed to your assigned scope.
             </div>
           )}
-          {isDean && !isProgramHead && (
+          {isDepartmentScopedRole && !isProgramHead && (
             <div className="text-xs text-gray-500 -mt-2">
               Department is fixed to your assigned scope.
+            </div>
+          )}
+          {(!modalDept || !modalProgram) && (
+            <div className="text-xs font-medium text-amber-700 -mt-2">
+              Select the required Department and Program before completing the schedule.
             </div>
           )}
 
@@ -2694,7 +3407,7 @@ function ClassScheduleIndex(){
               <label className="block text-sm font-medium text-gray-700 mb-1">Building Scope</label>
               <select value={modalBuilding} onChange={handleModalBuildingChange} className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500">
                 <option value="">All Buildings</option>
-                {buildings.map(b => <option key={b.building_id} value={b.building_id}>{b.building_name}</option>)}
+                {activeBuildings.map(b => <option key={b.building_id} value={b.building_id}>{b.building_name}</option>)}
               </select>
             </div>
             <div>
@@ -2716,24 +3429,24 @@ function ClassScheduleIndex(){
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Teacher</label>
-            <select name="user_id" value={form.user_id || ''} onChange={handleChange} className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500">
-              <option value="">Select teacher</option>
+            <select name="user_id" value={form.user_id || ''} onChange={handleChange} required disabled={!modalProgram || (editingSchedule && editIdentityLocked)} className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 disabled:bg-gray-100 disabled:text-gray-600 disabled:cursor-not-allowed">
+              <option value="">{modalProgram ? 'Select teacher' : 'Select program first'}</option>
               {modalTeachers.map(t=> <option key={t.user_id} value={t.user_id}>{t.first_name} {t.last_name}{t.role_name ? ` (${t.role_name})` : ''}</option>)}
             </select>
           </div>
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Subject</label>
-            <select name="subject_id" value={form.subject_id} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500">
-              <option value="">Select subject</option>
+            <select name="subject_id" value={form.subject_id} onChange={handleChange} required disabled={!modalProgram || (editingSchedule && editIdentityLocked)} className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 disabled:bg-gray-100 disabled:text-gray-600 disabled:cursor-not-allowed">
+              <option value="">{modalProgram ? 'Select subject' : 'Select program first'}</option>
               {modalSubjects.map(s=> <option key={s.subject_id} value={s.subject_id}>{s.subject_code} - {s.subject_name}</option>)}
             </select>
             </div>
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Section</label>
-              <select name="section_id" value={form.section_id} onChange={handleChange} required className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500">
-                <option value="">Select section</option>
+              <select name="section_id" value={form.section_id} onChange={handleChange} required disabled={!modalProgram || (editingSchedule && editIdentityLocked)} className="block w-full border border-gray-200 rounded px-3 py-2 focus:outline-none focus:ring-1 focus:ring-green-500 disabled:bg-gray-100 disabled:text-gray-600 disabled:cursor-not-allowed">
+                <option value="">{modalProgram ? 'Select section' : 'Select program first'}</option>
                 {modalSections.map(s=> <option key={s.section_id} value={s.section_id}>{s.section_name}</option>)}
               </select>
             </div>
@@ -2758,7 +3471,7 @@ function ClassScheduleIndex(){
 
             <div className="flex justify-end items-center gap-2">
               <button type="button" onClick={closeModal} className="px-3 py-2 rounded border bg-white text-sm">Cancel</button>
-              <button type="submit" disabled={loading} className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700">{loading ? 'Saving...' : (editingSchedule ? 'Update Schedule' : 'Save Schedule')}</button>
+              <button type="submit" disabled={loading || !modalDept || !modalProgram || Boolean(editingSchedule && editImpact?.active_session_now)} className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed">{loading ? 'Saving...' : (editingSchedule ? 'Update Schedule' : 'Save Schedule')}</button>
             </div>
           </form>
         </Modal>
@@ -2799,8 +3512,8 @@ function ClassScheduleIndex(){
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                 <div className="rounded-xl border border-[#d4eadc] bg-[#f6fbf8] p-4">
                   <div className="text-xs uppercase tracking-wide text-[#1D8551]">Program</div>
-                  <div className="mt-1 text-sm font-semibold text-gray-900">{viewingSchedule.program_name || '-'}</div>
-                  <div className="text-xs text-gray-600 mt-1">Department: {viewingSchedule.dept_name || '-'}</div>
+                  <div className="mt-1 text-sm font-semibold text-gray-900">{formatProgramLabel({ sub_name: viewingSchedule.program_sub_name, program_name: viewingSchedule.program_name }, '-')}</div>
+                  <div className="text-xs text-gray-600 mt-1">Department: {formatDepartmentLabel({ sub_name: viewingSchedule.department_sub_name, dept_name: viewingSchedule.dept_name }, '-')}</div>
                 </div>
                 <div className="rounded-xl border border-[#d4eadc] bg-[#f6fbf8] p-4">
                   <div className="text-xs uppercase tracking-wide text-[#1D8551]">Location</div>
@@ -2814,7 +3527,7 @@ function ClassScheduleIndex(){
                 </div>
                 <div className="rounded-xl border border-[#d4eadc] bg-[#f6fbf8] p-4">
                   <div className="text-xs uppercase tracking-wide text-[#1D8551]">Semester</div>
-                  <div className="mt-1 text-sm font-semibold text-gray-900">{activeSemesterLabel || 'N/A'}</div>
+                  <div className="mt-1 text-sm font-semibold text-gray-900">{formatSemesterLabel(semesters.find((semester) => Number(semester.semester_id) === Number(viewingSchedule.semester_id))) || 'N/A'}</div>
                   <div className="text-xs text-gray-600 mt-1">{viewingSchedule.semester_start || '-'} to {viewingSchedule.semester_end || '-'}</div>
                 </div>
               </div>
@@ -2823,8 +3536,8 @@ function ClassScheduleIndex(){
                 <div className="rounded-xl border border-[#d4eadc] p-4 bg-white">
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#1D8551] mb-3">Academic Details</div>
                   <div className="space-y-2 text-sm">
-                    <div className="flex justify-between gap-4"><span className="text-gray-500">Program</span><span className="font-medium text-gray-900 text-right">{viewingSchedule.program_name || '-'}</span></div>
-                    <div className="flex justify-between gap-4"><span className="text-gray-500">Department</span><span className="font-medium text-gray-900 text-right">{viewingSchedule.dept_name || '-'}</span></div>
+                    <div className="flex justify-between gap-4"><span className="text-gray-500">Program</span><span className="font-medium text-gray-900 text-right">{formatProgramLabel({ sub_name: viewingSchedule.program_sub_name, program_name: viewingSchedule.program_name }, '-')}</span></div>
+                    <div className="flex justify-between gap-4"><span className="text-gray-500">Department</span><span className="font-medium text-gray-900 text-right">{formatDepartmentLabel({ sub_name: viewingSchedule.department_sub_name, dept_name: viewingSchedule.dept_name }, '-')}</span></div>
                     <div className="flex justify-between gap-4"><span className="text-gray-500">Section</span><span className="font-medium text-gray-900 text-right">{viewingSchedule.section_name || '-'}</span></div>
                   </div>
                 </div>
@@ -2853,7 +3566,7 @@ function ClassScheduleIndex(){
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between gap-4"><span className="text-gray-500">Start</span><span className="font-medium text-gray-900 text-right">{viewingSchedule.semester_start || '-'}</span></div>
                     <div className="flex justify-between gap-4"><span className="text-gray-500">End</span><span className="font-medium text-gray-900 text-right">{viewingSchedule.semester_end || '-'}</span></div>
-                    <div className="flex justify-between gap-4"><span className="text-gray-500">Status</span><span className="font-medium text-gray-900 text-right">{activeSemesterLabel || 'N/A'}</span></div>
+                    <div className="flex justify-between gap-4"><span className="text-gray-500">Status</span><span className="font-medium text-gray-900 text-right">{Number(viewingSchedule.semester_id) === Number(activeSemesterId) ? 'Current' : 'Planned / Historical'}</span></div>
                   </div>
                 </div>
               </div>
@@ -2863,16 +3576,23 @@ function ClassScheduleIndex(){
 
         <Modal show={canUseBulkScheduleTools && showImportReviewModal} title="Review Spreadsheet Import" onClose={closeImportReviewModal} size="xl">
           <div className="space-y-4">
-            <div className={`rounded-xl border p-4 ${activeSemesterId ? 'border-green-200 bg-green-50 text-green-900' : 'border-red-200 bg-red-50 text-red-900'}`}>
-              <div className="text-xs font-semibold uppercase tracking-wide mb-1">Active Semester (Fixed for Import)</div>
+            <div className={`rounded-xl border p-4 ${workingSemesterIdNumber ? (isPlanningSemester ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-green-200 bg-green-50 text-green-900') : 'border-red-200 bg-red-50 text-red-900'}`}>
+              <div className="text-xs font-semibold uppercase tracking-wide mb-1">Working Semester (Fixed for This Import)</div>
               <div className="text-sm font-semibold">
-                {activeSemesterId
-                  ? activeSemesterLabel
-                  : 'No active semester is available for today.'}
+                {workingSemesterIdNumber
+                  ? workingSemesterLabel
+                  : 'No current or upcoming semester is available.'}
               </div>
               <div className="text-xs mt-1">
-                Semester is assigned automatically from the current active semester for every imported row.
+                {isPlanningSemester
+                  ? 'Every row will be saved as planning data. Attendance records are not generated yet.'
+                  : 'Every row will use the current semester and synchronize attendance records.'}
               </div>
+            </div>
+
+            <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-blue-900">
+              <div className="text-xs font-semibold uppercase tracking-wide mb-1">Program Scope Per Row</div>
+              <div className="text-sm">Each row uses the resolved instructor's assigned Department and Program. Its Subject and Section must belong to that same Program.</div>
             </div>
 
             <div className="rounded-xl border border-gray-200 p-4 bg-gray-50">
@@ -2888,56 +3608,45 @@ function ClassScheduleIndex(){
                   </thead>
                   <tbody>
                     <tr className="bg-white border-t border-gray-200">
-                      <td className="px-3 py-2 font-semibold text-green-700">{importPreviewResult ? Math.max(0, importPreviewResult.inserted - Object.keys(localImportErrors).length) : '-'}</td>
-                      <td className="px-3 py-2 font-semibold text-amber-700">{importPreviewResult ? Math.max(0, importPreviewResult.skipped + Object.keys(localImportErrors).length) : '-'}</td>
+                      <td className="px-3 py-2 font-semibold text-green-700">{importPreviewResult ? Math.max(0, importPreviewResult.total - Object.keys(previewErrorsByRow).length) : '-'}</td>
+                      <td className="px-3 py-2 font-semibold text-amber-700">{importPreviewResult ? Object.keys(previewErrorsByRow).length : '-'}</td>
                       <td className="px-3 py-2 font-semibold text-gray-800">{importPreviewResult ? importPreviewResult.total : '-'}</td>
                     </tr>
                   </tbody>
                 </table>
               </div>
-              <div className="text-xs text-gray-600 mt-2">Only valid rows will be inserted. Duplicate and conflicting rows are blocked by validation.</div>
+              <div className="text-xs text-gray-600 mt-2">All rows must be valid. If any row has an issue, nothing will be inserted.</div>
             </div>
-
-            {Object.keys(previewErrorsByRow).length > 0 && (
-              <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-red-800">
-                <div className="font-semibold mb-2">Detected issues</div>
-                <ul className="list-disc pl-5 text-sm">
-                  {Object.keys(previewErrorsByRow).slice(0, 30).map((rowNum, idx) => (
-                    <li key={`err-${rowNum}-${idx}`}>Row {rowNum}: {previewErrorsByRow[rowNum].join('. ')}</li>
-                  ))}
-                </ul>
-                {Object.keys(previewErrorsByRow).length > 30 && <div className="text-sm mt-2">And {Object.keys(previewErrorsByRow).length - 30} more...</div>}
-              </div>
-            )}
 
             {importPreviewRows.length > 0 && (
               <div className="rounded-xl border border-gray-200 bg-white p-4">
                 <div className="font-semibold text-sm mb-2">Rows Preview (editable)</div>
                 <div className="flex items-center justify-between mb-2">
-                  <div className="text-xs text-gray-500">Rows with issues are highlighted in red. Identifiers update in real time while you edit.</div>
+                  <div className="text-xs text-gray-500">Rows with issues are highlighted in red. Validation updates while you edit.</div>
                   <div className={`text-xs font-medium ${livePreviewing ? 'text-blue-700' : 'text-green-700'}`}>
-                    {livePreviewing ? 'Updating identifiers...' : 'Up to date'}
+                    {livePreviewing ? 'Validating...' : 'Up to date'}
                   </div>
                 </div>
-                <div className="overflow-y-auto max-h-96" style={{ overflowX: 'hidden', touchAction: 'pan-y' }}>
-                  <table className="w-full table-fixed text-xs text-left text-gray-700">
+                <div className="max-h-96 overflow-auto" style={{ touchAction: 'pan-x pan-y' }}>
+                  <table className="min-w-[1560px] w-full table-fixed text-xs text-left text-gray-700">
                     <thead className="text-xs uppercase bg-gray-100 text-gray-600">
                       <tr>
                         <th className="px-3 py-2">Row</th>
-                        <th className="px-3 py-2">Teacher Name</th>
-                        <th className="px-3 py-2">Gmail</th>
-                        <th className="px-3 py-2">Room</th>
-                        <th className="px-3 py-2">Subject</th>
+                        <th className="px-3 py-2">First Name</th>
+                        <th className="px-3 py-2">Last Name</th>
+                        <th className="px-3 py-2">Teacher Email</th>
+                        <th className="px-3 py-2">Subject Code</th>
                         <th className="px-3 py-2">Section</th>
+                        <th className="px-3 py-2">Room</th>
                         <th className="px-3 py-2">Day</th>
                         <th className="px-3 py-2">Start</th>
                         <th className="px-3 py-2">End</th>
-                        <th className="px-3 py-2">Status</th>
+                        <th className="px-3 py-2">Validation Status</th>
                       </tr>
                     </thead>
                     <tbody>
                       {importPreviewRows.map((row, idx) => {
-                        const rowNumber = Number(row?._row || (idx + 1));
+                        const rowNumber = Number(row?._row || (idx + 2));
                         const issues = previewErrorsByRow[rowNumber] || [];
                         const issueFields = inferImportIssueFields(issues);
                         const cellClass = (field) => `w-full border rounded px-2 py-1 text-sm ${issueFields.has(field) ? 'border-red-500 bg-red-50 text-red-900' : 'border-gray-300 bg-white text-gray-700'}`;
@@ -2947,10 +3656,19 @@ function ClassScheduleIndex(){
                           <td className="px-2 py-2">
                             <input
                               type="text"
-                              className={cellClass('teacher_name')}
-                              value={row.teacher_name || ''}
-                              onChange={(e)=>handleImportDraftCellChange(idx, 'teacher_name', e.target.value)}
-                              placeholder="teacher full name"
+                              className={cellClass('first_name')}
+                              value={row.first_name || ''}
+                              onChange={(e)=>handleImportDraftCellChange(idx, 'first_name', e.target.value)}
+                              placeholder="first name"
+                            />
+                          </td>
+                          <td className="px-2 py-2">
+                            <input
+                              type="text"
+                              className={cellClass('last_name')}
+                              value={row.last_name || ''}
+                              onChange={(e)=>handleImportDraftCellChange(idx, 'last_name', e.target.value)}
+                              placeholder="last name"
                             />
                           </td>
                           <td className="px-2 py-2">
@@ -2959,16 +3677,7 @@ function ClassScheduleIndex(){
                               className={cellClass('teacher')}
                               value={row.teacher || ''}
                               onChange={(e)=>handleImportDraftCellChange(idx, 'teacher', e.target.value)}
-                              placeholder="teacher email (Gmail)"
-                            />
-                          </td>
-                          <td className="px-2 py-2">
-                            <input
-                              type="text"
-                              className={cellClass('room')}
-                              value={row.room || ''}
-                              onChange={(e)=>handleImportDraftCellChange(idx, 'room', e.target.value)}
-                              placeholder="room name or room id"
+                              placeholder="registered teacher email"
                             />
                           </td>
                           <td className="px-2 py-2">
@@ -2977,7 +3686,7 @@ function ClassScheduleIndex(){
                               className={cellClass('subject')}
                               value={row.subject || ''}
                               onChange={(e)=>handleImportDraftCellChange(idx, 'subject', e.target.value)}
-                              placeholder="subject code/name/id"
+                              placeholder="subject code"
                             />
                           </td>
                           <td className="px-2 py-2">
@@ -2986,7 +3695,16 @@ function ClassScheduleIndex(){
                               className={cellClass('section')}
                               value={row.section || ''}
                               onChange={(e)=>handleImportDraftCellChange(idx, 'section', e.target.value)}
-                              placeholder="section name/id"
+                              placeholder="section name"
+                            />
+                          </td>
+                          <td className="px-2 py-2">
+                            <input
+                              type="text"
+                              className={cellClass('room')}
+                              value={row.room || ''}
+                              onChange={(e)=>handleImportDraftCellChange(idx, 'room', e.target.value)}
+                              placeholder="copy Room from Reference"
                             />
                           </td>
                           <td className="px-2 py-2">
@@ -3041,10 +3759,10 @@ function ClassScheduleIndex(){
 
             <div className="flex justify-end items-center gap-2">
               <button type="button" onClick={closeImportReviewModal} className="px-3 py-2 rounded border bg-white text-sm">Cancel</button>
-              <button type="button" onClick={handleValidateImportDraft} disabled={submittingReviewedImport || !importPreviewRows.length || hasSchedulingDependencyBlockers} className="px-4 py-2 rounded border border-blue-300 bg-white text-blue-700 hover:bg-blue-50 text-sm">
+              <button type="button" onClick={handleValidateImportDraft} disabled={submittingReviewedImport || !importPreviewRows.length || hasSchedulingDependencyBlockers || !workingSemesterIdNumber} className="px-4 py-2 rounded border border-blue-300 bg-white text-blue-700 hover:bg-blue-50 text-sm">
                 {submittingReviewedImport ? 'Validating...' : 'Validate'}
               </button>
-              <button type="button" onClick={handleConfirmImportSubmit} disabled={submittingReviewedImport || !importPreviewRows.length || hasSchedulingDependencyBlockers || Object.keys(previewErrorsByRow).length > 0} className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed disabled:text-gray-200">
+              <button type="button" onClick={handleConfirmImportSubmit} disabled={submittingReviewedImport || !importPreviewRows.length || hasSchedulingDependencyBlockers || !workingSemesterIdNumber || Object.keys(previewErrorsByRow).length > 0} className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed disabled:text-gray-200">
                 {submittingReviewedImport ? 'Submitting...' : 'Submit Import'}
               </button>
             </div>
@@ -3077,14 +3795,14 @@ function ClassScheduleIndex(){
                   <label className="block text-xs font-medium text-gray-700 mb-1">Department</label>
                   <select value={historicalFilterDept} onChange={e => setHistoricalFilterDept(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2 text-sm">
                     <option value="">All Departments</option>
-                    {departments.map(d => <option key={d.dept_id} value={d.dept_id}>{d.dept_name}</option>)}
+                    {departments.map(d => <option key={d.dept_id} value={d.dept_id}>{formatDepartmentLabel(d, d.dept_id)}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-gray-700 mb-1">Program</label>
                   <select value={historicalFilterProgram} onChange={e => setHistoricalFilterProgram(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2 text-sm">
                     <option value="">All Programs</option>
-                    {historicalProgramOptions.map(p => <option key={p.program_id} value={p.program_id}>{p.program_name}</option>)}
+                    {historicalProgramOptions.map(p => <option key={p.program_id} value={p.program_id}>{formatProgramLabel(p, p.program_id)}</option>)}
                   </select>
                 </div>
                 <div>
@@ -3098,7 +3816,7 @@ function ClassScheduleIndex(){
                   <label className="block text-xs font-medium text-gray-700 mb-1">Day</label>
                   <select value={historicalFilterDay} onChange={e => setHistoricalFilterDay(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2 text-sm">
                     <option value="">All Days</option>
-                    {DAY_OPTIONS.map(d => <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}
+                    {ALL_DAY_OPTIONS.map(d => <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}
                   </select>
                 </div>
                 <div>
@@ -3120,7 +3838,7 @@ function ClassScheduleIndex(){
                     type="button"
                     onClick={() => {
                       setHistoricalFilterSemester(activeSemesterId ? String(activeSemesterId) : '');
-                      setHistoricalFilterDept(isProgramHead ? String(programHeadDeptId || '') : (isDean ? String(deanDeptId || '') : ''));
+                      setHistoricalFilterDept(isProgramHead ? String(programHeadDeptId || '') : (isDepartmentScopedRole ? String(deanDeptId || '') : ''));
                       setHistoricalFilterProgram(isProgramHead ? String(programHeadProgramId || '') : '');
                       setHistoricalFilterTeacher('');
                       setHistoricalFilterDay('');
@@ -3144,7 +3862,7 @@ function ClassScheduleIndex(){
               </div>
               <div className="p-3 sm:p-4">
                 {historicalLoading ? (
-                  <div className="text-center py-10 text-sm text-slate-500">Loading historical schedules...</div>
+                  <LoadingState label="Loading historical schedules..." />
                 ) : historicalFilteredSchedules.length === 0 ? (
                   <div className="text-center py-14 border-2 border-dashed border-slate-200 rounded-2xl">
                     <div className="text-slate-400 mb-2 text-lg font-medium">📚 No historical schedules found</div>
@@ -3167,7 +3885,12 @@ function ClassScheduleIndex(){
                         render: (s) => {
                           const isParallel = isParallelSession(s);
                           return isParallel ? (
-                            <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">Parallel Session</span>
+                            <span
+                              className="inline-flex cursor-help items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800"
+                              title="Hover anywhere on this row to highlight its parallel group"
+                            >
+                              Parallel Session
+                            </span>
                           ) : (
                             <span className="text-xs text-slate-400 italic">Standard</span>
                           );
@@ -3194,6 +3917,10 @@ function ClassScheduleIndex(){
                     horizontalScroll={true}
                     wrapCells
                     className="class-schedule-table responsive-table"
+                    rowClassName={parallelRowClassName}
+                    rowStyle={parallelRowStyle}
+                    onRowMouseEnter={handleParallelRowMouseEnter}
+                    onRowMouseLeave={handleParallelRowMouseLeave}
                   />
                 )}
               </div>
@@ -3205,44 +3932,44 @@ function ClassScheduleIndex(){
           </div>
         </Modal>
 
-        <Modal show={canUseBulkScheduleTools && showBatchModal} title="Batch Add Schedules" onClose={closeBatchModal} size="xxl">
-          <div className="space-y-5">
-            <div className={`text-sm rounded px-3 py-2 border ${activeSemesterId ? 'bg-green-50 text-green-800 border-green-200' : 'bg-red-50 text-red-800 border-red-200'}`}>
-              {activeSemesterId
-                ? `Active semester is used automatically: ${activeSemesterLabel || 'Current term'}.`
-                : 'No active semester is available for today. Batch submit/import will be blocked.'}
+        <Modal show={canUseBulkScheduleTools && showBatchModal} title="Batch Add Schedules" onClose={closeBatchModal} size="xxl" className="class-schedule-batch-modal">
+          <div className="cs-batch-content space-y-5">
+            <div className={`text-sm rounded px-3 py-2 border ${workingSemesterIdNumber ? (isPlanningSemester ? 'bg-amber-50 text-amber-900 border-amber-200' : 'bg-green-50 text-green-800 border-green-200') : 'bg-red-50 text-red-800 border-red-200'}`}>
+              {workingSemesterIdNumber
+                ? `Working semester: ${workingSemesterLabel || 'Selected term'}. ${isPlanningSemester ? 'Planning only; attendance is not generated yet.' : 'Attendance synchronization is active.'}`
+                : 'No current or upcoming semester is available. Batch submit is blocked.'}
             </div>
-            <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+            <div className="cs-batch-scope rounded-xl border border-gray-200 bg-gray-50 p-4">
               <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-3">Header Filters</div>
-              <div className={`grid grid-cols-1 ${isProgramHead ? 'md:grid-cols-2' : (isDean ? 'md:grid-cols-3' : 'md:grid-cols-4')} gap-4`}>
-              {!isProgramHead && !isDean && (
+              <div className={`grid grid-cols-1 ${isProgramHead ? 'md:grid-cols-2' : (isDepartmentScopedRole ? 'md:grid-cols-3' : 'md:grid-cols-4')} gap-4`}>
+              {!isProgramHead && !isDepartmentScopedRole && (
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Department</label>
-                  <select value={headerDept} onChange={e=>setHeaderDept(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2">
-                    <option value="">All Departments</option>
-                    {activeDepartments.map(d=> <option key={d.dept_id} value={d.dept_id}>{d.dept_name}</option>)}
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Department {!effectiveHeaderDept && <span className="text-amber-700">(Required)</span>}</label>
+                  <select value={headerDept} onChange={handleHeaderDeptChange} required aria-required="true" className="block w-full border border-gray-200 rounded px-3 py-2">
+                    <option value="">Select department</option>
+                    {activeDepartments.map(d=> <option key={d.dept_id} value={d.dept_id}>{formatDepartmentLabel(d, d.dept_id)}</option>)}
                   </select>
                 </div>
               )}
               {!isProgramHead && (
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Program</label>
-                  <select value={headerProgram} onChange={e=>setHeaderProgram(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2">
-                    <option value="">All Programs</option>
-                    {filteredPrograms.map(p=> <option key={p.program_id} value={p.program_id}>{p.program_name}</option>)}
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Program {!effectiveHeaderProgram && <span className="text-amber-700">(Required)</span>}</label>
+                  <select value={headerProgram} onChange={handleHeaderProgramChange} disabled={!effectiveHeaderDept} required aria-required="true" className="block w-full border border-gray-200 rounded px-3 py-2 disabled:cursor-not-allowed disabled:bg-gray-100">
+                    <option value="">Select program</option>
+                    {filteredPrograms.map(p=> <option key={p.program_id} value={p.program_id}>{formatProgramLabel(p, p.program_id)}</option>)}
                   </select>
                 </div>
               )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Building</label>
-                <select value={headerBuilding} onChange={e=>setHeaderBuilding(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2">
+                <select value={headerBuilding} onChange={handleHeaderBuildingChange} className="block w-full border border-gray-200 rounded px-3 py-2">
                   <option value="">All Buildings</option>
                   {activeBuildings.map(b=> <option key={b.building_id} value={b.building_id}>{b.building_name}</option>)}
                 </select>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Floor</label>
-                <select value={headerFloor} onChange={e=>setHeaderFloor(e.target.value)} className="block w-full border border-gray-200 rounded px-3 py-2">
+                <select value={headerFloor} onChange={handleHeaderFloorChange} className="block w-full border border-gray-200 rounded px-3 py-2">
                   <option value="">All Floors</option>
                   {filteredFloors.map(f=> <option key={f.floor_id} value={f.floor_id}>{f.floor_name}</option>)}
                 </select>
@@ -3253,9 +3980,14 @@ function ClassScheduleIndex(){
                 Department and program are fixed to your account assignment.
               </div>
             )}
-            {isDean && (
+            {isDepartmentScopedRole && (
               <div className="mt-2 text-xs text-gray-600">
                 Department is fixed to your account assignment.
+              </div>
+            )}
+            {(!effectiveHeaderDept || !effectiveHeaderProgram) && (
+              <div className="mt-2 text-xs font-medium text-amber-700">
+                Select the required Department and Program before completing a batch row.
               </div>
             )}
             {hasSchedulingDependencyBlockers && (
@@ -3265,9 +3997,40 @@ function ClassScheduleIndex(){
             )}
             </div>
 
-            <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
-              <div className="flex items-center justify-between mb-3">
-                <div className="text-xs font-semibold uppercase tracking-wide text-blue-700">Batch Row Form</div>
+            <div className="cs-batch-row-form rounded-xl border border-blue-100 bg-blue-50/40 p-4">
+              <div className="cs-batch-row-heading flex items-center justify-between mb-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-blue-700">Batch Row Form</div>
+                  <div className="group relative">
+                    <span className={`inline-flex cursor-help items-center rounded-full border px-2 py-1 text-[10px] font-semibold ${
+                      batchRowValidationStatus.status === 'valid'
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : batchRowValidationStatus.status === 'invalid'
+                          ? 'border-rose-200 bg-rose-50 text-rose-700'
+                          : batchRowValidationStatus.status === 'required'
+                            ? 'border-amber-200 bg-amber-50 text-amber-700'
+                            : 'border-slate-200 bg-white text-slate-500'
+                    }`}>
+                      {batchRowValidationStatus.status === 'valid' ? '✓ ' : batchRowValidationStatus.status === 'invalid' ? '⚠ ' : batchRowValidationStatus.status === 'required' ? '• ' : ''}{batchRowValidationStatus.label}
+                    </span>
+                    {batchRowValidationStatus.status === 'invalid' && (
+                      <div className="pointer-events-none absolute left-0 top-full z-[110] mt-1 hidden w-80 rounded-xl border border-rose-200 bg-white p-3 text-xs text-slate-700 shadow-xl group-hover:block group-focus-within:block" role="tooltip">
+                        <div className="font-semibold text-rose-700">{batchRowValidationStatus.label}</div>
+                        <div className="mt-1 text-slate-600">{batchRowValidationStatus.message}</div>
+                        {batchRowValidationStatus.conflict && (
+                          <dl className="mt-2 grid grid-cols-[72px_1fr] gap-x-2 gap-y-1">
+                            <dt className="text-slate-400">Source</dt><dd>{batchRowValidationStatus.conflict.source}</dd>
+                            <dt className="text-slate-400">Teacher</dt><dd>{batchRowValidationStatus.conflict.teacher}</dd>
+                            <dt className="text-slate-400">Subject</dt><dd>{batchRowValidationStatus.conflict.subject}</dd>
+                            <dt className="text-slate-400">Section</dt><dd>{batchRowValidationStatus.conflict.section}</dd>
+                            <dt className="text-slate-400">Room</dt><dd>{batchRowValidationStatus.conflict.room}</dd>
+                            <dt className="text-slate-400">Schedule</dt><dd>{batchRowValidationStatus.conflict.day}, {batchRowValidationStatus.conflict.time}</dd>
+                          </dl>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
                 <label className="flex items-center gap-2 text-sm font-medium text-blue-800 cursor-pointer select-none">
                   <input
                     type="checkbox"
@@ -3285,66 +4048,17 @@ function ClassScheduleIndex(){
                   <span>Parallel Class Mode</span>
                 </label>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-7 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Subject</label>
-                <select name="subject_id" value={batchForm.subject_id} onChange={handleBatchChange} disabled={batchForm.isParallel} className="block w-full border border-gray-200 rounded px-3 py-2 disabled:bg-gray-200 disabled:cursor-not-allowed">
-                  <option value="">Select subject</option>
-                  {filteredSubjects.map(s=> <option key={s.subject_id} value={s.subject_id}>{s.subject_code} - {s.subject_name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Section</label>
-                <select name="section_id" value={batchForm.section_id} onChange={handleBatchChange} className="block w-full border border-gray-200 rounded px-3 py-2">
-                  <option value="">Select section</option>
-                  {filteredSections.map(s=> <option key={s.section_id} value={s.section_id}>{s.section_name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Teacher</label>
-                <select name="user_id" value={batchForm.user_id} onChange={handleBatchChange} className="block w-full border border-gray-200 rounded px-3 py-2">
-                  <option value="">Select teacher</option>
-                  {batchTeachers.map(t=> <option key={t.user_id} value={t.user_id}>{t.first_name} {t.last_name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Room</label>
-                <select name="room_id" value={batchForm.room_id} onChange={handleBatchChange} className="block w-full border border-gray-200 rounded px-3 py-2">
-                  <option value="">Select room</option>
-                  {filteredRooms.map(r=> <option key={r.room_id} value={r.room_id}>{r.room_name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Day</label>
-                <select name="day_of_week" value={batchForm.day_of_week} onChange={handleBatchChange} disabled={batchForm.isParallel} className="block w-full border border-gray-200 rounded px-3 py-2 disabled:bg-gray-200 disabled:cursor-not-allowed">
-                  {DAY_OPTIONS.map(d=> <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Start Time</label>
-                <input
-                  type="time"
-                  name="start_time"
-                  value={batchForm.start_time}
-                  onChange={handleBatchChange}
-                  disabled={batchForm.isParallel}
-                  className="w-full block border border-gray-200 rounded px-3 py-2 disabled:bg-gray-200 disabled:cursor-not-allowed"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">End Time</label>
-                <input
-                  type="time"
-                  name="end_time"
-                  value={batchForm.end_time}
-                  onChange={handleBatchChange}
-                  disabled={batchForm.isParallel}
-                  className="w-full block border border-gray-200 rounded px-3 py-2 disabled:bg-gray-200 disabled:cursor-not-allowed"
-                />
-              </div>
+              <div className="cs-batch-fields grid grid-cols-1 md:grid-cols-7 gap-4">
+              {renderBatchValidatedField('subject_id', 'Subject', (inputClass) => <select name="subject_id" value={batchForm.subject_id} onChange={handleBatchChange} disabled={batchForm.isParallel || !effectiveHeaderProgram} className={inputClass} aria-invalid={batchFieldValidation.subject_id.status === 'invalid'}><option value="">{effectiveHeaderProgram ? 'Select subject' : 'Select program first'}</option>{filteredSubjects.map(s=> <option key={s.subject_id} value={s.subject_id}>{s.subject_code} - {s.subject_name}</option>)}</select>)}
+              {renderBatchValidatedField('section_id', 'Section', (inputClass) => <select name="section_id" value={batchForm.section_id} onChange={handleBatchChange} disabled={!effectiveHeaderProgram} className={inputClass} aria-invalid={batchFieldValidation.section_id.status === 'invalid'}><option value="">{effectiveHeaderProgram ? 'Select section' : 'Select program first'}</option>{filteredSections.map(s=> <option key={s.section_id} value={s.section_id}>{s.section_name}</option>)}</select>)}
+              {renderBatchValidatedField('user_id', 'Teacher', (inputClass) => <select name="user_id" value={batchForm.user_id} onChange={handleBatchChange} disabled={!effectiveHeaderProgram} className={inputClass} aria-invalid={batchFieldValidation.user_id.status === 'invalid'}><option value="">{effectiveHeaderProgram ? 'Select teacher' : 'Select program first'}</option>{batchTeachers.map(t=> <option key={t.user_id} value={t.user_id}>{t.first_name} {t.last_name}</option>)}</select>)}
+              {renderBatchValidatedField('room_id', 'Room', (inputClass) => <select name="room_id" value={batchForm.room_id} onChange={handleBatchChange} className={inputClass} aria-invalid={batchFieldValidation.room_id.status === 'invalid'}><option value="">Select room</option>{filteredRooms.map(r=> <option key={r.room_id} value={r.room_id}>{r.room_name}</option>)}</select>)}
+              {renderBatchValidatedField('day_of_week', 'Day', (inputClass) => <select name="day_of_week" value={batchForm.day_of_week} onChange={handleBatchChange} disabled={batchForm.isParallel} className={inputClass} aria-invalid={batchFieldValidation.day_of_week.status === 'invalid'}>{DAY_OPTIONS.map(d=> <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>)}</select>)}
+              {renderBatchValidatedField('start_time', 'Start Time', (inputClass) => <input type="time" name="start_time" value={batchForm.start_time} onChange={handleBatchChange} disabled={batchForm.isParallel} className={inputClass} aria-invalid={batchFieldValidation.start_time.status === 'invalid'} />)}
+              {renderBatchValidatedField('end_time', 'End Time', (inputClass) => <input type="time" name="end_time" value={batchForm.end_time} onChange={handleBatchChange} disabled={batchForm.isParallel} className={inputClass} aria-invalid={batchFieldValidation.end_time.status === 'invalid'} />)}
             </div>
 
-            <div className="flex justify-end items-center gap-2 mt-4">
+            <div className="cs-batch-row-actions flex justify-end items-center gap-2 mt-4">
               {editingBatchIndex !== null && (
                 <button type="button" onClick={handleBatchCancelEdit} className="px-4 py-2 rounded border bg-white text-sm">Cancel Edit</button>
               )}
@@ -3353,19 +4067,20 @@ function ClassScheduleIndex(){
                 onClick={() => {
                   setBatchForm({ isParallel: false, room_id:'', subject_id:'', section_id:'', user_id:'', day_of_week:'monday', start_time:'', end_time:'' });
                   setEditingBatchIndex(null);
+                  setBatchValidationAttempted(false);
                 }}
                 className="px-4 py-2 rounded border bg-white text-sm hover:bg-gray-50"
               >
                 Clear
               </button>
-              <button type="button" onClick={handleBatchAdd} disabled={hasSchedulingDependencyBlockers} className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed">
+              <button type="button" onClick={handleBatchAdd} disabled={hasSchedulingDependencyBlockers || !effectiveHeaderDept || !effectiveHeaderProgram} className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed">
                 {editingBatchIndex !== null ? 'Update Row' : 'Add Row'}
               </button>
             </div>
             </div>
 
             {batchRows.length > 0 && (
-              <div className="overflow-x-auto bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-4">
+              <div className="cs-batch-review overflow-x-auto bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-4">
                 <table className="w-full text-sm text-left text-gray-500">
                   <thead className="text-xs text-gray-700 uppercase bg-gray-100">
                     <tr>
@@ -3383,13 +4098,13 @@ function ClassScheduleIndex(){
                       const actualIndex = ((batchPage - 1) * BATCH_PAGE_SIZE) + idx;
                       return (
                         <tr key={actualIndex} className="bg-white border-b">
-                          <td className="px-6 py-4">{subjectLabelById[String(row.subject_id)] || row.subject_id}</td>
-                          <td className="px-6 py-4">{sectionLabelById[String(row.section_id)] || row.section_id}</td>
-                          <td className="px-6 py-4">{teacherLabelById[String(row.user_id)] || row.user_id}</td>
-                          <td className="px-6 py-4">{roomLabelById[String(row.room_id)] || row.room_id}</td>
-                          <td className="px-6 py-4">{row.day_of_week ? row.day_of_week.charAt(0).toUpperCase() + row.day_of_week.slice(1) : ''}</td>
-                          <td className="px-6 py-4">{`${formatToAmPm(row.start_time)} - ${formatToAmPm(row.end_time)}`}</td>
-                          <td className="px-6 py-4 space-x-3">
+                          <td data-label="Subject" className="px-6 py-4">{subjectLabelById[String(row.subject_id)] || row.subject_id}</td>
+                          <td data-label="Section" className="px-6 py-4">{sectionLabelById[String(row.section_id)] || row.section_id}</td>
+                          <td data-label="Teacher" className="px-6 py-4">{teacherLabelById[String(row.user_id)] || row.user_id}</td>
+                          <td data-label="Room" className="px-6 py-4">{roomLabelById[String(row.room_id)] || row.room_id}</td>
+                          <td data-label="Day" className="px-6 py-4">{row.day_of_week ? row.day_of_week.charAt(0).toUpperCase() + row.day_of_week.slice(1) : ''}</td>
+                          <td data-label="Time" className="px-6 py-4">{`${formatToAmPm(row.start_time)} - ${formatToAmPm(row.end_time)}`}</td>
+                          <td data-label="Actions" className="px-6 py-4 space-x-3">
                             <button type="button" onClick={() => handleBatchEdit(actualIndex)} className="text-blue-700 hover:underline">Edit</button>
                             <button type="button" onClick={() => handleBatchRemove(actualIndex)} className="text-red-600 hover:underline">Remove</button>
                           </td>
@@ -3398,7 +4113,7 @@ function ClassScheduleIndex(){
                     })}
                   </tbody>
                 </table>
-                <div className="mt-3 flex items-center justify-between text-xs text-gray-600">
+                <div className="cs-batch-pagination mt-3 flex items-center justify-between text-xs text-gray-600">
                   <div>Showing {pagedBatchRows.length} of {batchRows.length} rows</div>
                   <div className="flex items-center gap-2">
                     <button
@@ -3423,7 +4138,7 @@ function ClassScheduleIndex(){
               </div>
             )}
 
-            <div className="flex justify-end items-center gap-2 border-t border-gray-200 pt-4">
+            <div className="cs-batch-footer flex justify-end items-center gap-2 border-t border-gray-200 pt-4">
               <button type="button" onClick={closeBatchModal} className="px-3 py-2 rounded border bg-white text-sm">Cancel</button>
               <button type="button" onClick={handleBatchSubmit} disabled={importing || hasSchedulingDependencyBlockers} className="px-5 py-2 rounded bg-green-600 text-white hover:bg-green-700">{importing ? 'Submitting...' : 'Submit Batch'}</button>
             </div>

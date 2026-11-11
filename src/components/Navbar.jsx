@@ -1,6 +1,18 @@
 import React, { useState, useEffect, useContext, useRef } from 'react';
 import { AuthContext } from "../context/AuthContext.jsx";
 import { canAccessModule, resolveRoleName as resolveRoleNameUtil } from "../utils/moduleAccess.js";
+import { apiUrl, getCsrfToken } from '../services/api.js';
+import {
+  disablePushNotifications,
+  getPushNotificationStatus,
+  showPushStatusSweetAlert,
+  syncPushSubscription,
+} from '../services/pushNotifications.js';
+import Modal from './Modal.jsx';
+import LoadingState from './LoadingState.jsx';
+
+const NAVBAR_NOTIFICATION_LIMIT = 20;
+const NAVBAR_NOTIFICATION_POLL_MS = 15000;
 
 // Fallback avatar path that works on localhost subfolder deployments (e.g. /3D1.2)
 const unknownImg = (() => {
@@ -34,17 +46,30 @@ export default function Navbar() {
   const [notifLoaded, setNotifLoaded] = useState(false);
   const [notificationActioning, setNotificationActioning] = useState(false);
   const [notificationFilter, setNotificationFilter] = useState('all');
+  const [navPushStatus, setNavPushStatus] = useState({ supported: true, enabled: false, permission: 'default' });
+  const [navPushActioning, setNavPushActioning] = useState(false);
+  const [navPushMessage, setNavPushMessage] = useState('');
+  const [navigationSearch, setNavigationSearch] = useState('');
+  const [navigationSearchOpen, setNavigationSearchOpen] = useState(false);
+  const [navigationSearchIndex, setNavigationSearchIndex] = useState(0);
 
   // Profile State
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileData, setProfileData] = useState(user || null);
   const [uploading, setUploading] = useState(false);
   const [profileForm, setProfileForm] = useState({ first_name: '', last_name: '', email: '', contact_no: '' });
+  const [profileAvatarFile, setProfileAvatarFile] = useState(null);
+  const [profileAvatarPreview, setProfileAvatarPreview] = useState('');
+  const [profileAvatarError, setProfileAvatarError] = useState('');
+  const [profileDetailsOpen, setProfileDetailsOpen] = useState(false);
+  const profileAvatarInputRef = useRef(null);
   const [notificationAgeTick, setNotificationAgeTick] = useState(Date.now());
 
   // Avoid repeated profile fetches for the same user
   const fetchedProfileFor = React.useRef(null);
   const notificationPanelRef = useRef(null);
+  const desktopNavigationSearchRef = useRef(null);
+  const mobileNavigationSearchRef = useRef(null);
 
   const unreadNotifications = notifLoaded
     ? unreadCount
@@ -52,6 +77,7 @@ export default function Navbar() {
   const profileUserId = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
   const notificationUserId = profileUserId;
   const canEditProfileContact = Boolean(profileUserId);
+  const canEditProfileAvatar = Boolean(profileUserId);
   const isOnNotificationRoute = String(currentHash || '').toLowerCase().includes('notification');
   const shouldAnimateNotificationBell = unreadNotifications > 0 && !notificationOpen && !isOnNotificationRoute;
   const filteredNotifications = notificationFilter === 'unread'
@@ -71,54 +97,11 @@ export default function Navbar() {
     });
   }, [profileData]);
 
-  // Helper to build server-php API URLs that work for both localhost subfolder and devtunnel/public origins
-  const buildServerPhpUrl = (p) => {
-    try {
-      if (typeof window === 'undefined') return '/server-php/api/' + p.replace(/^\/?/, '');
-      if (window.API_BASE) {
-        // window.API_BASE may be like 'https://host/.../server-php/index.php/api'
-        return String(window.API_BASE).replace(/\/index\.php\/api\/?$/, '') + '/api/' + String(p).replace(/^\/?/, '');
-      }
-      const origin = window.location.origin.replace(/\/+$/, '');
-      const parts = window.location.pathname.split('/').filter(Boolean);
-      let projectRoot = '';
-      if (parts.length) {
-        const first = String(parts[0]).toLowerCase();
-        if (first !== 'public') projectRoot = '/' + parts[0];
-      }
-      return origin + projectRoot + '/server-php/api/' + String(p).replace(/^\/?/, '');
-    } catch (e) {
-      return '/server-php/api/' + String(p).replace(/^\/?/, '');
-    }
-  };
-
-  // Build routed API URLs (server-php/index.php/api/...) for endpoints handled by index.php
-  const buildIndexApiUrl = (p) => {
-    try {
-      if (typeof window === 'undefined') return '/server-php/index.php/api/' + p.replace(/^\/?/, '');
-      if (window.API_BASE) {
-        return String(window.API_BASE).replace(/\/+$/, '') + '/' + String(p).replace(/^\/?/, '');
-      }
-      const origin = window.location.origin.replace(/\/+$/, '');
-      const parts = window.location.pathname.split('/').filter(Boolean);
-      let projectRoot = '';
-      if (parts.length) {
-        const first = String(parts[0]).toLowerCase();
-        if (first !== 'public') projectRoot = '/' + parts[0];
-      }
-      return origin + projectRoot + '/server-php/index.php/api/' + String(p).replace(/^\/?/, '');
-    } catch (e) {
-      return '/server-php/index.php/api/' + String(p).replace(/^\/?/, '');
-    }
-  };
-
-  const getAuthToken = () => {
-    try { return localStorage.getItem('token') || ''; } catch (e) { return ''; }
-  };
+  const buildIndexApiUrl = (p) => apiUrl(p);
 
   const getAuthHeaders = () => {
-    const token = getAuthToken();
-    return token ? { Authorization: `Bearer ${token}` } : {};
+    const csrfToken = getCsrfToken();
+    return csrfToken ? { 'X-CSRF-Token': csrfToken } : {};
   };
 
   const resetProfileEditor = () => {
@@ -128,6 +111,10 @@ export default function Navbar() {
       email: (profileData && profileData.email) || '',
       contact_no: (profileData && profileData.contact_no) || '',
     });
+    setProfileAvatarFile(null);
+    setProfileAvatarPreview('');
+    setProfileAvatarError('');
+    if (profileAvatarInputRef.current) profileAvatarInputRef.current.value = '';
   };
 
   const applyProfileUpdate = (nextUser) => {
@@ -139,7 +126,7 @@ export default function Navbar() {
 
   const normalizeNotificationLink = (rawLink) => {
     let link = String(rawLink || '').trim();
-    if (!link) return '/dashboard';
+    if (!link) return '';
     if (link.startsWith('#')) link = link.slice(1);
     if (!link.startsWith('/')) link = '/' + link;
     return link;
@@ -195,8 +182,7 @@ export default function Navbar() {
 
   const fetchNotifications = React.useCallback(async (silent = true) => {
     try {
-      const token = getAuthToken();
-      if (!notificationUserId || !token) {
+      if (!notificationUserId) {
         setNotifications([]);
         setUnreadCount(0);
         setNotifLoaded(true);
@@ -204,8 +190,9 @@ export default function Navbar() {
       }
       if (!silent) setNotificationsLoading(true);
 
-      const res = await fetch(buildIndexApiUrl('notification?limit=10'), {
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await fetch(buildIndexApiUrl(`notification?limit=${NAVBAR_NOTIFICATION_LIMIT}`), {
+        credentials: 'include',
+        headers: getAuthHeaders(),
         cache: 'no-store',
       });
       if (!res.ok) throw new Error(`Failed to load notifications (${res.status})`);
@@ -245,8 +232,8 @@ export default function Navbar() {
           return;
         }
 
-        const url = buildServerPhpUrl(`user_profile.php?user_id=${uid}`);
-        const res = await fetch(url, { headers: getAuthHeaders() });
+        const url = buildIndexApiUrl(`user-profile?user_id=${uid}`);
+        const res = await fetch(url, { credentials: 'include', headers: getAuthHeaders() });
         if (!alive) return;
         if (!res.ok) { console.warn('[Navbar] profile fetch failed', res.status); return; }
         const j = await res.json();
@@ -273,6 +260,16 @@ export default function Navbar() {
   }, []);
 
   useEffect(() => {
+    const onDocumentPointerDown = (event) => {
+      const inDesktopSearch = desktopNavigationSearchRef.current?.contains(event.target);
+      const inMobileSearch = mobileNavigationSearchRef.current?.contains(event.target);
+      if (!inDesktopSearch && !inMobileSearch) setNavigationSearchOpen(false);
+    };
+    document.addEventListener('mousedown', onDocumentPointerDown);
+    return () => document.removeEventListener('mousedown', onDocumentPointerDown);
+  }, []);
+
+  useEffect(() => {
     const timerId = window.setInterval(() => {
       setNotificationAgeTick(Date.now());
     }, 300000);
@@ -287,12 +284,19 @@ export default function Navbar() {
       return;
     }
 
+    // The full Notifications page owns live refresh while it is open. Avoid
+    // polling the same endpoint a second time from the Navbar.
+    if (isOnNotificationRoute) {
+      setNotifLoaded(true);
+      return;
+    }
+
     fetchNotifications(true);
     const poller = window.setInterval(() => {
       fetchNotifications(true);
-    }, 5000);
+    }, NAVBAR_NOTIFICATION_POLL_MS);
     return () => window.clearInterval(poller);
-  }, [notificationUserId, fetchNotifications]);
+  }, [notificationUserId, fetchNotifications, isOnNotificationRoute]);
 
   useEffect(() => {
     const onDocMouseDown = (event) => {
@@ -318,31 +322,143 @@ export default function Navbar() {
     await new Promise((resolve,reject)=>{ const s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js'; s.async=true; s.setAttribute('data-swal','1'); s.onload=()=>resolve(); s.onerror=()=>reject(); document.head.appendChild(s); });
   };
 
-  const handleLogout = async () => {
+  const handleLogout = () => {
+    setMenuOpen(false);
+    const forceLocalLogout = () => {
+      localStorage.removeItem('user');
+      localStorage.removeItem('last_activity_at');
+      localStorage.removeItem('session_meta');
+      window.location.hash = '#/login';
+    };
     try {
-      await ensureSwalLoaded();
-      try { if (window.Swal) await window.Swal.fire({ toast:true, position:'top', icon:'success', title: 'Logged out', showConfirmButton:false, timer:1200 }); } catch (e) {}
-    } catch (e) { try { alert('Logged out'); } catch (e) {} }
+      if (typeof logout === 'function') {
+        const logoutResult = logout();
+        Promise.resolve(logoutResult).catch(forceLocalLogout);
+      } else {
+        forceLocalLogout();
+      }
+    } catch (e) {
+      forceLocalLogout();
+    }
 
+    // Confirmation is shown only after logout has started and never delays it.
     try {
-      if (typeof logout === 'function') logout();
-      else { localStorage.removeItem('token'); localStorage.removeItem('user'); window.location.hash = '#/login'; }
-    } catch (e) { localStorage.removeItem('token'); localStorage.removeItem('user'); window.location.hash = '#/login'; }
+      if (window.Swal && typeof window.Swal.fire === 'function') {
+        Promise.resolve(window.Swal.fire({
+          toast: true,
+          position: 'top',
+          icon: 'success',
+          title: 'Logged out',
+          showConfirmButton: false,
+          timer: 1200
+        })).catch(() => {});
+      }
+    } catch (e) {}
   };
+
+  const refreshNavPushStatus = React.useCallback(async () => {
+    try {
+      const next = await getPushNotificationStatus();
+      setNavPushStatus(next);
+      if (next?.verificationFailed) {
+        setNavPushMessage('Server verification failed. Select Enable to retry.');
+      } else if (next?.needsSync) {
+        setNavPushMessage('Alerts need attention. Select Enable to reconnect.');
+      } else if (next?.enabled) {
+        setNavPushMessage('Background alerts are on.');
+      } else if (next?.permission === 'denied') {
+        setNavPushMessage('Alerts are blocked in browser settings.');
+      } else {
+        setNavPushMessage('Background alerts are off.');
+      }
+      return next;
+    } catch (error) {
+      const fallback = { supported: false, enabled: false, permission: 'unsupported' };
+      setNavPushStatus(fallback);
+      return fallback;
+    }
+  }, []);
+
+  const toggleNavBackgroundAlerts = async () => {
+    if (navPushActioning || !navPushStatus.supported) return;
+    setNavPushActioning(true);
+    setNavPushMessage('');
+    try {
+      let next;
+      if (navPushStatus.enabled) {
+        next = await disablePushNotifications({ unsubscribe: true });
+        setNavPushMessage('Background alerts are off.');
+        await showPushStatusSweetAlert('disabled', { once: false });
+      } else {
+        await syncPushSubscription({ requestPermission: true });
+        next = await getPushNotificationStatus();
+        if (!next?.enabled) throw new Error('The server could not verify this device. Please retry.');
+        setNavPushMessage(next?.enabled
+          ? 'Background alerts are on.'
+          : 'Permission is allowed, but the background subscription is not active.');
+        await showPushStatusSweetAlert('restored', { once: false });
+      }
+      setNavPushStatus(next);
+      try { window.dispatchEvent(new CustomEvent('push-notification-status-changed', { detail: next })); } catch (e) {}
+    } catch (error) {
+      const verified = await getPushNotificationStatus().catch(() => null);
+      if (verified?.enabled) {
+        setNavPushStatus(verified);
+        setNavPushMessage('Background alerts are on.');
+      } else {
+        const denied = typeof Notification !== 'undefined' && Notification.permission === 'denied';
+        setNavPushStatus(previous => ({
+          ...previous,
+          ...(verified || {}),
+          enabled: false,
+          permission: denied ? 'denied' : (verified?.permission || previous.permission),
+        }));
+        setNavPushMessage(denied
+          ? 'Alerts are blocked in browser settings.'
+          : `Alerts need attention: ${error?.body?.message || error?.message || 'Background alerts could not be updated.'}`);
+        await showPushStatusSweetAlert(
+          denied ? 'blocked' : (navigator.onLine === false ? 'offline' : 'verification-failed'),
+          { message: error?.body?.message || error?.message || '', once: false }
+        );
+      }
+    } finally {
+      setNavPushActioning(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+    refreshNavPushStatus();
+  }, [notificationOpen, refreshNavPushStatus]);
+
+  useEffect(() => {
+    const syncPushStatus = (event) => {
+      if (!event?.detail) return;
+      setNavPushStatus(event.detail);
+      if (event.detail.syncError) setNavPushMessage(`Alerts need attention: ${event.detail.syncError}`);
+      else if (event.detail.enabled) setNavPushMessage('Background alerts are on.');
+      else if (event.detail.needsSync) setNavPushMessage('Alerts need attention. Select Enable to reconnect.');
+      else if (event.detail.permission === 'denied') setNavPushMessage('Alerts are blocked in browser settings.');
+      else setNavPushMessage('Background alerts are off.');
+    };
+    window.addEventListener('push-notification-status-changed', syncPushStatus);
+    return () => window.removeEventListener('push-notification-status-changed', syncPushStatus);
+  }, []);
 
   // --- 2. NAVIGATION CONFIGURATION ---
 
   const navItems = [
     { label: "Home", path: "/home", permission: null },
     { label: "Dashboard", path: "/dashboard", permission: 'dashboard' },
+    { label: "Notification", path: "/notifications", permission: null },
     { label: "Users", path: "/users", permission: 'users' },
 
     // --- MODIFIED: Faculty Portal (Formerly Attendance Logs) ---
     // Permission 'attendance' allows: Dean, Program Head, Secretary, Teacher. (No Admin)
     { label: "Faculty Portal", path: "/faculty-portal", permission: 'attendance', children: [
       { label: "My Dashboard", path: "/faculty-dashboard", permission: 'faculty_dashboard' },
-      { label: "Attendance", path: "/attendance", permission: 'attendance' },
       { label: "Attendance History", path: "/attendance-history", permission: 'attendance' },
+      { label: "Attendance", path: "/attendance", permission: 'attendance' },
       { label: "Teaching Schedule", path: "/my-attendance", permission: 'attendance' },
       { label: "Request Edit", path: "/my-requested-edits", permission: 'attendance' },
     ]},
@@ -352,7 +468,7 @@ export default function Navbar() {
     { label: "Attendance Edit Request", path: "/attendance-edit-requests", permission: 'attendance_edits' },
     { label: "Attendance Adjustment Logs", path: "/attendance-logs", permission: 'attendance_logs' },
     { label: "Class Schedules", path: "/class-schedules", permission: 'class_schedules' },
-    { label: "Schedule Edit Requests", path: "/schedule-edit-requests", permission: 'schedule_edits' },
+    { label: "Holidays & Events", path: "/calendar-events", permission: 'calendar_events' },
     { label: "3D Campus Map", path: "/3d-building", permission: '3d_building' },
 
     // Grouped: Academic Management
@@ -367,16 +483,15 @@ export default function Navbar() {
     // Grouped: Facility Management
     { label: 'Facility', path: '/facility', permission: null, children: [
       { label: 'Buildings', path: '/building', permission: 'locations' },
-      { label: 'Floors', path: '/floors', permission: 'locations' },
+      { label: 'Floors', path: '/floors', permission: 'floor_qr' },
       { label: 'Rooms', path: '/rooms', permission: 'locations' }
     ]},
 
     { label: 'File Leave', path: '/File_leave', permission: 'leaves_file' },
     { label: "Substitutions", path: "/substitutions", permission: 'substitutions' },
-    // { label: "Penalties", path: "/penalties", permission: 'penalties' },
+    { label: "Penalties", path: "/penalties", permission: 'penalties' },
     { label: "Reports", path: "/reports", permission: 'reports' },
     { label: "Audit Trail", path: "/system-logs", permission: 'logs' },
-    { label: "Notification", path: "/notifications", permission: null },
     { label: 'General Settings', path: '/settings/system', permission: 'settings' },
 
   ];
@@ -398,6 +513,9 @@ export default function Navbar() {
   }, [user]);
 
   const currentRole = resolveRoleName(currentAccessUser);
+  const navFirstNameLabel = String(
+    profileData?.first_name || user?.first_name || currentAccessUser?.first_name || ''
+  ).trim();
 
   // Debugging: log role resolution after access snapshot is resolved.
   try {
@@ -417,9 +535,9 @@ export default function Navbar() {
         if (!currentRole && user) {
           const uid = user.user_id || user.id || user.userId || null;
           if (!uid) return;
-          const url = buildServerPhpUrl(`user_profile.php?user_id=${uid}`);
+          const url = buildIndexApiUrl(`user-profile?user_id=${uid}`);
           console.log('[Navbar] fetching profile for user_id=', uid, 'url=', url);
-          const res = await fetch(url, { headers: getAuthHeaders() });
+          const res = await fetch(url, { credentials: 'include', headers: getAuthHeaders() });
           if (!alive) return;
           if (!res.ok) { console.warn('[Navbar] profile fetch failed status=', res.status); return; }
           const j = await res.json();
@@ -452,10 +570,60 @@ export default function Navbar() {
     return canAccess(item.permission);
   });
 
+  const searchableNavItems = visibleNavItems.flatMap((item) => {
+    if (item.children?.length) {
+      return item.children.map((child) => ({
+        ...child,
+        group: item.label,
+        searchText: `${child.label} ${item.label} ${child.path}`.toLowerCase(),
+      }));
+    }
+    return [{
+      ...item,
+      group: '',
+      searchText: `${item.label} ${item.path}`.toLowerCase(),
+    }];
+  });
+  const normalizedNavigationSearch = navigationSearch.trim().toLowerCase();
+  const navigationSearchTerms = normalizedNavigationSearch.split(/\s+/).filter(Boolean);
+  const navigationSearchResults = normalizedNavigationSearch
+    ? searchableNavItems
+      .filter((item) => navigationSearchTerms.every((term) => item.searchText.includes(term)))
+      .slice(0, 8)
+    : [];
+
   // --- 3. HELPER FUNCTIONS ---
 
   const toggleSidebar = () => setSidebarOpen(s => !s);
   const navTo = (path) => { window.location.hash = '#' + path; setSidebarOpen(false); };
+
+  const navigateFromSearch = (item) => {
+    if (!item?.path) return;
+    setNavigationSearch('');
+    setNavigationSearchOpen(false);
+    setNavigationSearchIndex(0);
+    setMenuOpen(false);
+    setNotificationOpen(false);
+    navTo(item.path);
+  };
+
+  const handleNavigationSearchKeyDown = (event) => {
+    if (event.key === 'Escape') {
+      setNavigationSearchOpen(false);
+      return;
+    }
+    if (!navigationSearchResults.length) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setNavigationSearchIndex((index) => (index + 1) % navigationSearchResults.length);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setNavigationSearchIndex((index) => (index - 1 + navigationSearchResults.length) % navigationSearchResults.length);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      navigateFromSearch(navigationSearchResults[Math.min(navigationSearchIndex, navigationSearchResults.length - 1)]);
+    }
+  };
   
   const toggleSubmenu = (path) => {
     setOpenSubmenus(prev => ({ ...prev, [path]: !prev[path] }));
@@ -468,11 +636,12 @@ export default function Navbar() {
     if (p.startsWith('/faculty-dashboard')) return 'dashboard';
     if (p.startsWith('/users')) return 'users';
     if (p.startsWith('/faculty-portal')) return 'faculty';
-    if (p.startsWith('/attendance-edit-requests') || p.startsWith('/my-requested-edits') || p.startsWith('/schedule-edit-requests')) return 'edit_request';
+    if (p.startsWith('/attendance-edit-requests') || p.startsWith('/my-requested-edits')) return 'edit_request';
     if (p.startsWith('/attendance-history')) return 'history';
     if (p.startsWith('/attendance-logs') || p.startsWith('/system-logs') || p.startsWith('/logs')) return 'logs';
     if (p.startsWith('/attendance') || p.startsWith('/attendancemgmt') || p.startsWith('/my-attendance')) return 'attendance';
     if (p.startsWith('/class-schedules')) return 'schedule';
+    if (p.startsWith('/calendar-events')) return 'schedule';
     if (p.startsWith('/3d-building')) return 'map3d';
     if (p.startsWith('/academic') || p.startsWith('/programs') || p.startsWith('/departments') || p.startsWith('/sections') || p.startsWith('/school_year') || p.startsWith('/semesters') || p.startsWith('/subjects') || p.startsWith('/subject-offerings')) return 'academic';
     if (p.startsWith('/facility') || p.startsWith('/building') || p.startsWith('/floors') || p.startsWith('/rooms')) return 'facility';
@@ -634,14 +803,54 @@ export default function Navbar() {
     );
   };
 
+  const renderNavigationSearchResults = (mobile = false) => {
+    if (!navigationSearchOpen || !normalizedNavigationSearch) return null;
+    return (
+      <div
+        className={`${mobile ? 'mt-2' : 'absolute left-0 right-0 top-[calc(100%+0.5rem)]'} z-[70] overflow-hidden rounded-xl border border-gray-200 bg-white text-gray-800 shadow-2xl`}
+        role="listbox"
+        aria-label="Navigation search results"
+      >
+        {navigationSearchResults.length ? (
+          <div className="max-h-[min(60vh,24rem)] overflow-y-auto p-1.5">
+            {navigationSearchResults.map((item, index) => (
+              <button
+                key={item.path}
+                type="button"
+                role="option"
+                aria-selected={index === navigationSearchIndex}
+                onMouseEnter={() => setNavigationSearchIndex(index)}
+                onClick={() => navigateFromSearch(item)}
+                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${index === navigationSearchIndex ? 'bg-emerald-50 text-emerald-800' : 'hover:bg-gray-50'}`}
+              >
+                <span className="grid h-9 w-9 flex-none place-items-center rounded-lg bg-emerald-50 text-emerald-700">
+                  <NavIcon path={item.path} className="h-4 w-4" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-bold">{item.label}</span>
+                  <span className="block truncate text-[11px] text-gray-500">{item.group || 'Main navigation'}</span>
+                </span>
+                <svg className="h-4 w-4 flex-none text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="m9 18 6-6-6-6" />
+                </svg>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="px-4 py-5 text-center text-sm text-gray-500">No accessible page matches “{navigationSearch.trim()}”.</div>
+        )}
+      </div>
+    );
+  };
+
   const markNotificationRead = async (notifId) => {
-    const token = getAuthToken();
-    if (!token || !notifId) return;
+    if (!notifId) return;
     try {
       await fetch(buildIndexApiUrl(`notification/${notifId}`), {
         method: 'PUT',
+        credentials: 'include',
         headers: {
-          Authorization: `Bearer ${token}`,
+          ...getAuthHeaders(),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ is_read: 1 }),
@@ -652,16 +861,15 @@ export default function Navbar() {
   };
 
   const markAllNotificationsRead = async () => {
-    const token = getAuthToken();
-    if (!token) return;
     setNotificationActioning(true);
     setNotifications(prev => prev.map(n => ({ ...n, is_read: 1 })));
     setUnreadCount(0);
     try {
       await fetch(buildIndexApiUrl('notification/read-all'), {
         method: 'PUT',
+        credentials: 'include',
         headers: {
-          Authorization: `Bearer ${token}`,
+          ...getAuthHeaders(),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ is_read: 1 }),
@@ -695,8 +903,7 @@ export default function Navbar() {
   };
 
   const clearNotifications = async (mode = 'read') => {
-    const token = getAuthToken();
-    if (!token || notificationActioning) return;
+    if (notificationActioning) return;
 
     const isAll = mode === 'all';
     const ok = await confirmNotificationAction(
@@ -713,7 +920,8 @@ export default function Navbar() {
       const endpoint = isAll ? 'notification/clear-all' : 'notification/clear-read';
       const res = await fetch(buildIndexApiUrl(endpoint), {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'include',
+        headers: getAuthHeaders(),
       });
       if (!res.ok) throw new Error(`Failed to clear notifications (${res.status})`);
 
@@ -759,11 +967,15 @@ export default function Navbar() {
     }
     setNotificationOpen(false);
     const link = normalizeNotificationLink(notif.link);
-    if (link) window.location.hash = '#' + link;
+    const destination = link || `/notifications${notifId > 0 ? `?notif_id=${notifId}` : ''}`;
+    window.location.hash = '#' + destination;
   };
 
   // Open profile modal and ensure profileData is loaded
   const openProfile = () => {
+    setMenuOpen(false);
+    setNotificationOpen(false);
+    setProfileDetailsOpen(false);
     setProfileOpen(true);
     // Lazy fetch profile if not present
     (async () => {
@@ -772,10 +984,10 @@ export default function Navbar() {
           // If dept_name missing but dept_id present, try to resolve department name
           if ((!profileData.dept_name || profileData.dept_name === '') && profileData.dept_id) {
             try {
-              const dres = await fetch(buildServerPhpUrl('dashboard.php'), { headers: getAuthHeaders() });
+              const dres = await fetch(buildIndexApiUrl('departments'), { credentials: 'include', headers: getAuthHeaders() });
               if (dres.ok) {
                 const dj = await dres.json();
-                const depts = dj && dj.departments ? dj.departments : (dj && dj.data && dj.data.departments ? dj.data.departments : null);
+                const depts = Array.isArray(dj) ? dj : (dj && Array.isArray(dj.data) ? dj.data : null);
                 if (Array.isArray(depts)) {
                   const found = depts.find(dd => String(dd.dept_id) === String(profileData.dept_id));
                   if (found) setProfileData(p => ({ ...(p||{}), dept_name: found.dept_name }));
@@ -787,7 +999,7 @@ export default function Navbar() {
         }
         const uid = user && (user.user_id || user.id || user.userId) ? (user.user_id || user.id || user.userId) : null;
         if (!uid) return;
-        const res = await fetch(buildServerPhpUrl(`user_profile.php?user_id=${uid}`), { headers: getAuthHeaders() });
+        const res = await fetch(buildIndexApiUrl(`user-profile?user_id=${uid}`), { credentials: 'include', headers: getAuthHeaders() });
         if (!res.ok) return;
         const j = await res.json();
         if (j && j.user) {
@@ -795,10 +1007,10 @@ export default function Navbar() {
           // If server didn't include dept_name, attempt to resolve it from departments API
           if ((!userProfile.dept_name || userProfile.dept_name === '') && userProfile.dept_id) {
             try {
-              const dres = await fetch(buildServerPhpUrl('dashboard.php'), { headers: getAuthHeaders() });
+              const dres = await fetch(buildIndexApiUrl('departments'), { credentials: 'include', headers: getAuthHeaders() });
               if (dres.ok) {
                 const dj = await dres.json();
-                const depts = dj && dj.departments ? dj.departments : (dj && dj.data && dj.data.departments ? dj.data.departments : null);
+                const depts = Array.isArray(dj) ? dj : (dj && Array.isArray(dj.data) ? dj.data : null);
                 if (Array.isArray(depts)) {
                   const found = depts.find(dd => String(dd.dept_id) === String(userProfile.dept_id));
                   if (found) userProfile.dept_name = found.dept_name;
@@ -812,23 +1024,58 @@ export default function Navbar() {
     })();
   };
 
+  const handleProfileAvatarChange = (event) => {
+    const file = event.target.files && event.target.files[0] ? event.target.files[0] : null;
+    setProfileAvatarError('');
+    if (!file) return;
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!allowedTypes.includes(file.type)) {
+      setProfileAvatarFile(null);
+      setProfileAvatarPreview('');
+      setProfileAvatarError('Choose a JPEG, PNG, or WebP image.');
+      event.target.value = '';
+      return;
+    }
+    if (file.size > 4000000) {
+      setProfileAvatarFile(null);
+      setProfileAvatarPreview('');
+      setProfileAvatarError('Profile photos must be 4 MB or smaller.');
+      event.target.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setProfileAvatarFile(file);
+      setProfileAvatarPreview(typeof reader.result === 'string' ? reader.result : '');
+    };
+    reader.onerror = () => {
+      setProfileAvatarFile(null);
+      setProfileAvatarPreview('');
+      setProfileAvatarError('This image could not be previewed. Please choose another file.');
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleSaveProfile = async () => {
     const uid = profileUserId;
     if (!uid) return alert('No user id');
     const contactNo = String(profileForm.contact_no || '').replace(/\D/g, '').slice(0, 11);
     const currentContactNo = String((profileData && profileData.contact_no) || '').replace(/\D/g, '').slice(0, 11);
-    if (contactNo === currentContactNo) {
+    const contactChanged = contactNo !== currentContactNo;
+    const avatarChanged = Boolean(profileAvatarFile);
+    if (!contactChanged && !avatarChanged) {
       return alert('No changes to save');
     }
-    if (contactNo && (!/^09\d+$/.test(contactNo) || contactNo.length !== 11)) {
+    if (contactChanged && contactNo && (!/^09\d+$/.test(contactNo) || contactNo.length !== 11)) {
       return alert('Contact number must be 11 digits and start with 09.');
     }
     const fd = new FormData();
     fd.append('user_id', String(uid));
-    fd.append('contact_no', contactNo);
+    if (contactChanged) fd.append('contact_no', contactNo);
+    if (avatarChanged) fd.append('avatar', profileAvatarFile);
     setUploading(true);
     try {
-      const res = await fetch(buildServerPhpUrl('user_profile.php'), { method: 'POST', headers: getAuthHeaders(), body: fd });
+      const res = await fetch(buildIndexApiUrl('user-profile'), { method: 'POST', credentials: 'include', headers: getAuthHeaders(), body: fd });
       const j = await res.json();
       if (res.ok && j && j.ok) {
         applyProfileUpdate(j.user || profileData);
@@ -839,22 +1086,73 @@ export default function Navbar() {
               toast: true,
               position: 'top-end',
               icon: 'success',
-              title: 'Contact number updated',
+              title: avatarChanged ? (contactChanged ? 'Profile updated' : 'Profile photo updated') : 'Contact number updated',
               showConfirmButton: false,
               timer: 1500,
               timerProgressBar: true
             });
           } else {
-            alert('Contact number updated');
+            alert(avatarChanged ? 'Profile photo updated' : 'Contact number updated');
           }
-        } catch (e) { try { alert('Contact number updated'); } catch (e) {} }
+        } catch (e) { try { alert(avatarChanged ? 'Profile photo updated' : 'Contact number updated'); } catch (e) {} }
         resetProfileEditor();
         setProfileOpen(false);
-      } else { alert((j && (j.error || j.message)) || 'Profile update failed'); }
+      } else {
+        const errorMsg = (j && (j.error || j.message)) || 'Profile update failed';
+        if (j && j.error === 'contact_no_in_use') {
+          alert('This contact number is already in use by another user. Please use a different number.');
+        } else {
+          alert(errorMsg);
+        }
+      }
     } catch (e) { console.error(e); alert('Profile update failed'); } finally { setUploading(false); }
   };
 
   const avatarSrc = (profileData && profileData.avatar) || (user && (user.avatar || user.image)) || unknownImg;
+  const normalizedProfileContact = String(profileForm.contact_no || '').replace(/\D/g, '').slice(0, 11);
+  const savedProfileContact = String((profileData && profileData.contact_no) || '').replace(/\D/g, '').slice(0, 11);
+  const profileContactDirty = normalizedProfileContact !== savedProfileContact;
+  const profileContactValid = normalizedProfileContact === '' || /^09\d{9}$/.test(normalizedProfileContact);
+  const profileContactError = profileContactDirty && normalizedProfileContact && !profileContactValid
+    ? 'Enter an 11-digit mobile number beginning with 09.'
+    : '';
+
+  // Real-time contact number availability check
+  const [profileContactAvailability, setProfileContactAvailability] = React.useState(null);
+  const profileContactCheckTimer = React.useRef(null);
+  React.useEffect(() => {
+    if (profileContactCheckTimer.current) {
+      clearTimeout(profileContactCheckTimer.current);
+    }
+    const digits = String(profileForm.contact_no || '').replace(/\D/g, '').slice(0, 11);
+    if (digits.length === 11 && /^09\d{9}$/.test(digits) && profileContactDirty) {
+      setProfileContactAvailability(null);
+      profileContactCheckTimer.current = setTimeout(async () => {
+        try {
+          const uid = profileUserId || 0;
+          const res = await fetch(buildIndexApiUrl(`check-contact?contact_no=${encodeURIComponent(digits)}&exclude_user_id=${uid}`), { credentials: 'include', headers: getAuthHeaders() });
+          const data = await res.json();
+          if (data && data.checked) {
+            setProfileContactAvailability(data.available);
+          }
+        } catch (e) {
+          console.warn('Contact availability check failed', e);
+        }
+      }, 500);
+    } else {
+      setProfileContactAvailability(null);
+    }
+    return () => {
+      if (profileContactCheckTimer.current) clearTimeout(profileContactCheckTimer.current);
+    };
+  }, [profileForm.contact_no, profileContactDirty]);
+  const hasProfileChange = (canEditProfileContact && profileContactDirty) || (canEditProfileAvatar && Boolean(profileAvatarFile));
+  const canSaveProfile = hasProfileChange && (!profileContactDirty || profileContactValid) && !profileAvatarError && !uploading;
+  const closeProfileModal = () => {
+    resetProfileEditor();
+    setProfileDetailsOpen(false);
+    setProfileOpen(false);
+  };
 
   // --- 4. RENDER WITH TAILWIND ---
 
@@ -875,20 +1173,119 @@ export default function Navbar() {
           </button>
 
           {/* Logo next to the burger */}
-          <img src="cdoc-logo.png" alt="logo" className="w-9 h-9 rounded-md object-cover" />
+          <img src="cdoc-logo.webp?v=lossless-20260911" alt="logo" className="w-9 h-9 rounded-md object-cover" />
         </div>
 
-        {/* Center: Title */}
-        <div className="flex-1 flex items-center justify-center pointer-events-none">
-          <div className="text-center">
-            <div className="text-xs text-white/80 mt-0.5"><span className="font-medium">{user?.role_name || 'Panel'}</span></div>
+        {/* Compact desktop page search, aligned beside the logo. */}
+        {user ? (
+          <div className="relative ml-4 mr-auto hidden w-72 flex-none sm:block lg:w-80" ref={desktopNavigationSearchRef}>
+            <label className="relative block">
+              <span className="sr-only">Search navigation</span>
+              <svg className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/75" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input
+                type="text"
+                value={navigationSearch}
+                onFocus={() => setNavigationSearchOpen(true)}
+                onChange={(event) => {
+                  setNavigationSearch(event.target.value);
+                  setNavigationSearchIndex(0);
+                  setNavigationSearchOpen(true);
+                }}
+                onKeyDown={handleNavigationSearchKeyDown}
+                placeholder="Search pages..."
+                autoComplete="off"
+                aria-label="Search pages"
+                aria-expanded={navigationSearchOpen && Boolean(normalizedNavigationSearch)}
+                className="h-10 w-full rounded-xl border border-white/20 bg-white/10 pl-9 pr-8 text-sm text-white outline-none placeholder:text-white/70 transition focus:border-white/50 focus:bg-white/15 focus:ring-2 focus:ring-white/20"
+              />
+              {navigationSearch ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNavigationSearch('');
+                    setNavigationSearchIndex(0);
+                    setNavigationSearchOpen(false);
+                  }}
+                  className="absolute right-2 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded-full text-white/80 hover:bg-white/15 hover:text-white"
+                  aria-label="Clear navigation search"
+                >
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              ) : null}
+            </label>
+            {renderNavigationSearchResults(false)}
           </div>
-        </div>
+        ) : (
+          <div className="flex-1" aria-hidden="true"></div>
+        )}
 
         {/* Right: Actions */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-4">
           {user ? (
             <>
+              {/* Mobile navigation search opens below the fixed header. */}
+              <div className="relative sm:hidden" ref={mobileNavigationSearchRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNavigationSearchOpen((open) => !open);
+                    setNavigationSearchIndex(0);
+                    setNotificationOpen(false);
+                    setMenuOpen(false);
+                  }}
+                  className={`grid h-10 w-10 place-items-center rounded-full transition ${navigationSearchOpen ? 'bg-white text-emerald-700' : 'bg-white/6 text-white hover:bg-white/10'}`}
+                  aria-label="Search navigation"
+                  aria-expanded={navigationSearchOpen}
+                >
+                  <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="m20 20-3.5-3.5" />
+                  </svg>
+                </button>
+
+                {navigationSearchOpen ? (
+                  <div className="fixed left-2 right-2 top-[4.5rem] z-[70] rounded-xl border border-gray-200 bg-white p-2 text-gray-800 shadow-2xl">
+                    <label className="relative block">
+                      <span className="sr-only">Search navigation</span>
+                      <svg className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                        <circle cx="11" cy="11" r="7" />
+                        <path d="m20 20-3.5-3.5" />
+                      </svg>
+                      <input
+                        type="text"
+                        value={navigationSearch}
+                        autoFocus
+                        onChange={(event) => {
+                          setNavigationSearch(event.target.value);
+                          setNavigationSearchIndex(0);
+                        }}
+                        onKeyDown={handleNavigationSearchKeyDown}
+                        placeholder="Search pages..."
+                        autoComplete="off"
+                        aria-label="Search pages"
+                        className="h-11 w-full rounded-lg border border-gray-300 bg-white pl-9 pr-9 text-base text-gray-800 outline-none placeholder:text-gray-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                      />
+                      {navigationSearch ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNavigationSearch('');
+                            setNavigationSearchIndex(0);
+                          }}
+                          className="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-full text-gray-500 hover:bg-gray-100 hover:text-gray-800"
+                          aria-label="Clear navigation search"
+                        >
+                          <span aria-hidden="true">&times;</span>
+                        </button>
+                      ) : null}
+                    </label>
+                    {renderNavigationSearchResults(true)}
+                  </div>
+                ) : null}
+              </div>
                             {/* Notification Bell + Dropdown Panel */}
               <div className="relative" ref={notificationPanelRef}>
                 <button
@@ -942,6 +1339,40 @@ export default function Navbar() {
                       ) : null}
                     </div>
 
+                    <div className="flex items-center justify-between gap-3 border-b border-gray-100 bg-emerald-50/70 px-3 py-2.5">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-gray-800">
+                          <i className={`bi ${navPushStatus.enabled ? 'bi-bell-fill text-emerald-600' : 'bi-bell text-gray-500'}`}></i>
+                          Background alerts
+                        </div>
+                        <div className={`mt-0.5 truncate text-[10px] ${navPushMessage && !navPushStatus.enabled ? 'text-amber-700' : 'text-gray-500'}`} title={navPushMessage || ''}>
+                          {navPushMessage || (navPushStatus.enabled ? 'Enabled on this device' : navPushStatus.supported ? 'Receive alerts outside this page' : 'Unavailable in this browser')}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={toggleNavBackgroundAlerts}
+                        disabled={navPushActioning || !navPushStatus.supported}
+                        className={`inline-flex min-w-[72px] flex-none items-center justify-center rounded-lg px-3 py-1.5 text-[11px] font-bold transition disabled:cursor-not-allowed disabled:opacity-60 ${navPushStatus.enabled ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'border border-gray-200 bg-white text-gray-700 hover:bg-gray-50'}`}
+                      >
+                        {navPushActioning ? 'Updating…' : navPushStatus.enabled ? 'On' : 'Enable'}
+                      </button>
+                    </div>
+
+                    <div className="border-b border-gray-100 bg-white px-3 py-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNotificationOpen(false);
+                          window.location.hash = '#/notifications';
+                        }}
+                        className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700 transition hover:bg-emerald-100"
+                      >
+                        <i className="bi bi-list-ul" aria-hidden="true"></i>
+                        Show all
+                      </button>
+                    </div>
+
                     <div className="px-3 py-2 border-b border-gray-100 bg-gray-50">
                       <div className="inline-flex rounded-md border border-gray-200 overflow-hidden">
                         <button
@@ -963,7 +1394,7 @@ export default function Navbar() {
 
                     <div className={filteredNotifications.length >= 3 ? 'max-h-64 overflow-y-scroll' : 'overflow-y-visible'}>
                       {notificationsLoading ? (
-                        <div className="px-4 py-5 text-sm text-gray-500">Loading notifications...</div>
+                        <LoadingState label="Loading notifications..." compact />
                       ) : filteredNotifications.length === 0 ? (
                         <div className="px-4 py-5 text-sm text-gray-500">
                           {notificationFilter === 'unread' ? 'No unread notifications.' : 'No notifications yet.'}
@@ -1050,21 +1481,32 @@ export default function Navbar() {
                 )}
               </div>
 
-              {/* Avatar & Menu (preserve existing behavior) */}
+              {/* Profile identity + existing overflow menu */}
               <div className="relative flex items-center gap-2">
-                <img 
-                  src={avatarSrc} 
-                  alt="avatar" 
-                  className="w-9 h-9 rounded-full object-cover border-2 border-white/30 shadow-sm"
-                  onError={(e) => {
-                    if (e.currentTarget.dataset.fallbackApplied === '1') return;
-                    e.currentTarget.dataset.fallbackApplied = '1';
-                    e.currentTarget.src = unknownImg;
-                  }}
-                />
+                <button
+                  type="button"
+                  onClick={openProfile}
+                  className="group inline-flex min-w-0 items-center gap-2 rounded-full bg-white/5 py-1 pl-1 pr-2.5 text-left transition-colors hover:bg-white/12 focus:outline-none focus:ring-2 focus:ring-white/35"
+                  aria-label={navFirstNameLabel ? `Open My Profile. ${navFirstNameLabel}` : 'Open My Profile'}
+                  title="Open My Profile"
+                >
+                  <img
+                    src={avatarSrc}
+                    alt=""
+                    className="w-9 h-9 flex-none rounded-full object-cover border-2 border-white/30 shadow-sm"
+                    onError={(e) => {
+                      if (e.currentTarget.dataset.fallbackApplied === '1') return;
+                      e.currentTarget.dataset.fallbackApplied = '1';
+                      e.currentTarget.src = unknownImg;
+                    }}
+                  />
+                  <span className="hidden max-w-[150px] truncate text-sm font-semibold text-white sm:block">{navFirstNameLabel}</span>
+                </button>
                 <button 
                   onClick={() => setMenuOpen(!menuOpen)} 
                   className="w-8 h-8 rounded-full bg-white/8 hover:bg-white/12 flex flex-col items-center justify-center gap-1 transition-colors"
+                  aria-label="Open account menu"
+                  aria-expanded={menuOpen}
                 >
                   <span className="w-1 h-1 bg-white rounded-full"></span>
                   <span className="w-1 h-1 bg-white rounded-full"></span>
@@ -1179,125 +1621,171 @@ export default function Navbar() {
       )}
 
       {/* PROFILE MODAL */}
-      {profileOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-white w-full max-w-xl rounded-xl shadow-2xl overflow-hidden transform transition-all duration-300 ease-out scale-100 motion-safe:animate-fade-in-up">
-            <div className="bg-green-600 px-6 py-4 flex justify-between items-center">
-              <h3 className="text-white font-bold text-lg">My Profile</h3>
-              <button onClick={() => { resetProfileEditor(); setProfileOpen(false); }} className="text-white/90 hover:text-white font-bold text-xl">&times;</button>
+      <Modal
+        show={profileOpen}
+        title="My Profile"
+        description="Review your account information and keep your contact number current."
+        size="md"
+        className="profile-modal"
+        onClose={closeProfileModal}
+        headerIcon={(
+          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6.75a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.5 20.25a7.5 7.5 0 0115 0" />
+          </svg>
+        )}
+        footer={(
+          <>
+            <button
+              type="button"
+              onClick={closeProfileModal}
+              className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-200"
+            >
+              Close
+            </button>
+            {canEditProfileContact ? (
+              <button
+                type="button"
+                onClick={handleSaveProfile}
+                disabled={!canSaveProfile}
+                className={`inline-flex min-w-[132px] items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold text-white transition-colors focus:outline-none focus:ring-2 focus:ring-green-200 ${canSaveProfile ? 'bg-green-600 hover:bg-green-700' : 'cursor-not-allowed bg-gray-300'}`}
+              >
+                {uploading ? (
+                  <svg className="h-4 w-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+                ) : null}
+                {uploading ? 'Saving...' : 'Save Changes'}
+              </button>
+            ) : null}
+          </>
+        )}
+      >
+        <div className="profile-modal-content grid grid-cols-1 items-start gap-[20px] md:grid-cols-5">
+          <div className="profile-modal-summary rounded-2xl border border-emerald-100 bg-emerald-50/50 p-[20px] text-center md:col-span-2">
+            <div className="profile-modal-avatar relative mx-auto h-24 w-24 rounded-full bg-white p-[6px] shadow-sm ring-1 ring-emerald-100">
+              <img
+                src={profileAvatarPreview || (profileData && profileData.avatar) || avatarSrc}
+                alt={`${`${profileForm.first_name || ''} ${profileForm.last_name || ''}`.trim() || 'User'} profile`}
+                className="h-full w-full rounded-full object-cover"
+                onError={(e) => {
+                  if (e.currentTarget.dataset.fallbackApplied === '1') return;
+                  e.currentTarget.dataset.fallbackApplied = '1';
+                  e.currentTarget.src = unknownImg;
+                }}
+              />
+              {canEditProfileAvatar ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => profileAvatarInputRef.current && profileAvatarInputRef.current.click()}
+                    className="absolute bottom-0 right-0 inline-flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-green-600 text-white shadow-md transition hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-200"
+                    aria-label="Choose a new profile photo"
+                    title="Change profile photo"
+                  >
+                    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M6.827 6.175A2.31 2.31 0 008.186 5.5h7.628a2.31 2.31 0 011.359.675l.58.58c.434.434 1.022.678 1.636.678A2.611 2.611 0 0122 10.044v6.345A2.611 2.611 0 0119.389 19H4.61A2.611 2.611 0 012 16.389v-6.345a2.611 2.611 0 012.611-2.611c.614 0 1.202-.244 1.636-.678l.58-.58z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 13a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" /></svg>
+                  </button>
+                  <input
+                    ref={profileAvatarInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    onChange={handleProfileAvatarChange}
+                    className="hidden"
+                    tabIndex={-1}
+                  />
+                </>
+              ) : null}
             </div>
 
-            <div className="p-6">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6">
-                <div className="flex-shrink-0 relative">
-                  <img
-                    src={(profileData && profileData.avatar) || avatarSrc}
-                    alt="avatar"
-                    className="w-28 h-28 rounded-full object-cover shadow-lg ring-2 ring-white transition-transform duration-200 hover:scale-105"
-                    onError={(e) => {
-                      if (e.currentTarget.dataset.fallbackApplied === '1') return;
-                      e.currentTarget.dataset.fallbackApplied = '1';
-                      e.currentTarget.src = unknownImg;
-                    }}
-                  />
+            <h3 className="profile-modal-name mt-[14px] break-words text-lg font-bold text-gray-900">
+              {`${profileForm.first_name || ''} ${profileForm.last_name || ''}`.trim() || 'My Profile'}
+            </h3>
+            <span className="profile-modal-role mt-[8px] inline-flex max-w-full items-center rounded-full border border-emerald-200 bg-white px-[12px] py-[4px] text-xs font-bold uppercase tracking-wide text-emerald-700">
+              {profileData && profileData.role_name ? profileData.role_name : (user && user.role_name ? user.role_name : 'N/A')}
+            </span>
+            {canEditProfileAvatar ? <div className="profile-modal-avatar-hint mt-[8px] text-xs font-medium text-green-700">Use the camera button to change your photo.</div> : null}
+            {profileAvatarError ? <div className="mt-[8px] text-xs font-semibold text-red-600" role="alert">{profileAvatarError}</div> : null}
 
+            <div className="profile-modal-meta mt-[18px] grid grid-cols-2 gap-[12px] border-t border-emerald-100 pt-[16px] text-left md:grid-cols-1">
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-gray-500">Department</div>
+                <div className="mt-[4px] break-words text-sm font-semibold text-gray-800">{profileData && profileData.dept_name ? profileData.dept_name : 'None assigned'}</div>
+              </div>
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-gray-500">School ID</div>
+                <div className="mt-[4px] break-all font-mono text-sm font-semibold text-gray-800">{profileData && profileData.id_number ? String(profileData.id_number) : 'N/A'}</div>
+              </div>
+            </div>
+
+            <div className="profile-modal-summary-note mt-[18px] rounded-xl border border-emerald-100 bg-white/80 px-[12px] py-[10px] text-left text-xs leading-5 text-emerald-800">
+              {canEditProfileAvatar ? 'You can update your photo here. Other identity details are managed through User Management.' : 'Your photo and identity details are managed through User Management.'}
+            </div>
+          </div>
+
+          <div className="profile-modal-account min-w-0 md:col-span-3">
+            <div className="profile-modal-account-heading mb-4">
+              <h4 className="text-base font-bold text-gray-900">Account information</h4>
+              <p className="mt-[4px] text-sm text-gray-500">Your official details are shown below for reference.</p>
+            </div>
+
+            <button type="button" className="profile-modal-account-toggle" aria-expanded={profileDetailsOpen} aria-controls="profile-account-details" onClick={() => setProfileDetailsOpen((value) => !value)}>
+              <span><i className="bi bi-person-vcard" aria-hidden="true" />Account information</span>
+              <span>{profileDetailsOpen ? 'Hide' : 'Show'}<i className={`bi ${profileDetailsOpen ? 'bi-chevron-up' : 'bi-chevron-down'}`} aria-hidden="true" /></span>
+            </button>
+
+            <div id="profile-account-details" className={`profile-modal-account-content${profileDetailsOpen ? ' is-open' : ''}`}>
+            <div className="profile-modal-account-grid grid grid-cols-1 gap-[12px] sm:grid-cols-2">
+              <div className="profile-modal-info-card rounded-xl border border-gray-200 bg-gray-50 px-[16px] py-[12px]">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-gray-500">First name</div>
+                <div className="mt-[4px] break-words text-sm font-semibold text-gray-800">{profileForm.first_name || 'Not provided'}</div>
+              </div>
+              <div className="profile-modal-info-card rounded-xl border border-gray-200 bg-gray-50 px-[16px] py-[12px]">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-gray-500">Last name</div>
+                <div className="mt-[4px] break-words text-sm font-semibold text-gray-800">{profileForm.last_name || 'Not provided'}</div>
+              </div>
+              <div className="profile-modal-info-card is-wide rounded-xl border border-gray-200 bg-gray-50 px-[16px] py-[12px] sm:col-span-2">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-gray-500">Email address</div>
+                <div className="mt-[4px] break-all text-sm font-semibold text-gray-800">{profileForm.email || 'Not provided'}</div>
+              </div>
+            </div>
+
+            <div className="profile-modal-contact mt-[16px] rounded-2xl border border-green-200 bg-white p-[16px] shadow-sm">
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-lg bg-green-50 text-green-700">
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 002.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106a1.125 1.125 0 00-1.173.417l-.97 1.293a1.125 1.125 0 01-1.21.38 12.035 12.035 0 01-7.143-7.143 1.125 1.125 0 01.38-1.21l1.293-.97c.37-.278.534-.758.417-1.173L6.963 3.102A1.125 1.125 0 005.872 2.25H4.5A2.25 2.25 0 002.25 4.5v2.25z" /></svg>
                 </div>
-
-                <div className="flex-1 w-full">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <h4 className="text-xl font-semibold text-gray-800">{`${profileForm.first_name || ''} ${profileForm.last_name || ''}`.trim() || 'My Profile'}</h4>
-                      <div className="mt-1 text-sm text-gray-500">{profileForm.email || 'No email'}</div>
-                    </div>
-
-                    <div className="ml-4">
-                      <span className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-green-50 text-green-700 text-sm font-semibold">
-                        {profileData && profileData.role_name ? profileData.role_name : (user && user.role_name ? user.role_name : 'N/A')}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-700">
-                    <div className="bg-gray-50 p-3 rounded-lg border border-gray-100 transition-shadow hover:shadow-md">
-                      <div className="text-xs text-gray-500">Department</div>
-                      <div className="mt-1 font-medium text-gray-800">{profileData && profileData.dept_name ? profileData.dept_name : 'None'}</div>
-                    </div>
-
-                    <div className="bg-gray-50 p-3 rounded-lg border border-gray-100 transition-shadow hover:shadow-md">
-                      <div className="text-xs text-gray-500">ID Number</div>
-                      <div className="mt-1 font-medium text-gray-800">{profileData && profileData.id_number ? String(profileData.id_number) : 'N/A'}</div>
-                    </div>
-                  </div>
-
-                  <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-700">
-                    <label className="block">
-                      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">First Name</div>
-                      <input
-                        type="text"
-                        value={profileForm.first_name}
-                        readOnly
-                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
-                      />
-                    </label>
-
-                    <label className="block">
-                      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">Last Name</div>
-                      <input
-                        type="text"
-                        value={profileForm.last_name}
-                        readOnly
-                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
-                      />
-                    </label>
-
-                    <label className="block">
-                      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">Contact</div>
-                      <input
-                        type="text"
-                        value={profileForm.contact_no}
-                        onChange={(e) => {
-                          const digits = String(e.target.value || '').replace(/\D/g, '').slice(0, 11);
-                          setProfileForm((prev) => ({ ...prev, contact_no: digits }));
-                        }}
-                        placeholder="Optional"
-                        disabled={!canEditProfileContact}
-                        inputMode="numeric"
-                        maxLength={11}
-                        className={`w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-800 shadow-sm ${canEditProfileContact ? 'focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-100' : 'bg-gray-100 cursor-not-allowed'}`}
-                      />
-                    </label>
-
-                    <label className="block">
-                      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">Email</div>
-                      <input
-                        type="email"
-                        value={profileForm.email}
-                        readOnly
-                        className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-gray-700 shadow-sm cursor-not-allowed"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50/60 px-4 py-3 text-xs text-emerald-800">
-                    Only the contact number can be updated here. Name, email, avatar, department, role, and ID number stay managed by User Management.
-                  </div>
-
-                  <div className="mt-6 flex justify-end gap-3">
-                    <button onClick={() => { resetProfileEditor(); setProfileOpen(false); }} className="px-4 py-2 rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50">Close</button>
-                    {canEditProfileContact ? (
-                      <button onClick={handleSaveProfile} disabled={uploading} className={`px-4 py-2 rounded-md text-white font-semibold ${uploading ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}>
-                        {uploading ? (
-                          <svg className="animate-spin h-5 w-5 mx-auto text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
-                        ) : 'Save Changes'}
-                      </button>
-                    ) : null}
-                  </div>
+                <div className="min-w-0 flex-1">
+                  <label htmlFor="navbar-profile-contact" className="block text-sm font-bold text-gray-900">Contact number</label>
+                  <p className="mt-[2px] text-xs text-gray-500">Enter a new number below to enable Save Changes.</p>
                 </div>
               </div>
+              <input
+                id="navbar-profile-contact"
+                type="text"
+                value={profileForm.contact_no}
+                onChange={(e) => {
+                  const digits = String(e.target.value || '').replace(/\D/g, '').slice(0, 11);
+                  setProfileForm((prev) => ({ ...prev, contact_no: digits }));
+                }}
+                placeholder="09XXXXXXXXX"
+                disabled={!canEditProfileContact}
+                inputMode="numeric"
+                maxLength={11}
+                aria-invalid={Boolean(profileContactError)}
+                aria-describedby="navbar-profile-contact-help"
+                className={`mt-[14px] w-full rounded-xl border px-[16px] py-[10px] text-sm font-medium text-gray-900 outline-none transition ${profileContactError ? 'border-red-300 bg-red-50 focus:border-red-500 focus:ring-2 focus:ring-red-100' : 'border-gray-200 bg-white focus:border-green-500 focus:ring-2 focus:ring-green-100'} ${canEditProfileContact ? '' : 'cursor-not-allowed bg-gray-100'}`}
+              />
+              {profileContactAvailability !== null && profileContactDirty && profileContactValid && (
+                <div className={`mt-[8px] flex items-center gap-1.5 text-xs font-semibold ${profileContactAvailability ? 'text-green-600' : 'text-red-600'}`}>
+                  <span className={`inline-block w-2 h-2 rounded-full ${profileContactAvailability ? 'bg-green-500' : 'bg-red-500'}`}></span>
+                  {profileContactAvailability ? 'Available' : 'Already in use by another user'}
+                </div>
+              )}
+              <div id="navbar-profile-contact-help" className={`mt-[8px] text-xs ${profileContactError ? 'font-semibold text-red-600' : 'text-gray-500'}`}>
+                {profileContactError || (profileContactDirty && profileContactValid ? 'Valid number. Save Changes is now available.' : 'Use 11 digits beginning with 09, for example 09171234567.')}
+              </div>
+            </div>
             </div>
           </div>
         </div>
-      )}
+      </Modal>
     </>
   );
 }

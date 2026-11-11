@@ -5,9 +5,15 @@ import "./config.js";
 import "./services/api.js";
 
 import App from "./App.jsx";
+import { registerPushWorker } from './services/pushNotifications.js';
+import { installHtmlInputValidation } from './utils/htmlInputValidation.js';
 
-// Ensure styles load
-import "./styles/App.css";
+installHtmlInputValidation(document);
 
 const rootEl = document.getElementById('root');
 ReactDOM.render(React.createElement(App, null), rootEl);
+window.APP_RUNTIME_STARTED = true;
+
+registerPushWorker().catch(error => {
+  console.warn('[web_push] service worker registration unavailable', error);
+});

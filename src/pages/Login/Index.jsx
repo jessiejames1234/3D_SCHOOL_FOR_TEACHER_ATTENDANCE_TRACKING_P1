@@ -1,10 +1,16 @@
 import React from 'react';
 import { AuthContext } from "../../context/AuthContext.jsx";
+import { apiUrl } from '../../services/api.js';
+import { hasUnsafeHtmlInput } from '../../utils/htmlInputValidation.js';
+
+const INSTITUTIONAL_EMAIL_PATTERN = /^[^\s@]+@phinmaed\.com$/i;
+
 export default function LoginPage() {
   const { login } = React.useContext(AuthContext);
   const [loading, setLoading] = React.useState(false);
 
   const [form, setForm] = React.useState({ email: '', password: '' });
+  const [credentialsInvalid, setCredentialsInvalid] = React.useState(false);
   const [showPassword, setShowPassword] = React.useState(false);
   const [lockSecondsLeft, setLockSecondsLeft] = React.useState(0);
   const lockTimerRef = React.useRef(null);
@@ -70,7 +76,10 @@ export default function LoginPage() {
     }, 1000);
   };
 
-  const handleChange = (e) => setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
+  const handleChange = (e) => {
+    setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
+    if (credentialsInvalid) setCredentialsInvalid(false);
+  };
   
   const handleCaptchaChange = (e) => {
     // Only allow numbers
@@ -100,6 +109,22 @@ export default function LoginPage() {
       } catch (e) {}
       return;
     }
+    if (hasUnsafeHtmlInput(identifier)) return;
+    if (hasUnsafeHtmlInput(form.password)) return;
+
+    // School IDs remain valid login identifiers. If the user enters an email,
+    // provide immediate feedback before sending it to the server.
+    if (identifier.includes('@') && !INSTITUTIONAL_EMAIL_PATTERN.test(identifier)) {
+      try {
+        await Swal.fire({
+          icon: 'error',
+          title: 'Invalid Email Format',
+          text: 'Enter a valid @phinmaed.com email address or use your school ID number.',
+          confirmButtonColor: '#d33'
+        });
+      } catch (e) {}
+      return;
+    }
 
     // Validate Captcha
     const expected = captchaA + captchaB;
@@ -111,9 +136,10 @@ export default function LoginPage() {
 
     try {
       setLoading(true);
-      const loginUrl = (window.API_BASE ? window.API_BASE.replace(/\/+$/, '') + '/login' : '../server-php/index.php/api/login');
+      const loginUrl = apiUrl('login');
       const res = await fetch(loginUrl, { 
         method: 'POST', 
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' }, 
         body: JSON.stringify({ email: form.email, password: form.password }) 
       });
@@ -126,7 +152,13 @@ export default function LoginPage() {
         // Account locked (too many failed attempts)
         if (res.status === 429 && data && data.error === 'account_locked') {
           const secs = Number(data.remaining_seconds) || 30;
-          await Swal.fire({ icon: 'error', title: 'Account Locked', text: data.message || `Too many failed attempts. Try again in ${secs} seconds.`, confirmButtonColor: '#d33' });
+          setCredentialsInvalid(true);
+          await Swal.fire({
+            icon: 'error',
+            title: 'Too Many Login Attempts',
+            text: `Sign-in is temporarily unavailable due to repeated failed attempts. Please try again in ${secs} seconds.`,
+            confirmButtonColor: '#d33'
+          });
           startLockCountdown(secs);
           throw new Error('account_locked');
         }
@@ -139,7 +171,13 @@ export default function LoginPage() {
 
         // Invalid credentials with remaining attempts info
         if (res.status === 401 && data && typeof data.remaining_attempts === 'number') {
-          await Swal.fire({ icon: 'warning', title: 'Login Failed', text: `Invalid email / ID number or password. ${data.remaining_attempts} attempt(s) left.` });
+          setCredentialsInvalid(true);
+          await Swal.fire({
+            icon: 'error',
+            title: 'Invalid Credentials',
+            text: 'Invalid email/ID number or password.',
+            confirmButtonColor: '#d33'
+          });
           throw new Error('invalid_credentials');
         }
 
@@ -149,16 +187,22 @@ export default function LoginPage() {
         throw new Error(msg);
       }
       
-      if (!data || !data.token || !data.user) throw new Error('Invalid login response');
+      if (!data || !data.user || !data.session) throw new Error('Invalid login response');
       
-      login(data.user, data.token);
-      
-      try { 
-        const Toast = Swal.mixin({ toast: true, position: 'top-end', showConfirmButton: false, timer: 3000, timerProgressBar: true });
-        Toast.fire({ icon: 'success', title: 'Signed in successfully' });
-      } catch (e) { }
-      
-      window.location.hash = '#/home';
+      login(data.user, data.session);
+
+      if (Number(data.user?.is_first_login || 0) === 1) {
+        // Keep the authenticated but restricted session on the login screen.
+        // AppShell opens the mandatory password setup modal here, and the
+        // router permits /home only after that setup succeeds.
+        window.location.hash = '#/login';
+      } else {
+        try {
+          const Toast = Swal.mixin({ toast: true, position: 'top-end', showConfirmButton: false, timer: 3000, timerProgressBar: true });
+          Toast.fire({ icon: 'success', title: 'Signed in successfully' });
+        } catch (e) { }
+        window.location.hash = '#/home';
+      }
     } catch (err) {
       try {
         const message = String(err?.message || '').trim();
@@ -173,36 +217,25 @@ export default function LoginPage() {
     }
   };
 
-  const getApiBase = () => (window.API_BASE ? window.API_BASE.replace(/\/+$/, '') : '../server-php/index.php');
-
   const handleForgot = async (ev) => {
     ev && ev.preventDefault();
-    const { value: email } = await Swal.fire({ 
-      title: 'Forgot Password', 
-      input: 'email', 
-      inputLabel: 'Enter your email address', 
-      inputPlaceholder: 'email@example.com', 
-      showCancelButton: true 
-    }); 
-    if (!email) return;
     try {
       setLoading(true);
-      const url = `${getApiBase()}/api/forgot-password`;
-      const res = await fetch(url, { 
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
-        body: JSON.stringify({ email }) 
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Request failed');
-      let otpRequestedAtMs = Date.now();
+      let email = '';
+      let otpRequested = false;
+      let otpVerified = false;
+      let resetToken = '';
+      let resetExpiresAtMs = 0;
+      let verificationInFlight = false;
+      let otpRequestedAtMs = 0;
       const otpTtlSeconds = 2 * 60;
       const resendCooldownSeconds = 30;
-      let resendAvailableAtMs = Date.now() + resendCooldownSeconds * 1000;
+      let resendAvailableAtMs = 0;
       let resendInFlight = false;
       const getOtpRemainingSeconds = () => Math.max(
         0,
-        otpTtlSeconds - Math.floor((Date.now() - otpRequestedAtMs) / 1000)
+        otpVerified ? Math.ceil((resetExpiresAtMs - Date.now()) / 1000)
+          : (otpRequestedAtMs > 0 ? otpTtlSeconds - Math.floor((Date.now() - otpRequestedAtMs) / 1000) : 0)
       );
       const getResendRemainingSeconds = () => Math.max(
         0,
@@ -211,52 +244,79 @@ export default function LoginPage() {
       let otpCountdownInterval = null;
       let resendButtonEl = null;
       let resendClickHandler = null;
+      let sendCodeButtonEl = null;
+      let sendCodeClickHandler = null;
+      let emailInputEl = null;
+      let emailKeydownHandler = null;
 
-      let infoText = "If this email is registered, you'll receive a 6-digit code that expires in 2 minutes. You can resend a new code after 30 seconds.";
-      // In local/dev, backend may send debug_otp so you can test even if email is blocked.
-      if (data.debug_otp) {
-        infoText += ` (For local testing, your code is: ${data.debug_otp})`;
-      }
-
-      await Swal.fire({ 
-        icon: 'success', 
-        title: 'Check your email', 
-        text: infoText 
-      });
-      // Step 2: Enter OTP and new password
-      const safeEmail = String(email || '').replace(/[&<>"']/g, (ch) => (
-        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
-      ));
       const { value: formValues } = await Swal.fire({
         title: 'Reset Password',
         html: `
           <div class="reset-password-modal">
-            <p class="reset-subtitle">Enter the code sent to <span class="reset-email">${safeEmail}</span> (expires in 2 minutes)</p>
-            <div id="swal-otp-timer" class="reset-timer" aria-live="polite"></div>
-            <div class="reset-resend-row">
-              <button type="button" id="swal-resend-code" class="reset-resend-btn">Resend code</button>
-              <span id="swal-resend-hint" class="reset-resend-hint"></span>
+            <div id="swal-reset-email-stage">
+              <div class="reset-modal-intro">
+                <span class="reset-modal-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false"><path d="M4 5.5h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Zm0 2v.3l8 5.1 8-5.1v-.3H4Zm16 9v-6.3l-7.46 4.76a1 1 0 0 1-1.08 0L4 10.2v6.3h16Z"/></svg>
+                </span>
+                <div>
+                  <div class="reset-stage-title">Verify your account</div>
+                  <p class="reset-subtitle">Enter the email address registered to your account.</p>
+                </div>
+              </div>
+              <label class="reset-label" for="swal-reset-email">Email address</label>
+              <input id="swal-reset-email" type="email" class="swal2-input reset-input" placeholder="email@example.com" autocomplete="email">
+              <div class="reset-security-note">If this email is registered, a verification code will be sent.</div>
+              <button type="button" id="swal-send-reset-code" class="reset-resend-btn">Send verification code</button>
+              <div id="swal-email-hint" class="reset-resend-hint" aria-live="polite"></div>
             </div>
-            <label class="reset-label" for="swal-otp">Verification code</label>
-            <input id="swal-otp" class="swal2-input reset-input reset-otp" placeholder="6-digit code" maxlength="6" pattern="[0-9]*" inputmode="numeric">
-            <label class="reset-label" for="swal-password">New password</label>
-            <input id="swal-password" type="password" class="swal2-input reset-input" placeholder="Create a strong password">
-            <label class="reset-label" for="swal-confirm">Confirm new password</label>
-            <input id="swal-confirm" type="password" class="swal2-input reset-input" placeholder="Re-enter your new password">
-            <div class="reset-req-card">
-              <div class="reset-req-title">Password requirements</div>
-              <div class="reset-req-list">
-                <div id="pw-req-length" class="reset-req-item">At least 8 characters</div>
-                <div id="pw-req-letter" class="reset-req-item">Contains a letter (A-Z or a-z)</div>
-                <div id="pw-req-number" class="reset-req-item">Contains a number (0-9)</div>
-                <div id="pw-req-special" class="reset-req-item">Contains a special character</div>
-                <div id="pw-req-match" class="reset-req-item">Password confirmation matches</div>
+            <div id="swal-reset-code-stage" style="display:none">
+              <div class="reset-modal-intro reset-modal-intro-code">
+                <span class="reset-modal-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false"><path d="M17 8h-1V6a4 4 0 1 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V6Zm7 13H7v-9h10v9Zm-5-2a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg>
+                </span>
+                <div>
+                  <div id="swal-reset-stage-title" class="reset-stage-title">Verify your code</div>
+                  <p class="reset-subtitle">Enter the code sent to <span id="swal-reset-target-email" class="reset-email"></span>.</p>
+                </div>
+              </div>
+              <div class="reset-code-tools">
+                <div id="swal-otp-timer" class="reset-timer" aria-live="polite"></div>
+                <div class="reset-resend-row">
+                  <button type="button" id="swal-resend-code" class="reset-resend-btn">Resend code</button>
+                  <span id="swal-resend-hint" class="reset-resend-hint"></span>
+                </div>
+              </div>
+              <div id="swal-reset-otp-fields">
+              <label class="reset-label" for="swal-otp">Verification code</label>
+              <input id="swal-otp" class="swal2-input reset-input reset-otp" placeholder="6-digit code" maxlength="6" pattern="[0-9]*" inputmode="numeric">
+              </div>
+              <div id="swal-reset-password-stage" style="display:none">
+              <label class="reset-label" for="swal-password">New password</label>
+              <div class="reset-password-field">
+                <input id="swal-password" type="password" class="swal2-input reset-input" placeholder="Create a strong password" autocomplete="new-password">
+                <button type="button" class="reset-password-toggle" data-reset-toggle="swal-password" aria-label="Show new password" aria-pressed="false"><i class="bi bi-eye-slash" aria-hidden="true"></i></button>
+              </div>
+              <label class="reset-label" for="swal-confirm">Confirm new password</label>
+              <div class="reset-password-field">
+                <input id="swal-confirm" type="password" class="swal2-input reset-input" placeholder="Re-enter your new password" autocomplete="new-password">
+                <button type="button" class="reset-password-toggle" data-reset-toggle="swal-confirm" aria-label="Show password confirmation" aria-pressed="false"><i class="bi bi-eye-slash" aria-hidden="true"></i></button>
+              </div>
+              <div class="reset-req-card">
+                <div class="reset-req-title">Password requirements</div>
+                <div class="reset-req-list">
+                  <div id="pw-req-length" class="reset-req-item">At least 8 characters</div>
+                  <div id="pw-req-letter" class="reset-req-item">Contains a letter (A-Z or a-z)</div>
+                  <div id="pw-req-number" class="reset-req-item">Contains a number (0-9)</div>
+                  <div id="pw-req-special" class="reset-req-item">Contains a special character</div>
+                  <div id="pw-req-match" class="reset-req-item">Password confirmation matches</div>
+                </div>
+              </div>
               </div>
             </div>
           </div>
         `,
         showCancelButton: true,
-        confirmButtonText: 'Set new password',
+        confirmButtonText: 'Verify code',
         customClass: {
           popup: 'login-reset-modal-popup',
           title: 'login-reset-modal-title',
@@ -265,8 +325,15 @@ export default function LoginPage() {
           validationMessage: 'login-reset-modal-validation'
         },
         buttonsStyling: false,
+        showLoaderOnConfirm: true,
         focusConfirm: false,
         didOpen: () => {
+          const emailStageEl = document.getElementById('swal-reset-email-stage');
+          const codeStageEl = document.getElementById('swal-reset-code-stage');
+          emailInputEl = document.getElementById('swal-reset-email');
+          sendCodeButtonEl = document.getElementById('swal-send-reset-code');
+          const emailHintEl = document.getElementById('swal-email-hint');
+          const targetEmailEl = document.getElementById('swal-reset-target-email');
           const timerEl = document.getElementById('swal-otp-timer');
           resendButtonEl = document.getElementById('swal-resend-code');
           const resendHintEl = document.getElementById('swal-resend-hint');
@@ -279,6 +346,29 @@ export default function LoginPage() {
           const reqSpecial = document.getElementById('pw-req-special');
           const reqMatch = document.getElementById('pw-req-match');
           const confirmButton = Swal.getConfirmButton ? Swal.getConfirmButton() : null;
+          document.querySelectorAll('[data-reset-toggle]').forEach(button => {
+            button.addEventListener('click', () => {
+              const input = document.getElementById(button.dataset.resetToggle);
+              if (!input) return;
+              const visible = input.type === 'password';
+              input.type = visible ? 'text' : 'password';
+              button.setAttribute('aria-pressed', String(visible));
+              const label = input.id === 'swal-password' ? 'new password' : 'password confirmation';
+              button.setAttribute('aria-label', `${visible ? 'Hide' : 'Show'} ${label}`);
+              button.querySelector('i').className = `bi ${visible ? 'bi-eye' : 'bi-eye-slash'}`;
+            });
+          });
+          if (confirmButton) {
+            confirmButton.style.display = 'none';
+            confirmButton.disabled = true;
+          }
+          const setEmailHint = (text, type = 'neutral') => {
+            if (!emailHintEl) return;
+            emailHintEl.textContent = text || '';
+            emailHintEl.classList.remove('is-success', 'is-error');
+            if (type === 'success') emailHintEl.classList.add('is-success');
+            if (type === 'error') emailHintEl.classList.add('is-error');
+          };
           const setResendHint = (text, type = 'neutral') => {
             if (!resendHintEl) return;
             resendHintEl.textContent = text || '';
@@ -293,19 +383,23 @@ export default function LoginPage() {
             const ss = remaining % 60;
             if (timerEl) {
               if (remaining <= 0) {
-                timerEl.textContent = 'Code expired. Request a new code.';
+                timerEl.textContent = otpVerified ? 'Reset session expired. Request a new code.' : 'Code expired. Request a new code.';
                 timerEl.classList.add('is-expired');
               } else {
-                timerEl.textContent = `Code expires in ${mm}:${String(ss).padStart(2, '0')}`;
+                timerEl.textContent = `${otpVerified ? 'Complete your password reset within' : 'Code expires in'} ${mm}:${String(ss).padStart(2, '0')}`;
                 timerEl.classList.remove('is-expired');
               }
             }
-            if (confirmButton) confirmButton.disabled = remaining <= 0;
+            if (confirmButton) confirmButton.disabled = remaining <= 0 || verificationInFlight || resendInFlight;
           };
           const updateResendUi = () => {
             const remaining = getResendRemainingSeconds();
+            if (sendCodeButtonEl) {
+              sendCodeButtonEl.disabled = resendInFlight || remaining > 0;
+              sendCodeButtonEl.textContent = resendInFlight ? 'Sending...' : (remaining > 0 ? `Wait ${remaining}s` : 'Send verification code');
+            }
             if (resendButtonEl) {
-              resendButtonEl.disabled = resendInFlight || remaining > 0;
+              resendButtonEl.disabled = resendInFlight || verificationInFlight || remaining > 0;
               resendButtonEl.textContent = resendInFlight ? 'Sending...' : 'Resend code';
             }
             if (!resendInFlight) {
@@ -324,27 +418,93 @@ export default function LoginPage() {
               }
             }
           };
+          sendCodeClickHandler = async () => {
+            if (resendInFlight || verificationInFlight || getResendRemainingSeconds() > 0) return;
+            const candidate = String(emailInputEl?.value || '').trim();
+            if (hasUnsafeHtmlInput(candidate)) {
+              setEmailHint('HTML or script content is not allowed in this field.', 'error');
+              emailInputEl?.focus();
+              return;
+            }
+            if (!candidate || !emailInputEl?.checkValidity()) {
+              setEmailHint('Enter a valid email address.', 'error');
+              emailInputEl?.focus();
+              return;
+            }
+
+            resendInFlight = true;
+            if (sendCodeButtonEl) {
+              sendCodeButtonEl.disabled = true;
+              sendCodeButtonEl.textContent = 'Sending...';
+            }
+            setEmailHint('Sending a verification code...');
+            try {
+              const response = await fetch(apiUrl('forgot-password'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: candidate })
+              });
+              const responseData = await response.json().catch(() => ({}));
+              if (response.status === 429 && responseData.retry_after) {
+                resendAvailableAtMs = Date.now() + Number(responseData.retry_after) * 1000;
+              }
+              if (!response.ok) throw new Error(responseData.message || responseData.error || 'Failed to send verification code');
+
+              email = candidate;
+              otpRequested = true;
+              otpRequestedAtMs = Date.now();
+              resendAvailableAtMs = Date.now() + (Number(responseData.retry_after) || resendCooldownSeconds) * 1000;
+              if (targetEmailEl) targetEmailEl.textContent = email;
+              if (emailStageEl) emailStageEl.style.display = 'none';
+              if (codeStageEl) codeStageEl.style.display = '';
+              if (confirmButton) confirmButton.style.display = '';
+              setResendHint('If the email is registered, the verification code has been sent.', 'success');
+              updateOtpTimer();
+              updateResendUi();
+              otpInput?.focus();
+            } catch (error) {
+              setEmailHint(error?.message || 'Failed to send verification code. Please try again.', 'error');
+            } finally {
+              resendInFlight = false;
+              if (sendCodeButtonEl) {
+                sendCodeButtonEl.disabled = false;
+                sendCodeButtonEl.textContent = 'Send verification code';
+              }
+              updateResendUi();
+            }
+          };
           resendClickHandler = async () => {
-            if (resendInFlight || getResendRemainingSeconds() > 0) return;
+            if (resendInFlight || verificationInFlight || getResendRemainingSeconds() > 0) return;
             resendInFlight = true;
             updateResendUi();
             setResendHint('Sending a new code...');
             try {
-              const resendRes = await fetch(`${getApiBase()}/api/forgot-password`, {
+              const resendRes = await fetch(apiUrl('forgot-password'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email })
               });
               const resendData = await resendRes.json().catch(() => ({}));
-              if (!resendRes.ok) throw new Error(resendData.error || 'Failed to resend code');
-              otpRequestedAtMs = Date.now();
-              resendAvailableAtMs = Date.now() + resendCooldownSeconds * 1000;
-              if (resendData.debug_otp) {
-                setResendHint(`New code sent. Local testing code: ${resendData.debug_otp}`, 'success');
-              } else {
-                setResendHint('If the email is registered, a new code has been sent.', 'success');
+              if (resendRes.status === 429 && resendData.retry_after) {
+                resendAvailableAtMs = Date.now() + Number(resendData.retry_after) * 1000;
               }
+              if (!resendRes.ok) throw new Error(resendData.message || resendData.error || 'Failed to resend code');
+              otpVerified = false;
+              resetToken = '';
+              resetExpiresAtMs = 0;
+              if (otpInput) otpInput.value = '';
+              if (pwdInput) pwdInput.value = '';
+              if (confirmInput) confirmInput.value = '';
+              document.getElementById('swal-reset-otp-fields').style.display = '';
+              document.getElementById('swal-reset-password-stage').style.display = 'none';
+              document.getElementById('swal-reset-stage-title').textContent = 'Verify your code';
+              if (targetEmailEl) targetEmailEl.parentElement.firstChild.textContent = 'Enter the code sent to ';
+              if (confirmButton) confirmButton.textContent = 'Verify code';
+              otpRequestedAtMs = Date.now();
+              resendAvailableAtMs = Date.now() + (Number(resendData.retry_after) || resendCooldownSeconds) * 1000;
+              setResendHint('If the email is registered, a new code has been sent.', 'success');
               updateOtpTimer();
+              otpInput?.focus();
             } catch (error) {
               setResendHint(error?.message || 'Failed to resend code. Please try again.', 'error');
             } finally {
@@ -362,6 +522,16 @@ export default function LoginPage() {
           if (resendButtonEl && resendClickHandler) {
             resendButtonEl.addEventListener('click', resendClickHandler);
           }
+          if (sendCodeButtonEl && sendCodeClickHandler) {
+            sendCodeButtonEl.addEventListener('click', sendCodeClickHandler);
+          }
+          emailKeydownHandler = (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            sendCodeClickHandler?.();
+          };
+          emailInputEl?.addEventListener('keydown', emailKeydownHandler);
+          emailInputEl?.focus();
 
           if (otpInput) {
             otpInput.addEventListener('input', () => {
@@ -402,22 +572,64 @@ export default function LoginPage() {
           if (resendButtonEl && resendClickHandler) {
             resendButtonEl.removeEventListener('click', resendClickHandler);
           }
+          if (sendCodeButtonEl && sendCodeClickHandler) {
+            sendCodeButtonEl.removeEventListener('click', sendCodeClickHandler);
+          }
+          if (emailInputEl && emailKeydownHandler) {
+            emailInputEl.removeEventListener('keydown', emailKeydownHandler);
+          }
           resendButtonEl = null;
           resendClickHandler = null;
+          sendCodeButtonEl = null;
+          sendCodeClickHandler = null;
+          emailInputEl = null;
+          emailKeydownHandler = null;
         },
-        preConfirm: () => {
+        preConfirm: async () => {
+          if (verificationInFlight) return false;
+          if (!otpRequested) {
+            Swal.showValidationMessage('Send a verification code before setting a new password.');
+            return null;
+          }
           if (resendInFlight) {
             Swal.showValidationMessage('Please wait while the new code is being sent.');
             return null;
           }
           if (getOtpRemainingSeconds() <= 0) {
-            Swal.showValidationMessage('Code expired. Please request a new code.');
+            Swal.showValidationMessage(otpVerified ? 'Reset session expired. Please request a new code.' : 'Code expired. Please request a new code.');
             return null;
           }
           const otp = document.getElementById('swal-otp')?.value?.trim() || '';
+          if (!otpVerified) {
+            if (!/^[0-9]{6}$/.test(otp)) { Swal.showValidationMessage('Enter the 6-digit code from your email'); return false; }
+            verificationInFlight = true;
+            try {
+              const response = await fetch(apiUrl('reset-password'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, otp, action: 'verify_otp' })
+              });
+              const data = await response.json().catch(() => ({}));
+              if (!response.ok || !data.verified || !data.reset_token || !data.expires_at) throw new Error(data.message || data.error || 'Code verification failed');
+              otpVerified = true;
+              resetToken = data.reset_token;
+              resetExpiresAtMs = Number(data.expires_at) * 1000;
+              document.getElementById('swal-reset-otp-fields').style.display = 'none';
+              document.getElementById('swal-reset-password-stage').style.display = '';
+              document.getElementById('swal-reset-stage-title').textContent = 'Create a new password';
+              document.getElementById('swal-reset-target-email').parentElement.firstChild.textContent = 'Account verified: ';
+              Swal.getConfirmButton().textContent = 'Set new password';
+              document.getElementById('swal-password')?.focus();
+            } catch (error) {
+              Swal.showValidationMessage(error?.message || 'Code verification failed. Please try again.');
+            } finally {
+              verificationInFlight = false;
+            }
+            return false;
+          }
           const pwd = document.getElementById('swal-password')?.value || '';
           const confirm = document.getElementById('swal-confirm')?.value || '';
-          if (otp.length !== 6) { Swal.showValidationMessage('Enter the 6-digit code from your email'); return null; }
+          if (hasUnsafeHtmlInput(pwd) || hasUnsafeHtmlInput(confirm)) return null;
           const okLength = pwd.length >= 8;
           const okLetter = /[A-Za-z]/.test(pwd);
           const okNumber = /[0-9]/.test(pwd);
@@ -427,17 +639,25 @@ export default function LoginPage() {
             return null;
           }
           if (pwd !== confirm) { Swal.showValidationMessage('Passwords do not match'); return null; }
-          return { email, otp, new_password: pwd };
+          verificationInFlight = true;
+          try {
+            const response = await fetch(apiUrl('reset-password'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, reset_token: resetToken, new_password: pwd })
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.message || data.error || 'Reset failed');
+            return { reset: true };
+          } catch (error) {
+            Swal.showValidationMessage(error?.message || 'Reset failed. Please try again.');
+            return false;
+          } finally {
+            verificationInFlight = false;
+          }
         }
       });
       if (formValues) {
-        const res2 = await fetch(`${getApiBase()}/api/reset-password`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(formValues)
-        });
-        const data2 = await res2.json().catch(() => ({}));
-        if (!res2.ok) throw new Error(data2.error || 'Reset failed');
         await Swal.fire({ icon: 'success', title: 'Password reset', text: 'You can sign in with your new password.' });
       }
     } catch (err) {
@@ -447,6 +667,10 @@ export default function LoginPage() {
     }
   };
 
+  const trimmedIdentifier = String(form.email || '').trim();
+  const identifierHasUnsafeHtml = hasUnsafeHtmlInput(trimmedIdentifier);
+  const emailFormatInvalid = !identifierHasUnsafeHtml && trimmedIdentifier.includes('@') && !INSTITUTIONAL_EMAIL_PATTERN.test(trimmedIdentifier);
+
   return (
     <div className="container-fluid p-0 position-relative login-page-shell" style={{ minHeight: '100vh', overflowX: 'hidden' }}>
       <div className="row g-0 vh-100 login-main-row">
@@ -455,7 +679,7 @@ export default function LoginPage() {
         <div className="col-lg-6 d-flex flex-column justify-content-center align-items-center bg-transparent login-left-column" style={{ zIndex: 2 }}>
           <div className="text-center p-4 login-hero-panel login-logo-center mx-auto">
             {/* Main COC Seal */}
-            <img src="cdoc-logo.png" alt="COC Seal" className="img-fluid mb-3 login-seal" style={{ maxWidth: '280px' }} />            
+            <img src="cdoc-logo.webp?v=lossless-20260911" alt="COC Seal" className="img-fluid mb-3 login-seal" style={{ maxWidth: '280px' }} />            
             <h2 className="fw-bold text-dark mt-2" style={{ fontFamily: 'Times New Roman, serif', letterSpacing: '0.5px' }}>
               Cagayan De Oro College
             </h2>
@@ -498,10 +722,16 @@ export default function LoginPage() {
                       value={form.email} 
                       onChange={handleChange} 
                       type="text" 
-                      className="form-control login-input" 
+                      className={`form-control login-input ${(credentialsInvalid || identifierHasUnsafeHtml || emailFormatInvalid) ? 'is-invalid border-danger' : ''}`}
                       placeholder="Enter email or ID number" 
+                      aria-invalid={credentialsInvalid || identifierHasUnsafeHtml || emailFormatInvalid}
                       required 
                     />
+                    {emailFormatInvalid && (
+                      <div className="invalid-feedback">
+                        Enter a valid @phinmaed.com email address or use your school ID number.
+                      </div>
+                    )}
                   </div>
 
                   {/* Password */}
@@ -512,7 +742,7 @@ export default function LoginPage() {
                       value={form.password} 
                       onChange={handleChange} 
                       type={showPassword ? "text" : "password"} 
-                      className="form-control login-input" 
+                      className={`form-control login-input ${credentialsInvalid ? 'is-invalid border-danger' : ''}`}
                       placeholder="Enter Password" 
                       required 
                     />

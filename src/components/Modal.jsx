@@ -4,11 +4,14 @@ import React, { useEffect, useRef } from 'react';
 export default function Modal({
   show,
   title,
+  description = '',
+  headerIcon = null,
   size = 'md',
   onClose,
   children,
   closeOnBackdrop = true,
   footer = null,
+  className = '',
 }) {
   const dialogRef = useRef(null);
   const previouslyFocusedRef = useRef(null);
@@ -35,7 +38,7 @@ export default function Modal({
     const setInitialFocus = () => {
       const el = dialogRef.current;
       if (!el) return;
-      const focusable = el.querySelectorAll('a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])');
+      const focusable = el.querySelectorAll('a[href], button:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([type="hidden"]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])');
       if (focusable && focusable.length) {
         try { focusable[0].focus(); } catch (e) {}
       } else {
@@ -51,7 +54,7 @@ export default function Modal({
       } else if (e.key === 'Tab') {
         const el = dialogRef.current;
         if (!el) return;
-        const focusable = el.querySelectorAll('a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])');
+        const focusable = el.querySelectorAll('a[href], button:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([type="hidden"]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])');
         if (!focusable || focusable.length === 0) return;
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
@@ -79,7 +82,7 @@ export default function Modal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center px-4 sm:px-6"
+      className={`app-modal-root fixed inset-0 z-50 flex items-center justify-center px-3 py-3 sm:px-6 sm:py-6 ${className}`.trim()}
       role="dialog"
       aria-modal="true"
       aria-labelledby="modal-title"
@@ -87,12 +90,12 @@ export default function Modal({
       {/* Backdrop (click to close) */}
       <div
         onClick={(e) => { if (!closeOnBackdrop) return; if (onClose) onClose(); }}
-        className="absolute inset-0 bg-black/55 backdrop-blur-sm transition-opacity duration-300 z-40"
+        className="app-modal-backdrop absolute inset-0 bg-black/55 backdrop-blur-sm transition-opacity duration-300 z-40"
       />
 
       {/* Modal Panel */}
       <div
-        className={`${sizeClasses[size] || sizeClasses.md} w-full relative transform transition-all duration-300 ease-out will-change-transform z-50`}
+        className={`app-modal-shell ${sizeClasses[size] || sizeClasses.md} w-full relative transform transition-all duration-300 ease-out will-change-transform z-50`}
         style={{ zIndex: 60 }}
       >
         <div
@@ -100,16 +103,19 @@ export default function Modal({
           tabIndex={-1}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
-          className="mx-auto overflow-hidden rounded-2xl bg-white shadow-2xl border border-gray-100 transform transition-all duration-350 ease-out"
+          className="app-modal-panel mx-auto max-h-[calc(100vh-1.5rem)] overflow-hidden rounded-2xl bg-white shadow-2xl border border-gray-100 transform transition-all duration-350 ease-out sm:max-h-[calc(100vh-3rem)]"
           style={{ boxShadow: '0 10px 40px rgba(2,6,23,0.14)' }}
         >
 
           {/* Header */}
-          <div className="flex items-center justify-between gap-4 px-6 py-4 bg-gradient-to-b from-white to-gray-50 border-b border-gray-100">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-green-50 text-green-700 font-bold">{(title || '').charAt(0) || ''}</div>
-              <div>
-                <h2 id="modal-title" className="text-lg font-semibold text-gray-900">{title}</h2>
+          <div className="app-modal-header flex items-center justify-between gap-3 px-4 py-3 bg-gradient-to-b from-white to-gray-50 border-b border-gray-100 sm:gap-4 sm:px-[24px] sm:py-[16px]">
+            <div className="flex min-w-0 items-center gap-3 sm:gap-4">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-green-50 text-green-700 font-bold sm:h-10 sm:w-10">
+                {headerIcon || ((title || '').charAt(0) || '')}
+              </div>
+              <div className="min-w-0">
+                <h2 id="modal-title" className="break-words text-base font-semibold text-gray-900 sm:text-lg">{title}</h2>
+                {description ? <p className="mt-0.5 text-sm text-gray-500">{description}</p> : null}
               </div>
             </div>
 
@@ -127,7 +133,7 @@ export default function Modal({
           </div>
 
           {/* Body */}
-          <div className="p-6 max-h-[72vh] overflow-auto custom-scrollbar">
+          <div className="app-modal-body max-h-[calc(100vh-8rem)] overflow-auto p-4 custom-scrollbar sm:max-h-[72vh] sm:p-[24px]">
             <div className="motion-safe:animate-fade-slide-up">
               {children}
             </div>
@@ -135,7 +141,7 @@ export default function Modal({
 
           {/* Footer */}
           {footer ? (
-            <div className="flex items-center justify-end gap-3 px-6 py-4 bg-gray-50 border-t">
+            <div className="app-modal-footer flex items-center justify-end gap-3 px-[24px] py-[16px] bg-gray-50 border-t">
               {footer}
             </div>
           ) : null}

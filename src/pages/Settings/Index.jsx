@@ -4,26 +4,31 @@ import { apiGet, apiPut } from '../../services/api.js';
 import { MODULE_LABELS } from '../../utils/moduleAccess.js';
 import './Index.css';
 import LoginAttemptMonitor from './LoginAttemptMonitoring.jsx';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import { SecurityPolicyPanel, SettingsActivityPanel } from './AdminSettingsPanels.jsx';
+import LoadingState from '../../components/LoadingState.jsx';
+import UserStatusBadge, { normalizeUserStatus } from '../../components/UserStatusBadge.jsx';
 
-const ALLOWED_TARGET_ROLES_FOR_DEAN = new Set([3, 4, 5]);
 const MODULE_CATEGORY_ORDER = ['Attendance', 'Academic', 'Facility', 'Faculty Portal', 'Reports', 'Administration', 'Other'];
 const SETTINGS_LANDING_CARDS = [
   {
     id: 'module_access',
-    title: 'Module Access Matrix',
+    title: 'Module Access Settings',
     description: 'Manage module permissions per user and override role defaults when needed.',
     tag: 'Access Control',
     state: 'ready',
-    initials: 'MA',
+    icon: 'bi-person-gear',
+    group: 'Security & Access',
     cta: 'Open Module Access',
   },
   {
     id: 'home_content',
-    title: 'Home Text Customizer',
+    title: 'Home Content Settings',
     description: 'Customize the home page headline and preview its color before publishing.',
     tag: 'Home Page',
     state: 'ready',
-    initials: 'HT',
+    icon: 'bi-palette',
+    group: 'Appearance',
     cta: 'Customize Text',
   },
   {
@@ -31,17 +36,19 @@ const SETTINGS_LANDING_CARDS = [
     title: 'Locked Account',
     description: 'View and manage temporarily locked user accounts after failed login attempts.',
     tag: 'Security',
-    state: 'soon',
-    initials: 'LA',
-    cta: 'Coming Soon',
+    state: 'ready',
+    icon: 'bi-lock',
+    group: 'Security & Access',
+    cta: 'Manage Locked Accounts',
   },
   {
     id: 'change_password',
-    title: 'Change Password Account',
+    title: 'Password Reset Settings',
     description: 'Handle account password resets and forced password update policies.',
     tag: 'Security',
     state: 'ready',
-    initials: 'CP',
+    icon: 'bi-key',
+    group: 'Security & Access',
     cta: 'Open Password Reset',
   },
   {
@@ -50,27 +57,27 @@ const SETTINGS_LANDING_CARDS = [
     description: 'Track suspicious login spikes and failed authentication trends.',
     tag: 'Monitoring',
     state: 'ready',
-    initials: 'LM',
+    icon: 'bi-activity',
+    group: 'Monitoring & Audit',
     cta: 'Open Monitor',
   },
-  {
-    id: 'account_recovery',
-    title: 'Account Recovery Setup',
-    description: 'Configure account recovery flow for supported user roles.',
-    tag: 'Recovery',
-    state: 'soon',
-    initials: 'AR',
-    cta: 'Coming Soon',
-  },
+  { id:'settings_activity', title:'Settings Activity', description:'Review security-sensitive configuration and account actions.', tag:'Audit', state:'ready', icon:'bi-clock-history', group:'Monitoring & Audit', cta:'View Activity' },
   {
     id: 'security_policy',
     title: 'Security Policy Rules',
     description: 'Set password standards, lockout thresholds, and session controls.',
     tag: 'Policy',
-    state: 'soon',
-    initials: 'SP',
-    cta: 'Coming Soon',
+    state: 'ready',
+    icon: 'bi-shield-lock',
+    group: 'Security & Access',
+    cta: 'Configure Policy',
   },
+];
+
+const SETTINGS_GROUPS = [
+  { name: 'Security & Access', description: 'Accounts, permissions, passwords, and server-enforced protection.', icon: 'bi-shield-check' },
+  { name: 'Monitoring & Audit', description: 'Review sign-in activity and administrator actions.', icon: 'bi-graph-up-arrow' },
+  { name: 'Appearance', description: 'Control the content users see on the application home page.', icon: 'bi-brush' },
 ];
 
 const DEFAULT_HOME_TITLE = 'Welcome to COC Attendance WEB';
@@ -165,6 +172,7 @@ export default function GeneralSettingsIndex() {
   const isDean = roleId === 2;
   const isDepartmentAdmin = roleId === 6;
   const canManage = isAdmin || isDean || isDepartmentAdmin;
+  const canManageModuleAccess = isAdmin || isDepartmentAdmin;
   const [routePath, setRoutePath] = React.useState(window.location.hash.slice(1) || '/settings/system');
 
   const [managedUsers, setManagedUsers] = React.useState([]);
@@ -179,15 +187,30 @@ export default function GeneralSettingsIndex() {
   const [success, setSuccess] = React.useState('');
   const [moduleSearch, setModuleSearch] = React.useState('');
   const [schemaReady, setSchemaReady] = React.useState(true);
+  const [landingOverview, setLandingOverview] = React.useState({
+    loading: true,
+    login: null,
+    policy: null,
+    activity: [],
+    updatedAt: null,
+    error: '',
+  });
 
   const [targetInfo, setTargetInfo] = React.useState(null);
   const [roleDefaultModules, setRoleDefaultModules] = React.useState([]);
   const [manageableModules, setManageableModules] = React.useState([]);
   const [checkedModules, setCheckedModules] = React.useState([]);
-  const [homeSettingsLoading, setHomeSettingsLoading] = React.useState(false);
+  const loadedModulesRef = React.useRef([]);
+  const [copyAccessUserId, setCopyAccessUserId] = React.useState('');
+  const [homeSettingsLoading, setHomeSettingsLoading] = React.useState(true);
   const [homeSettingsSaving, setHomeSettingsSaving] = React.useState(false);
   const [homeTitleDraft, setHomeTitleDraft] = React.useState(DEFAULT_HOME_TITLE);
   const [homeTitleColorDraft, setHomeTitleColorDraft] = React.useState(DEFAULT_HOME_TITLE_COLOR);
+  const [homeScope, setHomeScope] = React.useState('global');
+  const [homeDepartments, setHomeDepartments] = React.useState([]);
+  const [loadedHomeScopeQuery, setLoadedHomeScopeQuery] = React.useState('');
+  const homeSettingsRequestRef = React.useRef(0);
+  const savedHomeSettingsRef = React.useRef({ title: DEFAULT_HOME_TITLE, color: DEFAULT_HOME_TITLE_COLOR });
   const homePreviewTitleStyle = React.useMemo(() => getHomeHeadlineStyle(
     homeTitleDraft || DEFAULT_HOME_TITLE,
     /^#[0-9a-fA-F]{6}$/.test(homeTitleColorDraft) ? homeTitleColorDraft : DEFAULT_HOME_TITLE_COLOR
@@ -205,12 +228,25 @@ export default function GeneralSettingsIndex() {
     return raw.startsWith('/') ? raw : `/${raw}`;
   }, [routePath]);
 
-  // Dean and Department Admin can ONLY access Home Content
-  const isRestrictedToHomeContent = (isDean || isDepartmentAdmin) && !isAdmin;
-  const isModuleAccessView = normalizedRoute.startsWith('/settings/module-access') && !isRestrictedToHomeContent;
-  const isHomeContentView = normalizedRoute.startsWith('/settings/home-content');
-  const isPasswordResetView = normalizedRoute.startsWith('/settings/change-password') && !isRestrictedToHomeContent;
-  const isLoginMonitorView = normalizedRoute.startsWith('/settings/login-monitor') && !isRestrictedToHomeContent;
+  const isHomeContentView = normalizedRoute.startsWith('/settings/home-content') && (isAdmin || isDepartmentAdmin);
+  const isModuleAccessView = normalizedRoute.startsWith('/settings/module-access') && canManageModuleAccess;
+  const isPasswordResetView = normalizedRoute.startsWith('/settings/change-password') && (isAdmin || isDepartmentAdmin);
+  const isLoginMonitorView = normalizedRoute.startsWith('/settings/login-monitor') && isAdmin;
+  const isLockedAccountView = normalizedRoute.startsWith('/settings/locked-account') && isAdmin;
+  const isSecurityPolicyView = normalizedRoute.startsWith('/settings/security-policy') && isAdmin;
+  const isSettingsActivityView = normalizedRoute.startsWith('/settings/activity') && isAdmin;
+  const isSettingsLandingView = !isModuleAccessView && !isHomeContentView && !isPasswordResetView
+    && !isLoginMonitorView && !isLockedAccountView && !isSecurityPolicyView
+    && !isSettingsActivityView;
+  const homeScopeQuery = isAdmin
+    ? (homeScope === 'global' ? '?scope=global' : `?dept_id=${encodeURIComponent(homeScope)}`)
+    : (user?.dept_id ? `?dept_id=${user.dept_id}` : '');
+  const homeSettingsPending = homeSettingsLoading || loadedHomeScopeQuery !== homeScopeQuery;
+
+  React.useEffect(() => {
+    if (!isAdmin || !isHomeContentView) return;
+    apiGet('departments').then((data) => setHomeDepartments(Array.isArray(data) ? data : [])).catch(() => setHomeDepartments([]));
+  }, [isAdmin, isHomeContentView]);
 
   const openModuleAccessView = React.useCallback(() => {
     window.location.hash = '#/settings/module-access';
@@ -224,12 +260,18 @@ export default function GeneralSettingsIndex() {
     window.location.hash = '#/settings/change-password';
   }, []);
 
-  // Redirect restricted users to home content if they're on a forbidden view
+  // Department Admin has exactly three scoped settings tools. Dean no longer
+  // manages Home Content and is returned to the application Home page.
   React.useEffect(() => {
-    if (isRestrictedToHomeContent && !isHomeContentView) {
-      openHomeContentView();
+    if (isDean && !isAdmin) {
+      window.location.hash = '#/home';
+      return;
     }
-  }, [isRestrictedToHomeContent, isHomeContentView, openHomeContentView]);
+    const isDepartmentAdminRoute = isHomeContentView || isModuleAccessView || isPasswordResetView || normalizedRoute.startsWith('/settings/system');
+    if (isDepartmentAdmin && !isAdmin && !isDepartmentAdminRoute) {
+      window.location.hash = '#/settings/system';
+    }
+  }, [isDean, isDepartmentAdmin, isAdmin, isHomeContentView, isModuleAccessView, isPasswordResetView, normalizedRoute]);
 
   const openSettingsHome = React.useCallback(() => {
     window.location.hash = '#/settings/system';
@@ -249,9 +291,12 @@ export default function GeneralSettingsIndex() {
       window.location.hash = '#/settings/login-monitor';
       return;
     }
+    if (card.id === 'locked_account') { window.location.hash = '#/settings/locked-account'; return; }
+    if (card.id === 'security_policy') { window.location.hash = '#/settings/security-policy'; return; }
+    if (card.id === 'settings_activity') { window.location.hash = '#/settings/activity'; return; }
     if (card.id === 'change_password') {
-      if (!isAdmin) {
-        const message = 'Only Admin can reset account passwords to default.';
+      if (!isAdmin && !isDepartmentAdmin) {
+        const message = 'Only Admin and Department Admin can reset account passwords.';
         try {
           if (window?.Swal) {
             await window.Swal.fire({ icon: 'warning', title: 'Admin Only', text: message });
@@ -284,15 +329,50 @@ export default function GeneralSettingsIndex() {
     if (typeof window !== 'undefined') {
       window.alert(message);
     }
-  }, [openModuleAccessView, openHomeContentView, openPasswordResetView, isAdmin]);
+  }, [openModuleAccessView, openHomeContentView, openPasswordResetView, isAdmin, isDepartmentAdmin]);
+
+  const loadLandingOverview = React.useCallback(async ({ silent = false } = {}) => {
+    if (!isAdmin || !isSettingsLandingView) return;
+    if (!silent) setLandingOverview((prev) => ({ ...prev, loading: true, error: '' }));
+
+    const [loginResult, policyResult, activityResult] = await Promise.allSettled([
+      apiGet('login-monitor?summary_only=1'),
+      apiGet('admin-settings/security-policy'),
+      apiGet('admin-settings/activity?page=1&page_size=3'),
+    ]);
+    const results = [loginResult, policyResult, activityResult];
+    const allFailed = results.every((result) => result.status === 'rejected');
+
+    setLandingOverview((prev) => ({
+      loading: false,
+      login: loginResult.status === 'fulfilled' ? loginResult.value : prev.login,
+      policy: policyResult.status === 'fulfilled' ? policyResult.value?.policy : prev.policy,
+      activity: activityResult.status === 'fulfilled' ? (activityResult.value?.rows || []).slice(0, 3) : prev.activity,
+      updatedAt: results.some((result) => result.status === 'fulfilled') ? new Date() : prev.updatedAt,
+      error: allFailed && !silent ? 'Live settings status is temporarily unavailable. All settings tools are still accessible.' : '',
+    }));
+  }, [isAdmin, isSettingsLandingView]);
+
+  React.useEffect(() => {
+    if (!isSettingsLandingView || !isAdmin) return;
+    loadLandingOverview().catch(() => {
+      setLandingOverview((prev) => ({ ...prev, loading: false, error: 'Live settings status is temporarily unavailable. All settings tools are still accessible.' }));
+    });
+  }, [isSettingsLandingView, isAdmin, loadLandingOverview]);
+
+  useAutoRefresh({
+    refresh: () => loadLandingOverview({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: Boolean(user) && isAdmin && isSettingsLandingView,
+  });
 
   const filteredManagedUsers = React.useMemo(() => {
     let list = Array.isArray(managedUsers) ? managedUsers.slice() : [];
-    if (isAdmin) {
+    if (isAdmin || isDepartmentAdmin) {
       list = list.filter((u) => Number(u?.role_id || 0) !== 1);
     }
-    if (isDean) {
-      list = list.filter((u) => ALLOWED_TARGET_ROLES_FOR_DEAN.has(Number(u?.role_id || 0)));
+    if (isDepartmentAdmin) {
+      list = list.filter((u) => String(u?.dept_id ?? '') === String(user?.dept_id ?? ''));
     }
     list.sort((a, b) => {
       const aName = `${a?.last_name || ''} ${a?.first_name || ''}`.trim().toLowerCase();
@@ -302,16 +382,18 @@ export default function GeneralSettingsIndex() {
       return Number(a?.user_id || 0) - Number(b?.user_id || 0);
     });
     return list;
-  }, [managedUsers, isAdmin, isDean]);
+  }, [managedUsers, isAdmin, isDepartmentAdmin, user?.dept_id]);
 
   React.useEffect(() => {
-    if (!canManage || (!isModuleAccessView && !isPasswordResetView)) return;
+    const canLoadModuleTargets = canManageModuleAccess && isModuleAccessView;
+    const canLoadPasswordTargets = (isAdmin || isDepartmentAdmin) && isPasswordResetView;
+    if (!canLoadModuleTargets && !canLoadPasswordTargets) return;
     let mounted = true;
     (async () => {
       setLoadingUsers(true);
       setError('');
       try {
-        const data = await apiGet('users');
+        const data = await apiGet(canLoadModuleTargets ? 'users?module_access_targets=1' : 'users?password_reset_targets=1');
         if (!mounted) return;
         setManagedUsers(Array.isArray(data) ? data : []);
       } catch (err) {
@@ -325,7 +407,7 @@ export default function GeneralSettingsIndex() {
     return () => {
       mounted = false;
     };
-  }, [canManage, isModuleAccessView, isPasswordResetView]);
+  }, [canManageModuleAccess, isAdmin, isModuleAccessView, isPasswordResetView]);
 
   React.useEffect(() => {
     if (!isModuleAccessView || !selectedUserId) return;
@@ -351,6 +433,7 @@ export default function GeneralSettingsIndex() {
         setRoleDefaultModules(defaults);
         setManageableModules(manageable);
         setCheckedModules(effective);
+        loadedModulesRef.current = effective;
       } catch (err) {
         if (!mounted) return;
         const message = err?.body?.message || err?.message || 'Failed to load module access.';
@@ -367,31 +450,61 @@ export default function GeneralSettingsIndex() {
   React.useEffect(() => {
     if (!canManage || !isHomeContentView) return;
     let mounted = true;
+    const requestId = ++homeSettingsRequestRef.current;
     (async () => {
       setHomeSettingsLoading(true);
       setError('');
       setSuccess('');
       try {
-        const deptId = user?.dept_id;
-        const query = deptId ? `?dept_id=${deptId}` : '';
-        const data = await apiGet(`app-settings/home${query}`);
-        if (!mounted) return;
+        const data = await apiGet(`app-settings/home${homeScopeQuery}`);
+        if (!mounted || requestId !== homeSettingsRequestRef.current) return;
         const title = String(data?.home_title || '').trim();
         const color = String(data?.home_title_color || '').trim();
-        setHomeTitleDraft(title || DEFAULT_HOME_TITLE);
-        setHomeTitleColorDraft(/^#[0-9a-fA-F]{6}$/.test(color) ? color : DEFAULT_HOME_TITLE_COLOR);
+        const nextTitle = title || DEFAULT_HOME_TITLE;
+        const nextColor = /^#[0-9a-fA-F]{6}$/.test(color) ? color : DEFAULT_HOME_TITLE_COLOR;
+        savedHomeSettingsRef.current = { title: nextTitle, color: nextColor };
+        setHomeTitleDraft(nextTitle);
+        setHomeTitleColorDraft(nextColor);
+        setLoadedHomeScopeQuery(homeScopeQuery);
       } catch (err) {
-        if (!mounted) return;
+        if (!mounted || requestId !== homeSettingsRequestRef.current) return;
         const message = err?.body?.message || err?.body?.error || err?.message || 'Failed to load home page settings.';
         setError(message);
       } finally {
-        if (mounted) setHomeSettingsLoading(false);
+        if (mounted && requestId === homeSettingsRequestRef.current) setHomeSettingsLoading(false);
       }
     })();
     return () => {
       mounted = false;
     };
-  }, [canManage, isHomeContentView, user?.dept_id]);
+  }, [canManage, isHomeContentView, user?.dept_id, homeScope]);
+
+  useAutoRefresh({
+    refresh: async () => {
+      if (((canManageModuleAccess && isModuleAccessView) || ((isAdmin || isDepartmentAdmin) && isPasswordResetView)) && !selectedUserId && !passwordResetUserId) {
+        const data = await apiGet(isModuleAccessView ? 'users?module_access_targets=1' : 'users?password_reset_targets=1');
+        setManagedUsers(Array.isArray(data) ? data : []);
+        return;
+      }
+      if (canManage && isHomeContentView) {
+        const saved = savedHomeSettingsRef.current;
+        const isDirty = homeTitleDraft !== saved.title || homeTitleColorDraft !== saved.color;
+        if (isDirty) return;
+        const requestId = ++homeSettingsRequestRef.current;
+        const data = await apiGet(`app-settings/home${homeScopeQuery}`);
+        if (requestId !== homeSettingsRequestRef.current) return;
+        const nextTitle = String(data?.home_title || '').trim() || DEFAULT_HOME_TITLE;
+        const rawColor = String(data?.home_title_color || '').trim();
+        const nextColor = /^#[0-9a-fA-F]{6}$/.test(rawColor) ? rawColor : DEFAULT_HOME_TITLE_COLOR;
+        savedHomeSettingsRef.current = { title: nextTitle, color: nextColor };
+        setHomeTitleDraft(nextTitle);
+        setHomeTitleColorDraft(nextColor);
+        setLoadedHomeScopeQuery(homeScopeQuery);
+      }
+    },
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: Boolean(user) && !saving && !homeSettingsSaving && !resettingPassword,
+  });
 
   React.useEffect(() => {
     setModuleSearch('');
@@ -399,6 +512,11 @@ export default function GeneralSettingsIndex() {
 
   const roleDefaultSet = React.useMemo(() => new Set(roleDefaultModules), [roleDefaultModules]);
   const checkedSet = React.useMemo(() => new Set(checkedModules), [checkedModules]);
+  const accessDirty = React.useMemo(() => JSON.stringify(sortUnique(checkedModules)) !== JSON.stringify(sortUnique(loadedModulesRef.current)), [checkedModules]);
+  React.useEffect(() => {
+    const warn=(event)=>{if(!accessDirty)return;event.preventDefault();event.returnValue='';};
+    window.addEventListener('beforeunload',warn); return()=>window.removeEventListener('beforeunload',warn);
+  },[accessDirty]);
   const draftMode = React.useMemo(() => {
     if (checkedModules.length !== roleDefaultModules.length) return 'custom';
     for (const key of checkedModules) {
@@ -543,6 +661,9 @@ export default function GeneralSettingsIndex() {
 
   const saveAccess = async () => {
     if (!selectedUserId) return;
+    const before=new Set(loadedModulesRef.current); const after=new Set(checkedModules);
+    const added=checkedModules.filter(key=>!before.has(key)); const removed=loadedModulesRef.current.filter(key=>!after.has(key));
+    if (window?.Swal) { const confirm=await window.Swal.fire({icon:'question',title:'Confirm Module Access',html:`<div class="text-start"><p><strong>${added.length}</strong> module(s) added</p><p><strong>${removed.length}</strong> module(s) removed</p><p class="mb-0">Server access changes immediately. The user menu refreshes on the next sign-in.</p></div>`,showCancelButton:true,confirmButtonText:'Save Changes'}); if(!confirm.isConfirmed)return; }
     setSaving(true);
     setError('');
     setSuccess('');
@@ -555,6 +676,7 @@ export default function GeneralSettingsIndex() {
       setRoleDefaultModules(defaults);
       setManageableModules(manageable);
       setCheckedModules(effective);
+      loadedModulesRef.current = effective;
       setSuccess('Module access updated successfully.');
       try {
         if (window?.Swal) {
@@ -569,6 +691,11 @@ export default function GeneralSettingsIndex() {
     } finally {
       setSaving(false);
     }
+  };
+
+  const copyModuleAccess = async () => {
+    if (!copyAccessUserId) return;
+    try { const data=await apiGet(`users/${copyAccessUserId}/module-access`); const source=sortUnique(data?.effective_modules); setCheckedModules(source.filter(key=>manageableModules.includes(key))); setSuccess('Permissions copied into the draft. Review and save to apply.'); } catch(err){setError(err?.body?.message||err.message);}
   };
 
   const resetHomeDraft = () => {
@@ -616,19 +743,21 @@ export default function GeneralSettingsIndex() {
     setError('');
     setSuccess('');
     try {
-      const deptId = user?.dept_id;
       const payload = {
         home_title: title,
         home_title_color: color,
       };
-      if (deptId) payload.dept_id = deptId;
+      if (isAdmin && homeScope === 'global') payload.scope = 'global';
+      else payload.dept_id = isAdmin ? Number(homeScope) : user?.dept_id;
       const data = await apiPut('app-settings/home', payload);
       const savedTitle = String(data?.home_title || title).trim() || DEFAULT_HOME_TITLE;
       const savedColor = /^#[0-9a-fA-F]{6}$/.test(String(data?.home_title_color || '').trim())
         ? String(data.home_title_color).trim()
         : color;
+      savedHomeSettingsRef.current = { title: savedTitle, color: savedColor };
       setHomeTitleDraft(savedTitle);
       setHomeTitleColorDraft(savedColor);
+      setLoadedHomeScopeQuery(homeScopeQuery);
       setSuccess('Home page text updated successfully.');
       try {
         window.dispatchEvent(new CustomEvent('app-settings-updated', { detail: { group: 'home' } }));
@@ -659,12 +788,12 @@ export default function GeneralSettingsIndex() {
 
   const resetPasswordToDefault = async () => {
     if (!passwordResetUserId || !passwordResetTarget) return;
-    const confirmText = `Reset ${passwordResetTargetLabel}'s password to the default and require a password change on next login?`;
+    const confirmText = `Email ${passwordResetTargetLabel}, send a random 6-character temporary password, revoke existing sessions, and require a password change?`;
     try {
       if (window?.Swal) {
         const confirm = await window.Swal.fire({
           icon: 'warning',
-          title: 'Reset Password To Default?',
+          title: 'Email Temporary Password?',
           text: confirmText,
           showCancelButton: true,
           confirmButtonText: 'Reset Password',
@@ -685,7 +814,7 @@ export default function GeneralSettingsIndex() {
     setSuccess('');
     try {
       const result = await apiPut(`users/${passwordResetUserId}/reset-default-password`, {});
-      const message = result?.message || 'Password reset to default. User must change password on next login.';
+      const message = result?.message || 'A random 6-character temporary password was emailed. The user must change it after signing in.';
       setSuccess(message);
       try {
         if (window?.Swal) {
@@ -711,6 +840,35 @@ export default function GeneralSettingsIndex() {
     }
   };
 
+  const lockedAccountCount = Number(landingOverview.login?.total_locked || 0);
+  const failedAttemptCount = Number(landingOverview.login?.total_failed_attempts || 0);
+  const maxLoginAttempts = Number(landingOverview.policy?.max_login_attempts || 10);
+  const idleTimeoutMinutes = Number(landingOverview.policy?.idle_timeout_minutes || 15);
+  const departmentAdminCardIds = new Set(['module_access', 'home_content', 'change_password']);
+  const visibleSettingsCards = isDepartmentAdmin && !isAdmin
+    ? SETTINGS_LANDING_CARDS.filter((card) => departmentAdminCardIds.has(card.id))
+    : SETTINGS_LANDING_CARDS;
+  const groupedSettingsCards = SETTINGS_GROUPS.map((group) => ({
+    ...group,
+    cards: visibleSettingsCards.filter((card) => card.group === group.name),
+  })).filter((group) => group.cards.length > 0);
+
+  const getLandingCardStatus = (card) => {
+    if (card.state !== 'ready') return { label: 'Coming Soon', tone: 'soon' };
+    if (card.id === 'locked_account') return { label: lockedAccountCount ? `${lockedAccountCount} Locked` : 'No Locks', tone: lockedAccountCount ? 'danger' : 'healthy' };
+    if (card.id === 'login_monitor') return { label: failedAttemptCount ? `${failedAttemptCount} Failed` : 'Quiet', tone: failedAttemptCount ? 'warning' : 'healthy' };
+    if (card.id === 'security_policy') return { label: `${maxLoginAttempts} Attempt Limit`, tone: 'info' };
+    if (card.id === 'settings_activity') return { label: landingOverview.activity.length ? `${landingOverview.activity.length} Recent` : 'No Recent Activity', tone: 'info' };
+    if (card.id === 'change_password') return { label: 'Admin Reset', tone: 'healthy' };
+    if (card.id === 'home_content') return { label: 'Global + Department', tone: 'info' };
+    return { label: 'Available', tone: 'healthy' };
+  };
+
+  const openLandingCard = (cardId) => {
+    const card = SETTINGS_LANDING_CARDS.find((item) => item.id === cardId);
+    if (card) handleSettingsCardClick(card);
+  };
+
   if (!canManage) {
     return (
       <div className="container-fluid py-3 general-settings-page">
@@ -721,26 +879,56 @@ export default function GeneralSettingsIndex() {
 
   return (
     <div className="container-fluid py-3 general-settings-page">
-      <div className="card border-0 shadow-sm gs-hero-card mb-3">
+      <div className={`card border-0 shadow-sm gs-hero-card mb-3 ${isSettingsLandingView ? 'is-control-center' : ''}`}>
         <div className="card-body d-flex flex-wrap justify-content-between align-items-center gap-3">
-          <div>
-            <h4 className="mb-1 fw-bold">General Settings</h4>
-            <p className="mb-0 text-muted">
-              {isHomeContentView
-                ? 'Customize the Home page headline and preview it before publishing.'
-                : isPasswordResetView
-                  ? 'Reset an account password to the default and require a password change on next login.'
-                  : 'Configure module visibility per user while keeping role defaults intact.'}
-            </p>
+          <div className="d-flex align-items-center gap-3">
+            {isSettingsLandingView && <span className="gs-hero-visual" aria-hidden="true"><i className="bi bi-sliders2"></i></span>}
+            <div>
+              {isSettingsLandingView && <div className="gs-hero-eyebrow">Administration Workspace</div>}
+              <h4 className="mb-1 fw-bold">{isSettingsLandingView ? (isDepartmentAdmin && !isAdmin ? 'Department Settings' : 'Admin Control Center') : 'General Settings'}</h4>
+              <p className="mb-0 text-muted">
+                {isSettingsLandingView
+                  ? (isDepartmentAdmin && !isAdmin
+                    ? `Welcome back, ${user?.first_name || 'Department Administrator'}. Manage department access, password resets, and Home content.`
+                    : `Welcome back, ${user?.first_name || 'Administrator'}. Manage access, security, monitoring, and appearance from one place.`)
+                  : isHomeContentView
+                    ? 'Customize the Home page headline and preview it before publishing.'
+                    : isPasswordResetView
+                      ? 'Email a random 6-character temporary password, revoke old sessions, and require a secure replacement.'
+                      : isLoginMonitorView || isLockedAccountView
+                        ? 'Review sign-in failures and safely manage locked accounts.'
+                        : isSecurityPolicyView
+                          ? 'Configure the security rules enforced by the PHP server.'
+                          : isSettingsActivityView
+                            ? 'Review security-sensitive administrator actions.'
+                            : 'Configure module visibility per user while keeping role defaults intact.'}
+              </p>
+              {isSettingsLandingView && (
+                <div className="gs-hero-meta">
+                  <span><i className="bi bi-calendar3"></i>{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span>
+                  <span><i className="bi bi-arrow-repeat"></i>{landingOverview.updatedAt ? `Updated ${landingOverview.updatedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Checking live status'}</span>
+                </div>
+              )}
+            </div>
           </div>
           <div className="d-flex align-items-center gap-2">
-            {isModuleAccessView || isHomeContentView || isPasswordResetView ? (
+            {isDepartmentAdmin && isModuleAccessView ? (
+              <button type="button" className="btn btn-sm btn-outline-danger" onClick={openPasswordResetView}>
+                Password Reset
+              </button>
+            ) : null}
+            {isDepartmentAdmin && isPasswordResetView ? (
+              <button type="button" className="btn btn-sm btn-outline-success" onClick={openModuleAccessView}>
+                Module Access
+              </button>
+            ) : null}
+            {!isSettingsLandingView && (
               <button type="button" className="btn btn-sm btn-outline-secondary" onClick={openSettingsHome}>
                 Back To Settings
               </button>
-            ) : null}
+            )}
             <span className={`gs-hero-badge ${isAdmin ? 'is-admin' : 'is-dean'}`}>
-              {isAdmin ? 'Admin Control' : 'Dean Control'}
+              {isAdmin ? 'Admin Control' : (isDepartmentAdmin ? 'Department Admin Control' : 'Dean Control')}
             </span>
           </div>
         </div>
@@ -748,30 +936,87 @@ export default function GeneralSettingsIndex() {
 
       {isLoginMonitorView ? (
         <LoginAttemptMonitor />
-      ) : !isModuleAccessView && !isHomeContentView && !isPasswordResetView ? (
-        <div className="row g-3 gs-entry-grid">
-          {SETTINGS_LANDING_CARDS.map((card) => (
-            <div key={card.id} className="col-12 col-md-6 col-xl-4">
-              <button
-                type="button"
-                className={`gs-entry-card ${card.state === 'ready' ? 'is-live' : 'is-soon'}`}
-                onClick={() => { handleSettingsCardClick(card); }}
-              >
-                <div className="gs-entry-top">
-                  <span className="gs-entry-pill">{card.tag}</span>
-                  <span className={`gs-entry-state ${card.state === 'ready' ? 'is-live' : 'is-soon'}`}>
-                    {card.state === 'ready' ? 'Ready' : 'Soon'}
-                  </span>
+      ) : isLockedAccountView ? (
+        <LoginAttemptMonitor lockedOnly />
+      ) : isSecurityPolicyView ? (
+        <SecurityPolicyPanel />
+      ) : isSettingsActivityView ? (
+        <SettingsActivityPanel />
+      ) : isSettingsLandingView ? (
+        <div className="gs-control-center">
+          {isAdmin && landingOverview.error && <div className="alert alert-warning py-2">{landingOverview.error}</div>}
+
+          {isAdmin && <div className="gs-overview-grid" role="region" aria-label="Settings overview">
+            <button type="button" className={`gs-overview-card ${lockedAccountCount ? 'is-danger' : 'is-success'}`} onClick={() => openLandingCard('locked_account')}>
+              <span className="gs-overview-icon"><i className={`bi ${lockedAccountCount ? 'bi-lock-fill' : 'bi-unlock'}`}></i></span>
+              <span><small>Locked Accounts</small><strong>{landingOverview.loading ? '—' : lockedAccountCount}</strong><em>{lockedAccountCount ? 'Needs review' : 'All accounts accessible'}</em></span>
+              <i className="bi bi-arrow-right gs-overview-arrow"></i>
+            </button>
+            <button type="button" className={`gs-overview-card ${failedAttemptCount ? 'is-warning' : 'is-success'}`} onClick={() => openLandingCard('login_monitor')}>
+              <span className="gs-overview-icon"><i className="bi bi-shield-exclamation"></i></span>
+              <span><small>Failed Logins · 24h</small><strong>{landingOverview.loading ? '—' : failedAttemptCount}</strong><em>{failedAttemptCount ? 'Open monitoring' : 'No failed attempts'}</em></span>
+              <i className="bi bi-arrow-right gs-overview-arrow"></i>
+            </button>
+            <button type="button" className="gs-overview-card is-info" onClick={() => openLandingCard('security_policy')}>
+              <span className="gs-overview-icon"><i className="bi bi-shield-check"></i></span>
+              <span><small>Security Policy</small><strong>{landingOverview.loading ? '—' : 'Enforced'}</strong><em>{maxLoginAttempts} attempts · {idleTimeoutMinutes} min idle</em></span>
+              <i className="bi bi-arrow-right gs-overview-arrow"></i>
+            </button>
+          </div>}
+
+          <div className="gs-landing-layout" style={!isAdmin ? { gridTemplateColumns: 'minmax(0, 1fr)' } : undefined}>
+            <main className="gs-settings-groups">
+              {groupedSettingsCards.map((group) => (
+                <div className="gs-settings-group" key={group.name}>
+                  <div className="gs-group-heading">
+                    <span className="gs-group-icon"><i className={`bi ${group.icon}`}></i></span>
+                    <div><h5>{group.name}</h5><p>{group.description}</p></div>
+                  </div>
+                  <div className="gs-group-cards">
+                    {group.cards.map((card) => {
+                      const status = getLandingCardStatus(card);
+                      return (
+                        <button type="button" key={card.id} className={`gs-entry-card ${card.state === 'ready' ? 'is-live' : 'is-soon'}`} onClick={() => handleSettingsCardClick(card)}>
+                          <span className="gs-entry-icon" aria-hidden="true"><i className={`bi ${card.icon}`}></i></span>
+                          <span className="gs-entry-copy">
+                            <span className="gs-entry-title">{card.title}</span>
+                            <span className="gs-entry-desc">{card.description}</span>
+                            <span className="gs-entry-footer">
+                              <span className={`gs-entry-status is-${status.tone}`}>{status.label}</span>
+                              <span className="gs-entry-cta">{card.cta}<i className="bi bi-arrow-right"></i></span>
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-                <span className="gs-entry-icon" aria-hidden="true">{card.initials}</span>
-                <span className="gs-entry-title">{card.title}</span>
-                <span className="gs-entry-desc">{card.description}</span>
-                <span className="gs-entry-cta">{card.cta}</span>
-              </button>
-            </div>
-          ))}
-          <div className="col-12">
-            <div className="gs-entry-note">Cards marked as <strong>Soon</strong> are prepared in UI and can be connected next.</div>
+              ))}
+            </main>
+
+            {isAdmin && <aside className="gs-landing-sidebar">
+              <div className="gs-side-panel">
+                <div className="gs-side-panel-head"><div><small>Shortcuts</small><h5>Quick Actions</h5></div><i className="bi bi-lightning-charge-fill"></i></div>
+                <div className="gs-quick-actions">
+                  <button type="button" onClick={() => openLandingCard('locked_account')}><span><i className="bi bi-unlock"></i>Unlock an account</span><i className="bi bi-chevron-right"></i></button>
+                  <button type="button" onClick={() => openLandingCard('change_password')}><span><i className="bi bi-key"></i>Reset account password</span><i className="bi bi-chevron-right"></i></button>
+                  <button type="button" onClick={() => openLandingCard('security_policy')}><span><i className="bi bi-shield-lock"></i>Edit security policy</span><i className="bi bi-chevron-right"></i></button>
+                  <button type="button" onClick={() => openLandingCard('home_content')}><span><i className="bi bi-house-gear"></i>Customize home page</span><i className="bi bi-chevron-right"></i></button>
+                </div>
+              </div>
+
+              <div className="gs-side-panel">
+                <div className="gs-side-panel-head"><div><small>Audit Trail</small><h5>Recent Activity</h5></div><button type="button" onClick={() => openLandingCard('settings_activity')}>View all</button></div>
+                <div className="gs-activity-preview">
+                  {landingOverview.loading ? <LoadingState label="Loading recent activity..." compact /> : landingOverview.activity.length ? landingOverview.activity.map((row) => (
+                    <button type="button" key={row.log_id} onClick={() => openLandingCard('settings_activity')}>
+                      <span className="gs-activity-dot"></span>
+                      <span><strong>{String(row.action || 'Settings update').replace(/_/g, ' ')}</strong><small>{row.actor_name?.trim() || 'Administrator'} · {new Date(row.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small></span>
+                    </button>
+                  )) : <div className="gs-side-empty"><i className="bi bi-check-circle"></i>No recent settings activity.</div>}
+                </div>
+              </div>
+            </aside>}
           </div>
         </div>
       ) : isHomeContentView ? (
@@ -791,10 +1036,11 @@ export default function GeneralSettingsIndex() {
                     <span className="gs-mini-chip">Live Preview</span>
                   </div>
 
-                  {homeSettingsLoading ? (
-                    <div className="text-muted">Loading home page settings...</div>
+                  {homeSettingsPending ? (
+                    <LoadingState label="Loading home page settings..." />
                   ) : (
                     <div className="d-grid gap-3">
+                      {isAdmin ? <div><label className="form-label fw-semibold">Settings Scope</label><select className="form-select" value={homeScope} disabled={homeSettingsSaving} onChange={(e)=>setHomeScope(e.target.value)}><option value="global">Global default</option>{homeDepartments.map((dept)=><option key={dept.dept_id} value={dept.dept_id}>{dept.dept_name || `Department #${dept.dept_id}`}</option>)}</select><div className="form-text">Department values override the global default.</div></div> : null}
                       <div>
                         <label className="form-label fw-semibold">Title Text</label>
                         <input
@@ -849,7 +1095,7 @@ export default function GeneralSettingsIndex() {
                         <button
                           type="button"
                           className="btn btn-success"
-                          disabled={homeSettingsSaving || homeSettingsLoading}
+                          disabled={homeSettingsSaving || homeSettingsPending}
                           onClick={saveHomeContent}
                         >
                           {homeSettingsSaving ? 'Saving...' : 'Confirm Changes'}
@@ -857,7 +1103,7 @@ export default function GeneralSettingsIndex() {
                         <button
                           type="button"
                           className="btn btn-outline-secondary"
-                          disabled={homeSettingsSaving || homeSettingsLoading}
+                          disabled={homeSettingsSaving || homeSettingsPending}
                           onClick={resetHomeDraft}
                         >
                           Reset Preview
@@ -877,9 +1123,15 @@ export default function GeneralSettingsIndex() {
                     CDOC Attendance Home
                   </span>
                 </div>
-                <h1 className="gs-home-preview-title" style={homePreviewTitleStyle} title={String(homeTitleDraft || '').trim() || DEFAULT_HOME_TITLE}>
-                  {String(homeTitleDraft || '').trim() || DEFAULT_HOME_TITLE}
-                </h1>
+                {homeSettingsPending ? (
+                  <div className="placeholder-glow mt-3" role="status" aria-label="Loading home title preview">
+                    <span className="placeholder col-9 rounded" style={{ height: '3.5rem' }}></span>
+                  </div>
+                ) : (
+                  <h1 className="gs-home-preview-title" style={homePreviewTitleStyle} title={String(homeTitleDraft || '').trim() || DEFAULT_HOME_TITLE}>
+                    {String(homeTitleDraft || '').trim() || DEFAULT_HOME_TITLE}
+                  </h1>
+                )}
                 <p className="gs-home-preview-copy">
                   Every minute in class matters. This preview updates as you type or choose a color.
                 </p>
@@ -892,8 +1144,8 @@ export default function GeneralSettingsIndex() {
           {error ? <div className="alert alert-danger">{error}</div> : null}
           {success ? <div className="alert alert-success">{success}</div> : null}
 
-          {!isAdmin ? (
-            <div className="alert alert-danger mb-0">Only Admin can reset account passwords to default.</div>
+          {!isAdmin && !isDepartmentAdmin ? (
+            <div className="alert alert-danger mb-0">Only Admin and Department Admin can reset account passwords.</div>
           ) : (
             <div className="gs-password-workspace">
               <div className="gs-password-summary-grid mb-3">
@@ -938,8 +1190,14 @@ export default function GeneralSettingsIndex() {
 
                     <div className="gs-reset-warning">
                       <i className="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
-                      <span>This action does not display the default password and does not write it to system logs.</span>
+                      <span>The random temporary password is emailed first. The password changes only after the email is accepted.</span>
                     </div>
+
+                    {isDepartmentAdmin ? (
+                      <div className="alert alert-info py-2">
+                        You may reset any non-Admin account in your own department. Admin accounts and users from other departments are blocked by the server.
+                      </div>
+                    ) : null}
 
                     <div className="gs-reset-form-grid">
                       <div>
@@ -986,7 +1244,7 @@ export default function GeneralSettingsIndex() {
                           })}
                         </select>
                         {loadingUsers ? (
-                          <div className="form-text">Loading users...</div>
+                          <LoadingState label="Loading users..." inline />
                         ) : (
                           <div className="form-text">Admin accounts are excluded from this emergency tool.</div>
                         )}
@@ -1015,7 +1273,7 @@ export default function GeneralSettingsIndex() {
                       disabled={!passwordResetUserId || resettingPassword || loadingUsers}
                       onClick={resetPasswordToDefault}
                     >
-                      {resettingPassword ? 'Resetting...' : 'Reset Password To Default'}
+                      {resettingPassword ? 'Resetting...' : 'Email Temporary Password'}
                     </button>
                   </div>
                 </div>
@@ -1035,8 +1293,8 @@ export default function GeneralSettingsIndex() {
                       <div className="gs-reset-step">
                         <span className="gs-reset-step-num">1</span>
                         <div>
-                          <div className="fw-semibold">Password returns to default</div>
-                          <div className="text-muted small">The default is based on the user's registered ID number.</div>
+                          <div className="fw-semibold">Reset instructions are emailed</div>
+                          <div className="text-muted small">The email contains a random 6-character temporary password.</div>
                         </div>
                       </div>
                       <div className="gs-reset-step">
@@ -1049,8 +1307,8 @@ export default function GeneralSettingsIndex() {
                       <div className="gs-reset-step">
                         <span className="gs-reset-step-num">3</span>
                         <div>
-                          <div className="fw-semibold">User is notified</div>
-                          <div className="text-muted small">A notification is sent without exposing the default password.</div>
+                          <div className="fw-semibold">Random temporary password becomes active</div>
+                          <div className="text-muted small">This happens only after the reset email is accepted for delivery.</div>
                         </div>
                       </div>
                       <div className="gs-reset-step">
@@ -1088,14 +1346,18 @@ export default function GeneralSettingsIndex() {
                       const fullName = `${item?.last_name || ''}, ${item?.first_name || ''}`.replace(/^,\s*/, '').trim();
                       const labelName = fullName || item?.email || `User #${item?.user_id}`;
                       const roleName = formatRoleName(item?.role_name || '');
+                      const accountStatus = normalizeUserStatus(item?.status);
+                      const statusLabel = accountStatus && accountStatus !== 'active'
+                        ? ` — ${accountStatus === 'archive' ? 'Archived' : 'Inactive'}`
+                        : '';
                       return (
                         <option key={item.user_id} value={item.user_id}>
-                          {labelName} {roleName ? `(${roleName})` : ''}
+                          {labelName} {roleName ? `(${roleName})` : ''}{statusLabel}
                         </option>
                       );
                     })}
                   </select>
-                  {loadingUsers ? <div className="form-text">Loading users...</div> : <div className="form-text">Pick a user to manage module access.</div>}
+                  {loadingUsers ? <LoadingState label="Loading users..." inline /> : <div className="form-text">Pick a user to manage module access.</div>}
                 </div>
                 <div className="col-12 col-md-4 text-md-end">
                   <button
@@ -1110,12 +1372,13 @@ export default function GeneralSettingsIndex() {
               </div>
 
               {selectedUserId ? (
-                <div className="gs-user-strip mt-3">
+                <><div className="gs-user-strip mt-3">
                   <div className="gs-user-avatar" aria-hidden="true">
                     {getInitials(targetInfo?.first_name, targetInfo?.last_name)}
                   </div>
                   <div className="gs-user-meta">
                     <div className="fw-semibold">{selectedUserLabel}</div>
+                    <UserStatusBadge status={filteredManagedUsers.find((item) => String(item.user_id) === String(selectedUserId))?.status} />
                     <div className="small text-muted">
                       Role: {formatRoleName(targetInfo?.role_name || '')}
                       {' | '}
@@ -1126,7 +1389,7 @@ export default function GeneralSettingsIndex() {
                     <span className="gs-mini-chip">Manageable: {moduleStats.totalManageable}</span>
                     <span className="gs-mini-chip">Enabled: {moduleStats.enabledModules}</span>
                   </div>
-                </div>
+                </div><div className="row g-2 mt-2 align-items-end"><div className="col-12 col-md-8"><label className="form-label small fw-semibold">Copy permissions from another user</label><select className="form-select" value={copyAccessUserId} onChange={e=>setCopyAccessUserId(e.target.value)}><option value="">Select source user</option>{filteredManagedUsers.filter(item=>String(item.user_id)!==String(selectedUserId)).map(item=>{ const status=normalizeUserStatus(item.status); const suffix=status&&status!=='active'?` — ${status==='archive'?'Archived':'Inactive'}`:''; return <option key={item.user_id} value={item.user_id}>{`${item.last_name||''}, ${item.first_name||''}${suffix}`}</option>; })}</select></div><div className="col-12 col-md-4"><button className="btn btn-outline-success w-100" disabled={!copyAccessUserId||saving} onClick={copyModuleAccess}>Copy To Draft</button></div></div>{accessDirty?<div className="alert alert-warning mt-3 mb-0">You have unsaved module-access changes.</div>:null}</>
               ) : null}
             </div>
           </div>
@@ -1135,7 +1398,7 @@ export default function GeneralSettingsIndex() {
             <div className="card border-0 shadow-sm gs-modules-card">
               <div className="card-body">
                 {loadingAccess ? (
-                  <div className="text-muted">Loading module access...</div>
+                  <LoadingState label="Loading module access..." />
                 ) : (
                   <>
                     <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
@@ -1144,14 +1407,16 @@ export default function GeneralSettingsIndex() {
                         <div className="text-muted small">Toggle modules that this user can open in the sidebar and routes.</div>
                       </div>
                       <div className="d-flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          className="btn btn-sm btn-outline-success"
-                          disabled={saving || manageableModules.length === 0}
-                          onClick={selectAllManageable}
-                        >
-                          Select All
-                        </button>
+                        {isAdmin ? (
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-outline-success"
+                            disabled={saving || manageableModules.length === 0}
+                            onClick={selectAllManageable}
+                          >
+                            Select All
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="btn btn-sm btn-outline-secondary"
@@ -1189,6 +1454,11 @@ export default function GeneralSettingsIndex() {
                         <div className="gs-stat-value">{moduleStats.customEnabled}</div>
                       </div>
                     </div>
+                    {isDepartmentAdmin ? (
+                      <div className="alert alert-info py-2">
+                        You can change only safe operational modules for non-Admin users in your own department. Protected Admin, security, facility, academic-control, user-management, and approval modules cannot be granted here.
+                      </div>
+                    ) : null}
 
                     <div className="gs-search-row mb-3">
                       <div className="input-group">
@@ -1215,7 +1485,7 @@ export default function GeneralSettingsIndex() {
                     {!schemaReady ? (
                       <div className="alert alert-warning mb-0">
                         Missing database columns for module access. Please run migration:
-                        <code className="ms-1">server-php/migrations/2026-04-16-add-user-module-permissions.sql</code>
+                        <code className="ms-1">api/migrations/2026-04-16-add-user-module-permissions.sql</code>
                       </div>
                     ) : manageableModules.length === 0 ? (
                       <div className="text-muted">No manageable modules available for this user.</div>

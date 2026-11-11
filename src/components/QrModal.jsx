@@ -1,5 +1,7 @@
-// Minimal QrModal using QRCode lib from CDN
-function QrModal({ show, onClose, token, active }) {
+import { apiUrl } from '../services/api.js';
+
+// QR payload generation and downloaded image content are intentionally kept unchanged.
+function QrModal({ show, onClose, token, manualCode, active, floorName = 'Floor', buildingName = '', readOnly = false, onRegenerateManualCode, regeneratingManualCode = false }) {
   const canvasRef = React.useRef(null);
   const [qrAvailable, setQrAvailable] = React.useState(false);
   const [imageUrl, setImageUrl] = React.useState('');
@@ -34,78 +36,12 @@ function QrModal({ show, onClose, token, active }) {
           }
         }
 
-        // Fallback: use server-side QR proxy to avoid CORS issues
-        // Try several candidate API base paths and pick the first that resolves (helps with php -S + port-forward tunnels)
-        const origin = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin.replace(/\/$/, '') : '';
-        const candidates = [];
-        if (typeof window !== 'undefined' && window.API_BASE) {
-          const apiBase = window.API_BASE.replace(/\/+$/,'');
-          candidates.push(apiBase);
-          // If API_BASE is /server-php/index.php/api, derive the /server-php/api folder (where qrcode.php lives)
-          const derivedApi = apiBase.replace(/\/index\.php\/api\/?$/, '/api');
-          if (derivedApi !== apiBase) candidates.push(derivedApi);
-        }
-        // Common locations to try
-        candidates.push('/server-php/api');
-        candidates.push('/api');
-        candidates.push('./server-php/api');
-        candidates.push('./api');
-        // If app is hosted under a project root (e.g. /3D1.2), add that root explicitly
-        if (origin && typeof window !== 'undefined' && window.location) {
-          const parts = window.location.pathname.split('/').filter(Boolean);
-          const host = (window.location.hostname || '').toLowerCase();
-          let projectRoot = '';
-          if (parts.length) {
-            const first = String(parts[0]).toLowerCase();
-            if (first !== 'public' && host.indexOf('devtunnels.ms') === -1) {
-              projectRoot = '/' + parts[0];
-            }
-          }
-          if (projectRoot) {
-            candidates.push(origin + projectRoot + '/server-php/api');
-            candidates.push(origin + projectRoot + '/api');
-          }
-        }
-        // Some tunnels add a '/public' prefix
-        if (origin) {
-          candidates.push(origin + '/server-php/api');
-          candidates.push(origin + '/public/server-php/api');
-          candidates.push(origin + '/api');
-        }
-
-        let found = null;
-        for (const c of candidates) {
-          try {
-            const testUrl = c.replace(/\/+$/,'') + '/qrcode.php?data=' + encodeURIComponent(token);
-            // Try a lightweight HEAD request to check existence (some hosts may not support HEAD; fallback to GET small request)
-            const resp = await fetch(testUrl, { method: 'HEAD' });
-            if (resp && resp.ok) { found = testUrl; break; }
-            // If HEAD not allowed, try GET but don't download body
-            if (resp && (resp.status === 405 || resp.status === 403 || resp.status === 0)) {
-              const r2 = await fetch(testUrl, { method: 'GET' });
-              if (r2 && r2.ok) { found = testUrl; break; }
-            }
-          } catch (e) {
-            // ignore and try next
-          }
-        }
-        // If nothing resolved, fall back to reasonable default (window.API_BASE or ./server-php/api)
-        if (!found) {
-          let fallback = (typeof window !== 'undefined' && window.API_BASE) ? window.API_BASE.replace(/\/+$/,'') : './server-php/api';
-          const derived = fallback.replace(/\/index\.php\/api\/?$/, '/api');
-          if (derived !== fallback) fallback = derived;
-          found = fallback.replace(/\/+$/,'') + '/qrcode.php?data=' + encodeURIComponent(token);
-        }
-        setImageUrl(found);
+        // Fallback: use the same centralized API base as every other request.
+        setImageUrl(apiUrl('qrcode?data=' + encodeURIComponent(token)));
         setQrAvailable(false);
       } catch (err) {
         console.error('QrModal error', err);
-        let base = (typeof window !== 'undefined' && window.API_BASE)
-          ? window.API_BASE.replace(/\/+$/,'')
-          : './server-php/api';
-        const derived = base.replace(/\/index\.php\/api\/?$/, '/api');
-        if (derived !== base) base = derived;
-        const proxyUrl = base.replace(/\/+$/,'') + '/qrcode.php?data=' + encodeURIComponent(token);
+        const proxyUrl = apiUrl('qrcode?data=' + encodeURIComponent(token));
         setImageUrl(proxyUrl);
         setQrAvailable(false);
       }
@@ -114,42 +50,99 @@ function QrModal({ show, onClose, token, active }) {
   }, [show, token]);
 
   const download = async () => {
-    if (qrAvailable && canvasRef.current) {
-      const canvas = canvasRef.current; const url = canvas.toDataURL('image/png'); const a = document.createElement('a'); a.href = url; a.download = `qr_${token}.png`; document.body.appendChild(a); a.click(); a.remove(); return;
-    }
-    if (imageUrl) {
-      try {
-        // Fetch from same-origin proxy so CORS is not an issue
+    try {
+      const output = document.createElement('canvas');
+      output.width = 280;
+      output.height = manualCode ? 320 : 280;
+      const ctx = output.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, output.width, output.height);
+
+      let source = null;
+      if (qrAvailable && canvasRef.current) {
+        source = canvasRef.current;
+      } else if (imageUrl) {
         const res = await fetch(imageUrl, { mode: 'cors' });
         if (!res.ok) throw new Error('Failed to fetch QR image');
         const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = `qr_${token}.png`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-      } catch (e) {
-        console.error('QrModal download failed', e);
-        // fallback: open in new tab
-        window.open(imageUrl, '_blank');
+        source = await new Promise((resolve, reject) => {
+          const objectUrl = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => { URL.revokeObjectURL(objectUrl); resolve(img); };
+          img.onerror = () => { URL.revokeObjectURL(objectUrl); reject(new Error('Failed to read QR image')); };
+          img.src = objectUrl;
+        });
       }
+      if (!source) throw new Error('QR image is not ready');
+
+      ctx.drawImage(source, 20, 20, 240, 240);
+      if (manualCode) {
+        ctx.fillStyle = '#111827';
+        ctx.font = '700 24px Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(manualCode).toUpperCase(), output.width / 2, 292);
+      }
+
+      const url = output.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `qr_${manualCode || token}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      console.error('QrModal download failed', e);
+      if (imageUrl) window.open(imageUrl, '_blank');
     }
   };
 
   if (!show) return null;
   return (
-    <div style={{position:'fixed',left:0,right:0,top:0,bottom:0,background:'rgba(0,0,0,0.4)'}} onClick={(e)=>{ if (e.target===e.currentTarget) onClose?.(); }}>
-      <div style={{maxWidth:360,margin:'60px auto',background:'#fff',padding:16}}>
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-          <h4 style={{margin:0}}>QR Code {active? '(Active)':'(Inactive)'}</h4>
-          <button onClick={onClose}>X</button>
-        </div>
-        <div style={{textAlign:'center'}}>
-          {qrAvailable ? (
-            <canvas ref={canvasRef} />
-          ) : (
-            imageUrl ? <img src={imageUrl} alt="QR code" width={240} height={240} style={{display:'block',margin:'0 auto'}} /> : <div style={{color:'#888',marginTop:8}}>QR library not loaded — cannot render QR.</div>
+    <div className="fixed inset-0 z-[1200] flex items-start justify-center overflow-y-auto bg-slate-950/65 p-3 backdrop-blur-sm sm:p-6" onClick={(event) => { if (event.target === event.currentTarget) onClose?.(); }}>
+      <div className="my-auto w-full max-w-md overflow-hidden rounded-2xl border border-white/20 bg-white shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="floor-qr-title">
+        <header className="flex items-start justify-between gap-3 border-b border-slate-200 bg-gradient-to-br from-emerald-50 to-white px-4 py-4 sm:px-5">
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-700 text-xl text-white shadow-sm" aria-hidden="true"><i className="bi bi-qr-code" /></span>
+            <div className="min-w-0">
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-700">Floor access</p>
+              <h2 id="floor-qr-title" className="truncate text-lg font-bold text-slate-900">{floorName || 'Floor QR Code'}</h2>
+              <p className="truncate text-xs text-slate-500">{buildingName || 'Campus building'} · Ready to preview and download</p>
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-800" aria-label="Close QR preview"><i className="bi bi-x-lg" /></button>
+        </header>
+
+        <div className="bg-slate-50 px-4 py-5 text-center sm:px-6">
+          <div className="mx-auto w-fit rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+            <canvas ref={canvasRef} style={{display:qrAvailable ? 'block' : 'none',margin:'0 auto'}} />
+            {!qrAvailable && (imageUrl
+              ? <img src={imageUrl} alt="QR code" width={240} height={240} style={{display:'block',margin:'0 auto'}} />
+              : <div className="flex h-60 w-60 items-center justify-center px-5 text-sm text-slate-500">QR library not loaded — cannot render QR.</div>)}
+          </div>
+
+          {manualCode && (
+            <div style={{marginTop:10,fontSize:22,fontWeight:800,letterSpacing:'0.12em',color:'#111827'}}>
+              {String(manualCode).toUpperCase()}
+            </div>
           )}
 
-          <div style={{marginTop:12}}><button onClick={download} disabled={!token}>Download</button></div>
+          <div className={`mx-auto mt-4 flex max-w-sm items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left text-xs ${active ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+            <i className={`bi ${active ? 'bi-check-circle-fill' : 'bi-info-circle-fill'} mt-0.5 shrink-0`} aria-hidden="true" />
+            <span>{active ? 'Active floor: this QR is currently enabled for floor verification.' : 'Inactive floor: you can download this QR, but scanning remains disabled until an Admin activates the floor.'}</span>
+          </div>
+          {readOnly ? <p className="mt-3 text-[11px] text-slate-500"><i className="bi bi-eye mr-1" />View and download access only</p> : null}
         </div>
+
+        <footer className="flex flex-col-reverse gap-2 border-t border-slate-200 bg-white px-4 py-4 sm:flex-row sm:justify-end sm:px-5">
+          <button type="button" onClick={onClose} className="inline-flex min-h-11 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-50">Close</button>
+          {onRegenerateManualCode && (
+            <button type="button" onClick={onRegenerateManualCode} disabled={regeneratingManualCode || !active} className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 text-sm font-semibold text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50">
+              <i className="bi bi-arrow-repeat" />{regeneratingManualCode ? 'Regenerating...' : 'Regenerate Manual Code'}
+            </button>
+          )}
+          <button type="button" onClick={download} disabled={!token} className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-emerald-700 px-5 text-sm font-bold text-white shadow-sm transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-slate-400"><i className="bi bi-download" />Download QR</button>
+        </footer>
       </div>
     </div>
   );

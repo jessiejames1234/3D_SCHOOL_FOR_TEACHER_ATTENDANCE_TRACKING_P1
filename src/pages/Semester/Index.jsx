@@ -2,6 +2,7 @@ import React from 'react';
 import { apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
 function getApiErrorMessage(err, fallbackMessage) {
   const body = err?.body;
@@ -27,20 +28,28 @@ function SemesterIndex(){
   const [showModal, setShowModal] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ session_name: '', term: '', start_date: '', end_date: '' });
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) { if (err?.status === 405 || err?.status === 500) return await fallback(); throw err; }
   };
 
-  React.useEffect(()=>{ 
-    (async ()=>{ 
-      try{ 
-        const data = await apiGet('semesters'); 
-        setItems(Array.isArray(data)? data.filter(x => String(x.status||'').toLowerCase() !== 'archive') : []); 
-      }catch(e){ console.error(e); } 
-    })(); 
+  const loadData = React.useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    try {
+      const data = await apiGet('semesters');
+      setItems(Array.isArray(data)? data.filter(x => String(x.status||'').toLowerCase() !== 'archive') : []);
+    } catch(e) { console.error(e); }
+    finally { if (!silent) setLoading(false); }
   }, []);
+
+  React.useEffect(()=>{ loadData(); }, [loadData]);
+
+  useAutoRefresh({
+    refresh: () => loadData({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: !showModal,
+  });
 
   const openModal = (it)=>{
     setEditing(it);
@@ -56,7 +65,6 @@ function SemesterIndex(){
     if (new Date(form.start_date) > new Date(form.end_date)) {
         try { if (window.Swal) await window.Swal.fire({ icon:'warning', title:'Invalid Date Range', text: 'Please set the start date earlier than or equal to the end date.' }); } catch(e){} setLoading(false); return;
     }
-    
     try{
       const payload = { start_date: form.start_date, end_date: form.end_date };
       await runWithFallback(() => apiPut(`semesters/${editing.semester_id}`, payload), () => apiPost(`semesters/${editing.semester_id}/update`, payload));
@@ -134,7 +142,7 @@ function SemesterIndex(){
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12}}>
         <h2 style={{margin:0}}>Semesters Setup</h2>
       </div>
-      <Table columns={columns} data={items} pageSize={10} />
+      <Table columns={columns} data={items} loading={loading} pageSize={10} />
 
       <Modal show={showModal} title="Edit Semester Dates" onClose={closeModal}>
         <form onSubmit={handleSubmit} className="space-y-4">

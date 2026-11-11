@@ -1,16 +1,19 @@
 import React from 'react';
 import Table from '../../components/Table.jsx';
 import Modal from '../../components/Modal.jsx';
+import UserStatusBadge from '../../components/UserStatusBadge.jsx';
 import { AuthContext } from '../../context/AuthContext.jsx';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
-// Leaves File (Secretary) - can create, edit or cancel while pending
+// Approved leave registry managed by Dean and Department Admin.
 export default function LeavesFiles(){
   const { user } = React.useContext(AuthContext);
-  const canFileFromApprovalPage = Number(user?.role_id) === 2;
+  const currentRoleId = Number(user?.role_id || 0);
+  const canManageLeaves = [2, 6].includes(currentRoleId);
   const [showDetailModal, setShowDetailModal] = React.useState(false);
   const [detailItem, setDetailItem] = React.useState(null);
   const [rows, setRows] = React.useState([]);
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   const [showModal, setShowModal] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ date_from:'', date_to:'', leave_type_id:'', teacher_id:'', reason:'' });
@@ -19,37 +22,45 @@ export default function LeavesFiles(){
   const [teacherSearch, setTeacherSearch] = React.useState('');
 
   React.useEffect(()=>{
-    // Restrict page: only dean (role_id === 2) or program_head (role_id === 3) may access approvals; others redirect
+    // Only Dean and Department Admin manage approved leave records.
     if (!user) return;
     const rid = Number(user.role_id);
-    if (![2,3].includes(rid)) { window.location.hash = '#/dashboard'; }
+    if (![2,6].includes(rid)) { window.location.hash = '#/dashboard'; }
   }, [user]);
 
-  const fetch = async ()=>{
-    setLoading(true);
+  const fetch = async ({ silent = false } = {})=>{
+    if (!silent) setLoading(true);
     try{
       const [d, types, tlist] = await Promise.all([
         apiGet('leaves'),
         apiGet('leaves/types').catch(()=>[]),
-        apiGet('teachers').catch(async ()=>{
+        apiGet('users?list=1&teaching_roles=1').catch(async ()=>{
           // fallback to users endpoint
-          try { const u = await apiGet('users'); return Array.isArray(u) ? u.filter(x=>Number(x.role_id)===5) : []; } catch(e){ return []; }
+          try { const u = await apiGet('users'); return Array.isArray(u) ? u.filter(x=>[2,3,4,5].includes(Number(x.role_id))) : []; } catch(e){ return []; }
         })
       ]);
       const list = Array.isArray(d) ? d : [];
       setLeaveTypes(Array.isArray(types) ? types : []);
       // restrict teachers to same department for non-admin users
       const allTeachers = Array.isArray(tlist) ? tlist : [];
-      const filteredTeachers = (user && 'dept_id' in user) ? allTeachers.filter(t => String(t.dept_id) === String(user.dept_id)) : allTeachers;
+      const activeTeachers = allTeachers.filter(t => ['active', '1', 'true'].includes(String(t.status || 'active').trim().toLowerCase()));
+      const roleScopedTeachers = currentRoleId === 6 ? activeTeachers : activeTeachers.filter(t => Number(t.role_id) !== 2);
+      const filteredTeachers = (user && 'dept_id' in user) ? roleScopedTeachers.filter(t => String(t.dept_id) === String(user.dept_id)) : roleScopedTeachers;
       setTeachers(filteredTeachers);
       // show only same department (if user available)
       const deptFiltered = user && 'dept_id' in user ? list.filter(l => String(l.dept_id) === String(user.dept_id)) : list;
       setRows(deptFiltered.map(r => ({ ...r, _status: String(r.req_status || '').toLowerCase() })));
     }catch(e){ console.error(e); }
-    setLoading(false);
+    if (!silent) setLoading(false);
   };
 
   React.useEffect(()=>{ fetch(); }, []);
+
+  useAutoRefresh({
+    refresh: () => fetch({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.WORKFLOW,
+    enabled: Boolean(user) && !showModal,
+  });
 
   // filter rows by teacher search
   const displayedRows = React.useMemo(()=>{
@@ -58,7 +69,12 @@ export default function LeavesFiles(){
     return rows.filter(r => (`${r.first_name || ''} ${r.last_name || ''}`).toLowerCase().includes(q));
   }, [rows, teacherSearch]);
 
+  const canManageLeaveRecord = (row) => canManageLeaves
+    && ['active', '1', 'true'].includes(String(row?.user_status || '').trim().toLowerCase())
+    && (currentRoleId === 6 || Number(row?.role_id) !== 2);
+
   const openModal = (row=null)=>{
+    if (row && !canManageLeaveRecord(row)) return;
     setEditing(row);
     if (row){ setForm({ date_from: row.date_from, date_to: row.date_to, leave_type_id: row.leave_type_id || '', teacher_id: row.teacher_id || '', reason: row.reason || '' }); }
     else setForm({ date_from:'', date_to:'', leave_type_id:'', teacher_id: '', reason:'' });
@@ -70,10 +86,11 @@ export default function LeavesFiles(){
   const handleSubmit = async (e)=>{
     e.preventDefault();
     try{
-      if (!canFileFromApprovalPage) throw new Error('Only dean can file leave records from this page.');
-      // teacher_id: if user is secretary and selected teacher exists use it, else if teacher user use current user id
-      const payloadTeacher = (Number(user.role_id) === 4) ? (Number(form.teacher_id) || null) : (user.user_id || null);
+      if (!canManageLeaves) throw new Error('Only the Dean or Department Admin can record leave from this page.');
+      const payloadTeacher = Number(form.teacher_id) || null;
       if (!payloadTeacher) throw new Error('Teacher is required');
+      const target = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
+      if (currentRoleId === 2 && Number(target?.role_id) === 2) throw new Error("Only the Department Admin can manage a Dean's leave.");
       // validate teacher dept matches current user dept (if current user has dept)
       if (user && 'dept_id' in user){
         const t = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
@@ -81,14 +98,11 @@ export default function LeavesFiles(){
       }
       const payload = { teacher_id: payloadTeacher, leave_type_id: Number(form.leave_type_id)||1, date_from: form.date_from, date_to: form.date_to, reason: form.reason };
       if (editing && editing.leave_id){
-        // edit only if still pending
-        if (String(editing.req_status) !== 'pending') throw new Error('Cannot edit non-pending leave');
         await apiPut(`leaves/${editing.leave_id}`, payload);
         window.Swal && window.Swal.fire('Saved','Leave updated','success');
       } else {
-        // create default pending
         await apiPost('leaves', payload);
-        window.Swal && window.Swal.fire('Saved','Leave request created','success');
+        window.Swal && window.Swal.fire('Saved','Approved leave recorded','success');
       }
       setShowModal(false);
       fetch();
@@ -100,10 +114,11 @@ export default function LeavesFiles(){
 
   const handleCancel = async (r)=>{
     if (!r || !r.leave_id) return;
+    if (!canManageLeaveRecord(r)) return;
     if (!confirm('Cancel this leave request?')) return;
     try{
-      await apiPut(`leaves/${r.leave_id}`, { req_status: 'canceled' });
-      window.Swal && window.Swal.fire('Canceled','Leave request canceled','success');
+      await apiPut(`leaves/${r.leave_id}`, { req_status: 'void' });
+      window.Swal && window.Swal.fire('Voided','Leave record voided','success');
       fetch();
     }catch(e){ console.error(e); window.Swal && window.Swal.fire('Error','Failed to cancel','error'); }
   };
@@ -136,33 +151,21 @@ export default function LeavesFiles(){
 
   const columns = [
     { key: 'rownum', label: '#', render: (r,pIdx,gIdx)=> gIdx+1 },
-    { key: 'teacher', label: 'Teacher', render: (r)=> `${r.first_name || ''} ${r.last_name || ''}` },
+    { key: 'teacher', label: 'Teacher', render: (r)=> <div className="flex flex-col gap-1"><span>{`${r.first_name || ''} ${r.last_name || ''}`}</span><UserStatusBadge status={r.user_status} /></div> },
     { key: 'date', label: 'From - To', render: (r)=> `${r.date_from} → ${r.date_to}` },
     { key: 'type', label: 'Type', render: (r)=> r.name_type || r.leave_type || 'N/A' },
     { key: 'status', label: 'Status', render: (r)=> (
         <span className={`badge ${r.req_status==='pending' ? 'bg-yellow-300 text-black' : (r.req_status==='approve' ? 'bg-green-600 text-white' : 'bg-red-500 text-white')}`}>{String(r.req_status).toUpperCase()}</span>
       ) },
     { key: 'actions', label: 'Actions', actions: (row)=> {
-      const actions = [];
-      // resolve role robustly
-      let role = (user && (user.role_name || user.role)) || '';
-      if (!role && user && user.role_id) {
-        const rid = Number(user.role_id);
-        if (rid === 4) role = 'secretary';
-        else if (rid === 5) role = 'teacher';
-        else if (rid === 2) role = 'dean';
-        else if (rid === 3) role = 'program_head';
-      }
-
-      if (['dean','program_head'].includes(String(role).toLowerCase())){
-        if (row.req_status === 'pending'){
-          actions.push({ label: 'Approve', onClick: ()=> handleDecision(row, 'approve') });
-          actions.push({ label: 'Reject', variant: 'danger', onClick: ()=> handleDecision(row, 'rejected') });
+      const actions = [{ label: 'View', onClick: ()=> openDetail(row) }];
+      if (canManageLeaveRecord(row)) {
+        actions.push({ label: 'Edit', onClick: ()=> openModal(row) });
+        if (String(row.req_status).toLowerCase() === 'void') {
+          actions.push({ label: 'Restore', onClick: ()=> handleDecision(row, 'approve') });
+        } else {
+          actions.push({ label: 'Void', variant: 'danger', onClick: ()=> handleCancel(row) });
         }
-        // Do NOT add 'Add Sub' here for File_leave
-      } else if (String(role).toLowerCase() === 'secretary'){
-        actions.push({ label: 'View', onClick: ()=> openDetail(row) });
-        // Do NOT add 'Add Sub' here for File_leave
       }
       return actions;
     } }
@@ -177,6 +180,7 @@ export default function LeavesFiles(){
             <div className="w-12 h-12 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-lg">{detailItem ? (detailItem.first_name||'').charAt(0) : ''}</div>
             <div>
               <div className="text-lg font-semibold">{detailItem ? `${detailItem.first_name || ''} ${detailItem.last_name || ''}` : '—'}</div>
+              <UserStatusBadge status={detailItem?.user_status} />
               <div className="text-sm text-gray-500">{detailItem && (detailItem.dept_name || detailItem.department || '')}</div>
             </div>
           </div>
@@ -206,7 +210,9 @@ export default function LeavesFiles(){
 
         <div className="mt-6 flex justify-end gap-2">
           <button onClick={()=>setShowDetailModal(false)} className="px-4 py-2 rounded border">Close</button>
-          { detailItem && (['dean','program_head'].includes((user && (user.role_name || '').toLowerCase())||'') && detailItem.req_status === 'pending') && (<><button onClick={() => { handleDecision(detailItem, 'rejected'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-red-600 text-white">Reject</button><button onClick={() => { handleDecision(detailItem, 'approve'); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-green-600 text-white">Approve</button></>)}
+          {detailItem && canManageLeaveRecord(detailItem) && String(detailItem.req_status).toLowerCase() !== 'void' && (
+            <button onClick={() => { handleCancel(detailItem); setShowDetailModal(false); }} className="px-4 py-2 rounded bg-red-600 text-white">Void Leave</button>
+          )}
         </div>
       </div>
     </Modal>
@@ -224,7 +230,7 @@ export default function LeavesFiles(){
             className="px-2 py-1 border rounded-md text-sm"
             style={{ width: 180 }}
           />
-          {canFileFromApprovalPage && (
+          {canManageLeaves && (
             <button className="px-3 py-2 bg-green-600 text-white rounded-md text-sm" onClick={()=>openModal()}>File Leave</button>
           )}
         </div>
@@ -250,7 +256,7 @@ export default function LeavesFiles(){
             </select>
           </div>
 
-          {Number(user.role_id) === 4 && (
+          {canManageLeaves && (
             <div>
               <label className="block text-sm">Teacher</label>
               {/* show names only; remove inline search input */}

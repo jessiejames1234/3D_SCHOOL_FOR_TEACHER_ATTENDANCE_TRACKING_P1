@@ -2,8 +2,8 @@ import React from 'react';
 import Modal from '../../components/Modal.jsx';
 // Ensure these components exist in your project or adjust imports
 import { apiGet, apiPost } from '../../services/api.js';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
-const API_BASE = (typeof window !== 'undefined' && window.API_BASE) ? window.API_BASE : '/server-php/api';
 const ALTITUDE_CALIBRATION_STORAGE_KEY = 'attendance_altitude_calibration_v1';
 const IOS_CALIBRATION_MAX_OFFSET_METERS = 200;
 
@@ -113,11 +113,27 @@ const subjectKey = (record) => {
 
 const isSameScheduleGroup = (a, b) => {
   if (!a || !b) return false;
+  const leftSemester = String(a.semester_id ?? '');
+  const rightSemester = String(b.semester_id ?? '');
+  if (!leftSemester || !rightSemester || leftSemester !== rightSemester) return false;
   return String(a.date || '') === String(b.date || '')
     && timeKey(a.start_time) === timeKey(b.start_time)
     && timeKey(a.end_time) === timeKey(b.end_time)
     && subjectKey(a) === subjectKey(b);
 };
+
+const hasDistinctParallelIdentity = (a, b, field) => {
+  const left = a?.[field];
+  const right = b?.[field];
+  return left !== undefined && left !== null && String(left) !== ''
+    && right !== undefined && right !== null && String(right) !== ''
+    && String(left) !== String(right);
+};
+
+const isParallelSchedulePair = (a, b) => isSameScheduleGroup(a, b)
+  && hasDistinctParallelIdentity(a, b, 'schedule_id')
+  && hasDistinctParallelIdentity(a, b, 'section_id')
+  && hasDistinctParallelIdentity(a, b, 'room_id');
 
 const isRecordActiveNow = (record, now = new Date()) => {
   if (!record?.date || !record?.start_time || !record?.end_time) return false;
@@ -125,6 +141,16 @@ const isRecordActiveNow = (record, now = new Date()) => {
   const end = new Date(`${record.date}T${record.end_time}`);
   return now >= start && now <= end;
 };
+
+const isSubstitutedRecord = (record) => Number(record?.flag_in_id) === 4
+  || Number(record?.flag_check_id) === 4
+  || Number(record?.flag_out_id) === 4;
+
+const isOnLeaveRecord = (record) => Number(record?.flag_in_id) === 7
+  || Number(record?.flag_check_id) === 7
+  || Number(record?.flag_out_id) === 7;
+
+const isAttendanceExemptRecord = (record) => isSubstitutedRecord(record) || isOnLeaveRecord(record);
 
 const getFlagLabel = (flagId) => {
   switch (Number(flagId)) {
@@ -142,14 +168,14 @@ const getFlagLabel = (flagId) => {
 // Status color map matching the attendance management page colors
 const getStatusColor = (flagId) => {
   switch (Number(flagId)) {
-    case 1: return { bg: '#94a3b8', text: '#ffffff' }; // Upcoming - slate
-    case 2: return { bg: '#15803d', text: '#ffffff' }; // Present - green
+    case 1: return { bg: '#64748b', text: '#ffffff' }; // Upcoming - slate
+    case 2: return { bg: '#16a34a', text: '#ffffff' }; // Present - green
     case 3: return { bg: '#dc2626', text: '#ffffff' }; // Absent - red
-    case 4: return { bg: '#7c3aed', text: '#ffffff' }; // Substituted - violet
+    case 4: return { bg: '#4f46e5', text: '#ffffff' }; // Substituted - indigo
     case 5: return { bg: '#f59e0b', text: '#0f172a' }; // Late - amber
-    case 7: return { bg: '#0ea5e9', text: '#ffffff' }; // On Leave - sky
+    case 7: return { bg: '#0891b2', text: '#ffffff' }; // On Leave - cyan
     case 8: return { bg: '#f97316', text: '#ffffff' }; // Pending - orange
-    default: return { bg: '#94a3b8', text: '#ffffff' }; // Default - slate
+    default: return { bg: '#64748b', text: '#ffffff' }; // Default - slate
   }
 };
 
@@ -175,20 +201,95 @@ const formatClockDate = (d) => {
   return `${month} ${day},${year} ${hours}:${minutes}${ampm}`;
 };
 
+const ClockDisplay = React.memo(function ClockDisplay() {
+  const [now, setNow] = React.useState(() => new Date());
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <>{formatClockDate(now)}</>;
+});
+
+const CountdownDisplay = React.memo(function CountdownDisplay({ targetDate }) {
+  const getSecondsLeft = React.useCallback(() => {
+    if (!targetDate) return null;
+    return Math.max(0, Math.ceil((targetDate.getTime() - Date.now()) / 1000));
+  }, [targetDate]);
+  const [secondsLeft, setSecondsLeft] = React.useState(getSecondsLeft);
+
+  React.useEffect(() => {
+    setSecondsLeft(getSecondsLeft());
+    if (!targetDate) return undefined;
+    const timer = window.setInterval(() => setSecondsLeft(getSecondsLeft()), 1000);
+    return () => window.clearInterval(timer);
+  }, [getSecondsLeft, targetDate]);
+
+  if (secondsLeft == null) return null;
+  if (secondsLeft <= 0) return <>now</>;
+  const days = Math.floor(secondsLeft / 86400);
+  const hours = Math.floor((secondsLeft % 86400) / 3600);
+  const mins = Math.floor((secondsLeft % 3600) / 60);
+  const secs = secondsLeft % 60;
+  const value = `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  return <>{days > 0 ? `${days}d ${value}` : value}</>;
+});
+
+const arraysEqualByJson = (left, right) => {
+  if (left === right) return true;
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+  try { return JSON.stringify(left) === JSON.stringify(right); } catch (e) { return false; }
+};
+
+const ensureSwalLoaded = async () => {
+  if (typeof window === 'undefined') return;
+  if (window.Swal) return;
+  if (!document.querySelector('link[data-swal]')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css';
+    link.setAttribute('data-swal', '1');
+    document.head.appendChild(link);
+  }
+  if (document.querySelector('script[data-swal]')) {
+    const existing = document.querySelector('script[data-swal]');
+    if (existing.getAttribute('data-loaded') === '1' && window.Swal) return;
+    await new Promise((resolve, reject) => {
+      existing.addEventListener('load', () => resolve(), { once: true });
+      existing.addEventListener('error', () => reject(new Error('Failed to load SweetAlert')), { once: true });
+    });
+    if (window.Swal) return;
+  }
+  await new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js';
+    script.async = true;
+    script.setAttribute('data-swal', '1');
+    script.onload = () => { script.setAttribute('data-loaded', '1'); resolve(); };
+    script.onerror = () => reject(new Error('Failed to load SweetAlert script'));
+    document.head.appendChild(script);
+  });
+  if (!window.Swal) throw new Error('SweetAlert failed to initialize');
+};
+
 export default function AttendanceIndex() {
   const [userId, setUserId] = React.useState(null);
   const [teacherName, setTeacherName] = React.useState('');
     
   const [records, setRecords] = React.useState([]);
+  const [attendanceDataLoaded, setAttendanceDataLoaded] = React.useState(false);
+  const [qrStorageReady, setQrStorageReady] = React.useState(false);
   const [rooms, setRooms] = React.useState([]);
   const [floors, setFloors] = React.useState([]);
   const [buildings, setBuildings] = React.useState([]);
+  const [referenceDataLoaded, setReferenceDataLoaded] = React.useState(false);
   const [currentBuilding, setCurrentBuilding] = React.useState(null);
     
   const [coords, setCoords] = React.useState(null);
   const [errorMessage, setErrorMessage] = React.useState(null);
+  const [locationPermission, setLocationPermission] = React.useState('checking');
+  const [locationIssue, setLocationIssue] = React.useState(null);
+  const [gpsEnabled, setGpsEnabled] = React.useState(true);
   const [wrongFloorInfo, setWrongFloorInfo] = React.useState(null);
-  const [filterMode, setFilterMode] = React.useState('today');
     
   const [actionAllowed, setActionAllowed] = React.useState(false);
   const [allowAt, setAllowAt] = React.useState(null);
@@ -203,15 +304,18 @@ export default function AttendanceIndex() {
   const [previewActive, setPreviewActive] = React.useState(false);
   const scannerStartedRef = React.useRef(false);
   const handleCheckNowRef = React.useRef(null);
+  const scannerSessionRef = React.useRef(0);
+  const locationSuppressedRef = React.useRef(false);
+  const substitutedNoticeKeyRef = React.useRef('');
     
-  const [nextSchedule, setNextSchedule] = React.useState(null);
-  const [nextStartDate, setNextStartDate] = React.useState(null);
-  const [nextSecondsLeft, setNextSecondsLeft] = React.useState(null);
-
   const [cameraPermission, setCameraPermission] = React.useState('prompt');
 
   const [scannedQrToken, setScannedQrToken] = React.useState(null);
   const [scannedFloor, setScannedFloor] = React.useState(null);
+  const [manualFloorCode, setManualFloorCode] = React.useState('');
+  const [manualCodeError, setManualCodeError] = React.useState('');
+  const [manualCodeVerifying, setManualCodeVerifying] = React.useState(false);
+  const [qrVerificationMode, setQrVerificationMode] = React.useState('scan');
   const [devicePlatform] = React.useState(() => detectDevicePlatform());
   const [connectionQuality, setConnectionQuality] = React.useState(null);
   const pingIntervalRef = React.useRef(null);
@@ -220,140 +324,161 @@ export default function AttendanceIndex() {
   const [parallelModalData, setParallelModalData] = React.useState(null);
   const [showParallelModal, setShowParallelModal] = React.useState(false);
 
-  const [nowClock, setNowClock] = React.useState(new Date());
+  const [scheduleEpoch, setScheduleEpoch] = React.useState(0);
   React.useEffect(() => {
-    const timer = setInterval(() => setNowClock(new Date()), 1000);
-    return () => clearInterval(timer);
+    let timer = null;
+    let cancelled = false;
+
+    const scheduleNextTick = () => {
+      const delay = 5000 - (Date.now() % 5000);
+      timer = window.setTimeout(() => {
+        if (cancelled) return;
+        setScheduleEpoch(value => value + 1);
+        scheduleNextTick();
+      }, delay);
+    };
+
+    scheduleNextTick();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, []);
 
   React.useEffect(() => {
+    let pingController = null;
     const measurePing = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setConnectionQuality({ rtt: null, effectiveType: 'offline', label: 'No Signal', color: '#6c757d' });
+        setConnectionQuality({ rtt: null, downlink: null, effectiveType: 'offline', label: 'Offline', color: '#6c757d' });
         return;
       }
       const start = performance.now();
       let ok = true;
+      let timeout = null;
       try {
-        const ctrl = new AbortController();
-        const timeout = setTimeout(() => ctrl.abort(), 5000);
-        await fetch('/server-php/api/ping.json?t=' + Date.now(), { method: 'GET', cache: 'no-store', mode: 'no-cors', signal: ctrl.signal });
-        clearTimeout(timeout);
-      } catch (_) { ok = false; }
+        if (pingController) pingController.abort();
+        pingController = new AbortController();
+        timeout = window.setTimeout(() => pingController?.abort(), 5000);
+        const pingUrl = new URL('network-ping.json', document.baseURI);
+        pingUrl.searchParams.set('t', String(Date.now()));
+        const response = await fetch(pingUrl.toString(), {
+          method: 'GET',
+          cache: 'no-store',
+          signal: pingController.signal,
+        });
+        if (!response.ok) throw new Error(`Network check failed (${response.status})`);
+      } catch (err) {
+        if (err?.name === 'AbortError') return;
+        ok = false;
+      } finally {
+        if (timeout !== null) window.clearTimeout(timeout);
+      }
       const elapsed = Math.round(performance.now() - start);
+      const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+      const downlink = Number(connection?.downlink);
+      const estimatedDownlink = Number.isFinite(downlink) && downlink >= 0 ? downlink : null;
+      const effectiveType = connection?.effectiveType || 'unknown';
       if (!ok) {
-        setConnectionQuality({ rtt: null, effectiveType: 'unknown', label: 'No Signal', color: '#6c757d' });
+        setConnectionQuality({ rtt: null, downlink: estimatedDownlink, effectiveType, label: 'Offline', color: '#6c757d' });
         return;
       }
       const clamped = Math.min(Math.max(elapsed, 0), 999);
       let label, color;
-      if (clamped < 100) { label = 'Good'; color = '#28a745'; }
-      else if (clamped < 200) { label = 'Fair'; color = '#ffc107'; }
+      const slowDownlink = estimatedDownlink !== null && estimatedDownlink < 1.5;
+      const fairDownlink = estimatedDownlink !== null && estimatedDownlink < 5;
+      if (clamped < 100 && !fairDownlink) { label = 'Good'; color = '#28a745'; }
+      else if (clamped < 250 && !slowDownlink) { label = 'Fair'; color = '#ffc107'; }
       else { label = 'Poor'; color = '#dc3545'; }
-      setConnectionQuality({ rtt: clamped, effectiveType: navigator.connection?.effectiveType || 'unknown', label, color });
+      setConnectionQuality({ rtt: clamped, downlink: estimatedDownlink, effectiveType, label, color });
     };
     measurePing();
     const onOnline = () => measurePing();
+    const onOffline = () => setConnectionQuality({ rtt: null, downlink: null, effectiveType: 'offline', label: 'Offline', color: '#6c757d' });
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') measurePing();
+      else if (pingController) pingController.abort();
+    };
     window.addEventListener('online', onOnline);
-    window.addEventListener('offline', () => setConnectionQuality({ rtt: null, effectiveType: 'offline', label: 'No Signal', color: '#6c757d' }));
-    pingIntervalRef.current = setInterval(measurePing, 3000);
+    window.addEventListener('offline', onOffline);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    pingIntervalRef.current = window.setInterval(measurePing, 10000);
     return () => {
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (pingController) pingController.abort();
+      if (pingIntervalRef.current) window.clearInterval(pingIntervalRef.current);
       window.removeEventListener('online', onOnline);
-      window.removeEventListener('offline', onOnline);
+      window.removeEventListener('offline', onOffline);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, []);
   const [altitudeCalibration, setAltitudeCalibration] = React.useState(null);
   const LOCAL_STORAGE_KEY = 'attendance_scanned_qr_v1';
 
-  // --- Logic Effects ---
-  React.useEffect(() => {
-    try {
-      const floorsReady = Array.isArray(floors) && floors.length > 0;
-      const recordsReady = Array.isArray(records); 
-      if (!floorsReady || !recordsReady) return; 
-
-      const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (!parsed || !parsed.token) return;
-
-      const now = new Date();
-      const todayStr = formatDateYMD(now);
-      const todays = records.filter(r => r.date === todayStr);
-      const active = todays.find(r => {
-        if (!r.start_time || !r.end_time) return false;
-        const start = new Date(`${r.date}T${r.start_time}`);
-        const end = new Date(`${r.date}T${r.end_time}`);
-        return now >= start && now <= end;
-      }) || null;
-
-      if (parsed.schedule_id && active && (String(parsed.schedule_id) !== String(active.schedule_id))) {
-        const parsedRecord = todays.find(r => String(r.schedule_id) === String(parsed.schedule_id));
-        if (parsedRecord && isSameScheduleGroup(parsedRecord, active)) {
-          // Keep one QR scan alive when the teacher has multiple sections in the same subject/time slot.
-        } else {
-          localStorage.removeItem(LOCAL_STORAGE_KEY);
-          return;
-        }
-      }
-
-      if (parsed.group_key && active && parsed.group_key !== `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}`) {
-        localStorage.removeItem(LOCAL_STORAGE_KEY);
-        return;
-      }
-
-      if (parsed.floor_id) {
-        const f = floors.find(ff => String(ff.floor_id) === String(parsed.floor_id));
-        if (f) {
-          setScannedQrToken(parsed.token);
-          setScannedFloor(f);
-        } else {
-          localStorage.removeItem(LOCAL_STORAGE_KEY);
-        }
-      } else {
-        setScannedQrToken(parsed.token);
-      }
-    } catch (e) { }
-  }, [floors, records]);
-
-  React.useEffect(() => {
-    try {
-      if (!scannedQrToken) {
-        localStorage.removeItem(LOCAL_STORAGE_KEY);
-        return;
-      }
-      const now = new Date();
-      const todayStr = formatDateYMD(now);
-      const todays = records.filter(r => r.date === todayStr);
-      const active = todays.find(r => {
-        if (!r.start_time || !r.end_time) return false;
-        const start = new Date(`${r.date}T${r.start_time}`);
-        const end = new Date(`${r.date}T${r.end_time}`);
-        return now >= start && now <= end;
-      }) || null;
-
-      const payload = {
-        token: scannedQrToken,
-        floor_id: scannedFloor ? scannedFloor.floor_id : null,
-        schedule_id: active ? active.schedule_id : null,
-        group_key: active ? `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}` : null,
-        ts: Date.now()
-      };
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
-    } catch (e) {}
-  }, [scannedQrToken, scannedFloor, records]);
-
   const lastCoordsRef = React.useRef(null);
   const watchIdRef = React.useRef(null);
-  const pollingRef = React.useRef(null);
+  const locationTrackingActiveRef = React.useRef(false);
   const isFetchingRef = React.useRef(false);
-  const pausedPollingRef = React.useRef(false);
+  const attendanceAbortRef = React.useRef(null);
+  const attendanceRequestSeqRef = React.useRef(0);
+  const attendanceEtagRef = React.useRef('');
+  const attendanceSignatureRef = React.useRef('');
+  const referenceAbortRef = React.useRef(null);
+  const referenceRequestSeqRef = React.useRef(0);
+  const lastPositionAtRef = React.useRef(0);
+  const fallbackLocationInFlightRef = React.useRef(false);
+  const locationPermissionRef = React.useRef('checking');
+  const locationRetryRequiredRef = React.useRef(false);
+  const gpsEnabledRef = React.useRef(true);
+  const locationAutoRetryCountRef = React.useRef(0);
+  const locationAutoRetryTimerRef = React.useRef(null);
+  const startLocationTrackingRef = React.useRef(null);
+  const locationRequiredAlertShownRef = React.useRef(false);
+  const locationBlockedAlertShownRef = React.useRef(false);
 
   const ACCURACY_THRESHOLD_METERS = 30;
   const ALTITUDE_ACCURACY_THRESHOLD_METERS = 30;
   const LOCATION_DISTANCE_INTERVAL_METERS = 5;
-  const BUILDING_TOLERANCE_METERS = 10;
+  const MAX_LOCATION_AUTO_RETRIES = 3;
+  const LOCATION_AUTO_RETRY_DELAY_MS = 1000;
+
+  const showLocationRequiredAlert = React.useCallback(async () => {
+    if (locationRequiredAlertShownRef.current) return false;
+    locationRequiredAlertShownRef.current = true;
+    try {
+      await ensureSwalLoaded();
+      const result = await window.Swal.fire({
+        icon: 'info',
+        title: 'Location Required',
+        text: 'Attendance needs your location. Select Enable Location, then allow location access in your browser.',
+        confirmButtonText: 'Enable Location',
+        showCancelButton: true,
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#15803d',
+        reverseButtons: true,
+      });
+      return Boolean(result?.isConfirmed);
+    } catch (error) {
+      console.warn('Location permission alert unavailable:', error);
+      return false;
+    }
+  }, []);
+
+  const showLocationBlockedAlert = React.useCallback(async () => {
+    if (locationBlockedAlertShownRef.current) return;
+    locationBlockedAlertShownRef.current = true;
+    try {
+      await ensureSwalLoaded();
+      await window.Swal.fire({
+        icon: 'error',
+        title: 'Location Permission Blocked',
+        text: 'Allow Location for this website in your browser settings, then press Turn on GPS.',
+        confirmButtonText: 'OK',
+        confirmButtonColor: '#15803d',
+      });
+    } catch (error) {
+      console.warn('Location blocked alert unavailable:', error);
+    }
+  }, []);
 
   React.useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -380,138 +505,401 @@ export default function AttendanceIndex() {
     setTeacherName(nameParam || '');
   }, []);
 
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const [roomsData, floorsData] = await Promise.all([apiGet('rooms'), apiGet('floors')]);
-        if (Array.isArray(roomsData)) setRooms(roomsData);
-        if (Array.isArray(floorsData)) setFloors(floorsData);
-      } catch (err) {
-        console.error('Failed loading rooms/floors (initial):', err);
-      }
-    })();
+  const loadReferenceData = React.useCallback(async ({ silent = false } = {}) => {
+    const requestSeq = ++referenceRequestSeqRef.current;
+    if (referenceAbortRef.current) referenceAbortRef.current.abort();
+    const controller = new AbortController();
+    referenceAbortRef.current = controller;
+    try {
+      const [roomsData, floorsData, buildingsData] = await Promise.all([
+        apiGet('rooms', { signal: controller.signal }),
+        apiGet('floors', { signal: controller.signal }),
+        apiGet('buildings', { signal: controller.signal }),
+      ]);
+      if (requestSeq !== referenceRequestSeqRef.current) return;
+      const isActive = (item) => String(item?.status || '').toLowerCase() === 'active';
+      const activeBuildings = Array.isArray(buildingsData)
+        ? buildingsData.filter((building) => isActive(building) && (!building.school_id || String(building.school_status || '').toLowerCase() === 'active'))
+        : [];
+      const activeBuildingIds = new Set(activeBuildings.map((building) => String(building.building_id)));
+      const activeFloors = Array.isArray(floorsData)
+        ? floorsData.filter((floor) => isActive(floor) && activeBuildingIds.has(String(floor.building_id)))
+        : [];
+      const activeFloorIds = new Set(activeFloors.map((floor) => String(floor.floor_id)));
+      const activeRooms = Array.isArray(roomsData)
+        ? roomsData.filter((room) => isActive(room) && activeBuildingIds.has(String(room.building_id)) && activeFloorIds.has(String(room.floor_id)))
+        : [];
+      setRooms(previous => arraysEqualByJson(previous, activeRooms) ? previous : activeRooms);
+      setFloors(previous => arraysEqualByJson(previous, activeFloors) ? previous : activeFloors);
+      setBuildings(previous => arraysEqualByJson(previous, activeBuildings) ? previous : activeBuildings);
+      setReferenceDataLoaded(true);
+    } catch (err) {
+      if (err?.name !== 'AbortError' && !silent) console.error('Failed loading attendance reference data:', err);
+    }
   }, []);
 
   React.useEffect(() => {
-    (async () => {
-      try {
-        const data = await apiGet('buildings');
-        setBuildings(Array.isArray(data) ? data : []);
-      } catch (e) {
-        console.error('Failed to load buildings', e);
-      }
-    })();
-  }, []);
+    loadReferenceData();
+    const refresh = () => loadReferenceData({ silent: true });
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine !== false) refresh();
+    };
+    window.addEventListener('focus', refresh);
+    window.addEventListener('online', refresh);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      if (referenceAbortRef.current) referenceAbortRef.current.abort();
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('online', refresh);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [loadReferenceData]);
 
-  const loadMyAttendance = React.useCallback(async () => {
+  const loadMyAttendance = React.useCallback(async ({ silent = false } = {}) => {
     if (!userId || isFetchingRef.current) return;
     isFetchingRef.current = true;
+    const requestSeq = ++attendanceRequestSeqRef.current;
+    const controller = new AbortController();
+    attendanceAbortRef.current = controller;
     try {
-      const data = await apiGet(`attendance?teacher_id=${userId}`);
-      setRecords(Array.isArray(data) ? data : []);
+      // The live GPS screen only needs today's classes. Historical and future
+      // records are loaded independently by the Attendance History calendar.
+      const today = formatDateYMD(new Date());
+      const headers = attendanceEtagRef.current ? { 'If-None-Match': attendanceEtagRef.current } : {};
+      const response = await apiGet(`attendance?teacher_id=${userId}&date=${encodeURIComponent(today)}&include_avatar=0&operational_only=1`, {
+        signal: controller.signal,
+        headers,
+        returnMeta: true,
+      });
+      if (requestSeq !== attendanceRequestSeqRef.current || response?.status === 304) return;
+      const data = Array.isArray(response?.data) ? response.data : [];
+      const etag = response?.headers?.get?.('ETag');
+      if (etag) attendanceEtagRef.current = etag;
+      let signature = '';
+      try { signature = JSON.stringify(data); } catch (e) {}
+      if (!signature || signature !== attendanceSignatureRef.current) {
+        attendanceSignatureRef.current = signature;
+        setRecords(data);
+      }
+      setAttendanceDataLoaded(true);
       setErrorMessage(null);
     } catch (err) {
-      setErrorMessage(err && err.message ? `Network Error: ${err.message}` : 'Network Error');
+      if (err?.name !== 'AbortError' && !silent) {
+        setErrorMessage(err && err.message ? `Network Error: ${err.message}` : 'Network Error');
+      }
     } finally {
-      isFetchingRef.current = false;
+      if (requestSeq === attendanceRequestSeqRef.current) {
+        isFetchingRef.current = false;
+        attendanceAbortRef.current = null;
+      }
     }
   }, [userId]);
 
-  const startLocationTracking = React.useCallback(() => {
-    if (!('geolocation' in navigator)) {
-      setErrorMessage('Geolocation is not supported.');
+  const acceptLocation = React.useCallback((newCoords) => {
+    if (!newCoords) return;
+    if (locationAutoRetryTimerRef.current !== null) {
+      window.clearTimeout(locationAutoRetryTimerRef.current);
+      locationAutoRetryTimerRef.current = null;
+    }
+    locationAutoRetryCountRef.current = 0;
+    lastPositionAtRef.current = Date.now();
+    locationRetryRequiredRef.current = false;
+    locationPermissionRef.current = 'granted';
+    setLocationPermission('granted');
+    setLocationIssue(null);
+    const last = lastCoordsRef.current;
+    if (last) {
+      const dist = getDistanceMeters(newCoords.latitude, newCoords.longitude, last.latitude, last.longitude);
+      const previousAccuracy = Number(last.accuracy);
+      const nextAccuracy = Number(newCoords.accuracy);
+      const accuracyImproved = Number.isFinite(nextAccuracy)
+        && (!Number.isFinite(previousAccuracy) || nextAccuracy < previousAccuracy);
+      if (dist < LOCATION_DISTANCE_INTERVAL_METERS && !accuracyImproved) return;
+    }
+    lastCoordsRef.current = newCoords;
+    setCoords(newCoords);
+    setErrorMessage(null);
+  }, []);
+
+  const stopLocationTracking = React.useCallback(() => {
+    locationTrackingActiveRef.current = false;
+    if (watchIdRef.current !== null) {
+      try { navigator.geolocation.clearWatch(watchIdRef.current); } catch (e) {}
+      watchIdRef.current = null;
+    }
+  }, []);
+
+  const handleLocationFailure = React.useCallback((error) => {
+    const code = Number(error?.code);
+    const rawMessage = String(error?.message || '');
+    const normalizedMessage = rawMessage.toLowerCase();
+    let type = 'unavailable';
+    let message = 'Location is temporarily unavailable. Move near a window or open area, then press Turn on GPS.';
+
+    if (code === 1) {
+      type = 'permission-denied';
+      message = 'Location permission is blocked. Allow Location for this website in your browser settings, then press Turn on GPS.';
+      locationPermissionRef.current = 'denied';
+      setLocationPermission('denied');
+      void showLocationBlockedAlert();
+    } else if (code === 3) {
+      type = 'timeout';
+      message = 'The location request timed out after 3 automatic retries. Check that device location is on, then press Turn on GPS.';
+    } else if (
+      normalizedMessage.includes('turned off')
+      || normalizedMessage.includes('disabled')
+      || normalizedMessage.includes('location service')
+      || normalizedMessage.includes('location setting')
+    ) {
+      type = 'device-location-off';
+      message = 'Device location appears to be turned off. Turn it on, then press Turn on GPS.';
+    } else if (!('geolocation' in navigator)) {
+      type = 'unsupported';
+      message = 'This browser does not support location access.';
+    }
+
+    fallbackLocationInFlightRef.current = false;
+    stopLocationTracking();
+    if (code === 3 && gpsEnabledRef.current && !locationSuppressedRef.current && locationAutoRetryCountRef.current < MAX_LOCATION_AUTO_RETRIES) {
+      locationAutoRetryCountRef.current += 1;
+      locationRetryRequiredRef.current = false;
+      setLocationIssue(null);
+      if (locationAutoRetryTimerRef.current !== null) window.clearTimeout(locationAutoRetryTimerRef.current);
+      locationAutoRetryTimerRef.current = window.setTimeout(() => {
+        locationAutoRetryTimerRef.current = null;
+        if (!gpsEnabledRef.current || locationSuppressedRef.current || document.visibilityState !== 'visible' || navigator.onLine === false) return;
+        lastPositionAtRef.current = Date.now();
+        if (typeof startLocationTrackingRef.current === 'function') startLocationTrackingRef.current();
+      }, LOCATION_AUTO_RETRY_DELAY_MS);
       return;
     }
+
+    locationAutoRetryCountRef.current = 0;
+    locationRetryRequiredRef.current = true;
+    gpsEnabledRef.current = false;
+    setGpsEnabled(false);
+    setLocationIssue({ type, message });
+  }, [showLocationBlockedAlert, stopLocationTracking]);
+
+  const startLocationTracking = React.useCallback(() => {
+    if (locationSuppressedRef.current || !gpsEnabledRef.current) return;
+    if (!('geolocation' in navigator)) {
+      handleLocationFailure({ code: 0, message: 'Geolocation is not supported.' });
+      return;
+    }
+    if (watchIdRef.current !== null) return;
     try {
+      lastPositionAtRef.current = Date.now();
+      locationTrackingActiveRef.current = true;
       watchIdRef.current = navigator.geolocation.watchPosition(
         (pos) => {
-          const newCoords = pos.coords;
-          const last = lastCoordsRef.current;
-          if (last) {
-            const dist = getDistanceMeters(newCoords.latitude, newCoords.longitude, last.latitude, last.longitude);
-            if (dist < LOCATION_DISTANCE_INTERVAL_METERS) return; 
-          }
-          lastCoordsRef.current = newCoords;
-          setCoords(newCoords);
-          setErrorMessage(null);
+          if (!locationTrackingActiveRef.current) return;
+          acceptLocation(pos.coords);
         },
         (err) => {
-          setErrorMessage(`GPS Error: ${err && err.message ? err.message : String(err)}`);
+          if (!locationTrackingActiveRef.current) return;
+          handleLocationFailure(err);
         },
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
       );
     } catch (err) {
-      setErrorMessage('Failed to start geolocation: ' + (err.message || err));
+      handleLocationFailure({ code: 0, message: err?.message || String(err) });
     }
-  }, []);
+  }, [acceptLocation, handleLocationFailure]);
+  startLocationTrackingRef.current = startLocationTracking;
 
-  const gpsPollRef = React.useRef(null);
-  const LOCATION_POLL_INTERVAL_MS = 2000;
+  const retryLocationTracking = React.useCallback(async () => {
+    gpsEnabledRef.current = true;
+    setGpsEnabled(true);
+    locationAutoRetryCountRef.current = 0;
+    if (locationAutoRetryTimerRef.current !== null) {
+      window.clearTimeout(locationAutoRetryTimerRef.current);
+      locationAutoRetryTimerRef.current = null;
+    }
+    stopLocationTracking();
+    fallbackLocationInFlightRef.current = false;
+    setLocationIssue(null);
 
-  const startGpsPoll = React.useCallback(() => {
-    if (gpsPollRef.current) return;
-    if (!('geolocation' in navigator)) return;
-    gpsPollRef.current = setInterval(() => {
+    if (locationPermissionRef.current === 'denied' && navigator.permissions?.query) {
       try {
-        navigator.geolocation.getCurrentPosition(
-          (pos) => {
-            const newCoords = pos.coords;
-            lastCoordsRef.current = newCoords;
-            setCoords(newCoords);
-            setErrorMessage(null);
-          },
-          (err) => {
-            console.debug('GPS Poll Error (suppressed in UI):', err && err.message ? err.message : String(err));
-          },
-          { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
-        );
-      } catch (e) {}
-    }, LOCATION_POLL_INTERVAL_MS);
-  }, []);
-
-  const stopGpsPoll = React.useCallback(() => {
-    try {
-      if (gpsPollRef.current) {
-        clearInterval(gpsPollRef.current);
-        gpsPollRef.current = null;
+        const permission = await navigator.permissions.query({ name: 'geolocation' });
+        locationPermissionRef.current = permission.state;
+        setLocationPermission(permission.state);
+        if (permission.state === 'denied') {
+          gpsEnabledRef.current = false;
+          setGpsEnabled(false);
+          locationRetryRequiredRef.current = true;
+          setLocationIssue({
+            type: 'permission-denied',
+            message: 'Location permission is blocked. Allow Location for this website in your browser settings, then press Turn on GPS.',
+          });
+          locationBlockedAlertShownRef.current = false;
+          void showLocationBlockedAlert();
+          return;
+        }
+      } catch (error) {
+        // The geolocation request below remains the source of truth when Permissions API is unavailable.
       }
-    } catch (e) {}
-  }, []);
+    }
+
+    locationRetryRequiredRef.current = false;
+    lastPositionAtRef.current = Date.now();
+    startLocationTracking();
+  }, [showLocationBlockedAlert, startLocationTracking, stopLocationTracking]);
+
+  const toggleGpsTracking = React.useCallback(async () => {
+    if (gpsEnabledRef.current) {
+      gpsEnabledRef.current = false;
+      setGpsEnabled(false);
+      locationRetryRequiredRef.current = true;
+      locationAutoRetryCountRef.current = 0;
+      fallbackLocationInFlightRef.current = false;
+      if (locationAutoRetryTimerRef.current !== null) {
+        window.clearTimeout(locationAutoRetryTimerRef.current);
+        locationAutoRetryTimerRef.current = null;
+      }
+      stopLocationTracking();
+      lastCoordsRef.current = null;
+      lastPositionAtRef.current = 0;
+      setCoords(null);
+      setLocationIssue({ type: 'gps-off', message: 'GPS tracking is turned off. Press Turn on GPS to continue.' });
+      return;
+    }
+    await retryLocationTracking();
+  }, [retryLocationTracking, stopLocationTracking]);
+
+  React.useEffect(() => {
+    if (!userId) return undefined;
+    let mounted = true;
+    let permissionStatus = null;
+
+    const applyPermissionState = async (state) => {
+      if (!mounted) return;
+      const nextState = state || 'unknown';
+      locationPermissionRef.current = nextState;
+      setLocationPermission(nextState);
+
+      if (nextState === 'denied') {
+        handleLocationFailure({ code: 1, message: 'Location permission denied.' });
+        return;
+      }
+
+      if (nextState === 'prompt') {
+        gpsEnabledRef.current = false;
+        setGpsEnabled(false);
+        locationRetryRequiredRef.current = true;
+        setLocationIssue({
+          type: 'permission-required',
+          message: 'Location permission is required for attendance. Select Enable Location to continue.',
+        });
+        const shouldEnable = await showLocationRequiredAlert();
+        if (!mounted) return;
+        if (shouldEnable) {
+          await retryLocationTracking();
+        }
+      }
+    };
+
+    if (!('geolocation' in navigator)) {
+      locationPermissionRef.current = 'unsupported';
+      setLocationPermission('unsupported');
+      handleLocationFailure({ code: 0, message: 'Geolocation is not supported.' });
+      return () => { mounted = false; };
+    }
+
+    if (!navigator.permissions?.query) {
+      locationPermissionRef.current = 'unknown';
+      setLocationPermission('unknown');
+      return () => { mounted = false; };
+    }
+
+    navigator.permissions.query({ name: 'geolocation' })
+      .then((status) => {
+        if (!mounted) return;
+        permissionStatus = status;
+        void applyPermissionState(status.state);
+        status.onchange = () => { void applyPermissionState(status.state); };
+      })
+      .catch(() => {
+        if (!mounted) return;
+        locationPermissionRef.current = 'unknown';
+        setLocationPermission('unknown');
+      });
+
+    return () => {
+      mounted = false;
+      if (permissionStatus) permissionStatus.onchange = null;
+    };
+  }, [userId, handleLocationFailure, retryLocationTracking, showLocationRequiredAlert]);
 
   React.useEffect(() => {
     const update = () => {
-      try {
-        const visible = (typeof document !== 'undefined') ? document.visibilityState === 'visible' : true;
-        if (userId && visible && !isCameraVisible) startGpsPoll(); else stopGpsPoll();
-      } catch (e) {}
+      const visible = document.visibilityState === 'visible';
+      const online = navigator.onLine !== false;
+      const permissionAllowsStart = locationPermission === 'granted' || locationPermission === 'unknown';
+      if (userId && gpsEnabled && visible && online && !isCameraVisible && permissionAllowsStart && !locationRetryRequiredRef.current) startLocationTracking();
+      else stopLocationTracking();
     };
     update();
     document.addEventListener('visibilitychange', update);
-    return () => { stopGpsPoll(); document.removeEventListener('visibilitychange', update); };
-  }, [userId, isCameraVisible, startGpsPoll, stopGpsPoll]);
+    window.addEventListener('online', update);
+    window.addEventListener('offline', update);
+    return () => {
+      stopLocationTracking();
+      document.removeEventListener('visibilitychange', update);
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', update);
+    };
+  }, [userId, gpsEnabled, isCameraVisible, locationPermission, startLocationTracking, stopLocationTracking]);
 
   React.useEffect(() => {
-    if (!userId) return;
-    (async () => {
+    if (!userId || !('geolocation' in navigator)) return undefined;
+    const timer = window.setInterval(() => {
+      const active = document.visibilityState === 'visible'
+        && navigator.onLine !== false
+        && !isCameraVisible
+        && !locationSuppressedRef.current
+        && !locationRetryRequiredRef.current;
+      if (!active || fallbackLocationInFlightRef.current || Date.now() - lastPositionAtRef.current < 5000) return;
+      fallbackLocationInFlightRef.current = true;
       try {
-        const [roomsData, floorsData] = await Promise.all([
-          apiGet('rooms'),
-          apiGet('floors')
-        ]);
-        if (Array.isArray(roomsData)) setRooms(roomsData);
-        if (Array.isArray(floorsData)) setFloors(floorsData);
-      } catch (err) {
-        console.error('Failed loading rooms/floors', err);
-      }
-    })();
+        navigator.geolocation.getCurrentPosition(
+          pos => {
+            fallbackLocationInFlightRef.current = false;
+            if (locationTrackingActiveRef.current) acceptLocation(pos.coords);
+          },
+          error => {
+            fallbackLocationInFlightRef.current = false;
+            if (locationTrackingActiveRef.current) handleLocationFailure(error);
+          },
+          { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+        );
+      } catch (e) { fallbackLocationInFlightRef.current = false; }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [userId, isCameraVisible, acceptLocation, handleLocationFailure]);
+
+  React.useEffect(() => () => {
+    if (locationAutoRetryTimerRef.current !== null) window.clearTimeout(locationAutoRetryTimerRef.current);
+  }, []);
+
+  React.useEffect(() => {
+    if (!userId) return undefined;
+    attendanceEtagRef.current = '';
+    attendanceSignatureRef.current = '';
     loadMyAttendance();
-    startLocationTracking();
-    pollingRef.current = setInterval(loadMyAttendance, 5000);
     return () => {
-      if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
-      if (pollingRef.current) clearInterval(pollingRef.current);
+      attendanceRequestSeqRef.current += 1;
+      isFetchingRef.current = false;
+      if (attendanceAbortRef.current) attendanceAbortRef.current.abort();
     };
-  }, [userId, loadMyAttendance, startLocationTracking]);
+  }, [userId, loadMyAttendance]);
+
+  useAutoRefresh({
+    refresh: () => loadMyAttendance({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.LIVE,
+    enabled: Boolean(userId) && !isCameraVisible,
+  });
 
   const detectFloorFromAltitude = React.useCallback((alt, buildingId = null) => {
     if (alt == null || !floors.length) return null;
@@ -625,16 +1013,117 @@ export default function AttendanceIndex() {
     return upcoming;
   }, [getActiveSchedules, getUpcomingSchedules]);
 
-  const activeSchedule = React.useMemo(() => findActiveSchedule(), [findActiveSchedule]);
+  const activeSchedule = React.useMemo(() => findActiveSchedule(), [findActiveSchedule, scheduleEpoch]);
+  const activeAttendanceOnLeave = isOnLeaveRecord(activeSchedule);
+  const activeAttendanceBlocked = isAttendanceExemptRecord(activeSchedule);
+
+  React.useEffect(() => {
+    locationSuppressedRef.current = activeAttendanceBlocked;
+    if (activeAttendanceBlocked) {
+      stopLocationTracking();
+      setWrongFloorInfo(null);
+      setErrorMessage(previous => {
+        const message = String(previous || '').toLowerCase();
+        return message.includes('gps') || message.includes('geolocation') || message.includes('wrong_floor')
+          ? null
+          : previous;
+      });
+      return;
+    }
+    const permissionAllowsStart = locationPermission === 'granted' || locationPermission === 'unknown';
+    if (userId && gpsEnabled && document.visibilityState === 'visible' && navigator.onLine !== false && !isCameraVisible && permissionAllowsStart && !locationRetryRequiredRef.current) {
+      startLocationTracking();
+    }
+  }, [activeAttendanceBlocked, userId, gpsEnabled, isCameraVisible, locationPermission, startLocationTracking, stopLocationTracking]);
+
   const activeScheduleGroup = React.useMemo(() => (
     activeSchedule ? findMatchingScheduleGroup(activeSchedule) : []
   ), [activeSchedule, findMatchingScheduleGroup]);
 
   // targetSchedule = active OR upcoming within 30 min (for QR validation)
-  const targetSchedule = React.useMemo(() => findTargetSchedule(), [findTargetSchedule]);
+  const targetSchedule = React.useMemo(() => findTargetSchedule(), [findTargetSchedule, scheduleEpoch]);
+  const targetAttendanceBlocked = isAttendanceExemptRecord(targetSchedule);
+  const qrLocationOperational = React.useMemo(() => {
+    const room = targetSchedule
+      ? rooms.find(item => Number(item.room_id) === Number(targetSchedule.room_id))
+      : null;
+    const floor = room ? floors.find(item => Number(item.floor_id) === Number(room.floor_id)) : null;
+    const building = room ? buildings.find(item => Number(item.building_id) === Number(room.building_id)) : null;
+    const isActive = item => ['active', '1', 'true'].includes(String(item?.status || '').trim().toLowerCase());
+    return Boolean(room && floor && building && isActive(room) && isActive(floor) && isActive(building));
+  }, [targetSchedule, rooms, floors, buildings]);
+  const qrScannerDisabled = targetAttendanceBlocked || !referenceDataLoaded || !qrLocationOperational;
   const targetScheduleGroup = React.useMemo(() => (
     targetSchedule ? findTargetScheduleGroup(targetSchedule) : []
   ), [targetSchedule, findTargetScheduleGroup]);
+
+  // --- Logic Effects ---
+  React.useEffect(() => {
+    if (qrStorageReady || !referenceDataLoaded || !attendanceDataLoaded) return;
+    try {
+      const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !parsed.token) return;
+
+      const active = findTargetSchedule();
+      if (!active) {
+        localStorage.removeItem(LOCAL_STORAGE_KEY);
+        return;
+      }
+
+      if (parsed.schedule_id && active && (String(parsed.schedule_id) !== String(active.schedule_id))) {
+        const parsedRecord = records.find(r => r.date === active.date && String(r.schedule_id) === String(parsed.schedule_id));
+        if (parsedRecord && isSameScheduleGroup(parsedRecord, active)) {
+          // Keep one QR scan alive when the teacher has multiple sections in the same subject/time slot.
+        } else {
+          localStorage.removeItem(LOCAL_STORAGE_KEY);
+          return;
+        }
+      }
+
+      if (parsed.group_key && active && parsed.group_key !== `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}`) {
+        localStorage.removeItem(LOCAL_STORAGE_KEY);
+        return;
+      }
+
+      if (parsed.floor_id) {
+        const f = floors.find(ff => String(ff.floor_id) === String(parsed.floor_id));
+        if (f) {
+          setScannedQrToken(parsed.token);
+          setScannedFloor(f);
+        } else {
+          localStorage.removeItem(LOCAL_STORAGE_KEY);
+        }
+      } else {
+        setScannedQrToken(parsed.token);
+      }
+    } catch (e) {
+      try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch (_) {}
+    } finally {
+      setQrStorageReady(true);
+    }
+  }, [qrStorageReady, referenceDataLoaded, attendanceDataLoaded, floors, records, findTargetSchedule]);
+
+  React.useEffect(() => {
+    if (!qrStorageReady) return;
+    try {
+      if (!scannedQrToken) {
+        localStorage.removeItem(LOCAL_STORAGE_KEY);
+        return;
+      }
+      const active = findTargetSchedule();
+
+      const payload = {
+        token: scannedQrToken,
+        floor_id: scannedFloor ? scannedFloor.floor_id : null,
+        schedule_id: active ? active.schedule_id : null,
+        group_key: active ? `${active.date}|${subjectKey(active)}|${timeKey(active.start_time)}|${timeKey(active.end_time)}` : null,
+        ts: Date.now()
+      };
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+    } catch (e) {}
+  }, [qrStorageReady, scannedQrToken, scannedFloor, records, findTargetSchedule]);
 
   const getScheduleRoomName = React.useCallback((record) => {
     if (!record) return '';
@@ -648,10 +1137,9 @@ export default function AttendanceIndex() {
     const seen = new Set();
     return records
       .filter(other => {
-        if (!other || !isSameScheduleGroup(other, record)) return false;
+        if (!other || !isParallelSchedulePair(other, record)) return false;
         const sameAttendance = other.attendance_id && record.attendance_id && String(other.attendance_id) === String(record.attendance_id);
-        const sameSchedule = other.schedule_id && record.schedule_id && String(other.schedule_id) === String(record.schedule_id);
-        return !(sameAttendance || sameSchedule);
+        return !sameAttendance;
       })
       .map(getScheduleRoomName)
       .filter(name => {
@@ -667,26 +1155,59 @@ export default function AttendanceIndex() {
   ), [activeSchedule, getParallelRoomNames]);
 
   const activeParallelRoomNames = React.useMemo(() => {
-    if (activeScheduleGroup.length <= 1) return [];
+    if (!activeSchedule || activeOtherParallelRoomNames.length === 0) return [];
     const seen = new Set();
-    return activeScheduleGroup
-      .map(getScheduleRoomName)
+    return [getScheduleRoomName(activeSchedule), ...activeOtherParallelRoomNames]
       .filter(name => {
         const key = name.trim().toLowerCase();
         if (!key || seen.has(key)) return false;
         seen.add(key);
         return true;
       });
-  }, [activeScheduleGroup, getScheduleRoomName]);
+  }, [activeSchedule, activeOtherParallelRoomNames, getScheduleRoomName]);
 
   const currentRoomObj = React.useMemo(() => {
     return activeSchedule ? rooms.find(r => Number(r.room_id) === Number(activeSchedule.room_id)) || null : null;
   }, [activeSchedule, rooms]);
 
+  const scheduledGroupRooms = React.useMemo(() => {
+    if (!activeSchedule || !Array.isArray(rooms)) return [];
+    const group = (activeScheduleGroup.length > 0 ? activeScheduleGroup : [activeSchedule])
+      .filter(record => !isAttendanceExemptRecord(record));
+    const seen = new Set();
+    return group.map(record => rooms.find(room => Number(room.room_id) === Number(record.room_id)) || null)
+      .filter(room => {
+        if (!room) return false;
+        const key = String(room.room_id ?? '');
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }, [activeSchedule, activeScheduleGroup, rooms]);
+
+  const scheduledGroupBuildings = React.useMemo(() => {
+    if (!activeSchedule || !Array.isArray(buildings)) return [];
+    const allowedIds = new Set(scheduledGroupRooms.map(room => String(room.building_id ?? '')).filter(Boolean));
+    return buildings.filter(building => allowedIds.has(String(building.building_id ?? '')));
+  }, [activeSchedule, buildings, scheduledGroupRooms]);
+
   const scheduledBuildingObj = React.useMemo(() => {
     if (!currentRoomObj || !Array.isArray(buildings)) return null;
     return buildings.find(b => Number(b.building_id) === Number(currentRoomObj.building_id)) || null;
   }, [currentRoomObj, buildings]);
+
+  const scheduledFloorObj = React.useMemo(() => {
+    if (!currentRoomObj || !Array.isArray(floors)) return null;
+    return floors.find(f => Number(f.floor_id) === Number(currentRoomObj.floor_id)) || null;
+  }, [currentRoomObj, floors]);
+
+  const attendanceLocationOperational = React.useMemo(() => {
+    const isActive = (item) => ['active', '1', 'true'].includes(String(item?.status || '').trim().toLowerCase());
+    return Boolean(currentRoomObj && scheduledFloorObj && scheduledBuildingObj
+      && isActive(currentRoomObj)
+      && isActive(scheduledFloorObj)
+      && isActive(scheduledBuildingObj));
+  }, [currentRoomObj, scheduledFloorObj, scheduledBuildingObj]);
 
   const altitudeCalibrationBuildingId = React.useMemo(() => {
     const id = scannedFloor?.building_id ?? currentRoomObj?.building_id ?? currentBuilding?.building_id ?? scheduledBuildingObj?.building_id ?? null;
@@ -786,31 +1307,34 @@ export default function AttendanceIndex() {
 
   React.useEffect(() => {
     if (!coords || !Array.isArray(buildings) || buildings.length === 0) { setCurrentBuilding(null); return; }
-    let best = null;
-    for (const b of buildings) {
-      const bLat = (b.latitude ?? b.lat ?? b.altitude ?? null);
-      const bLon = (b.longitude ?? b.lon ?? b.lng ?? b.longitude ?? null);
-      const bRadius = Number(b.radius ?? b.building_radius ?? 0);
-      if (bLat == null || bLon == null) continue;
-      const d = getDistanceMeters(coords.latitude, coords.longitude, Number(bLat), Number(bLon));
-      if (d <= bRadius) {
-        if (!best || d < best.dist) best = { building: b, dist: d };
+    const findNearestContainingBuilding = (candidates) => {
+      let nearest = null;
+      for (const building of candidates) {
+        const status = String(building?.status || '').trim().toLowerCase();
+        if (status && !['active', '1', 'true'].includes(status)) continue;
+        const latitude = building.latitude ?? building.lat ?? null;
+        const longitude = building.longitude ?? building.lon ?? building.lng ?? null;
+        const radius = Number(building.radius ?? building.building_radius ?? 0);
+        if (latitude == null || longitude == null || !Number.isFinite(radius) || radius <= 0) continue;
+        const distance = getDistanceMeters(coords.latitude, coords.longitude, Number(latitude), Number(longitude));
+        if (distance <= radius && (!nearest || distance < nearest.dist)) nearest = { building, dist: distance };
+      }
+      return nearest;
+    };
+
+    // An assigned solo/parallel building takes priority when GPS areas overlap.
+    // Another building is retained only to explain that it is not scheduled.
+    if (activeSchedule && scheduledGroupBuildings.length > 0) {
+      const scheduledMatch = findNearestContainingBuilding(scheduledGroupBuildings);
+      if (scheduledMatch) {
+        setCurrentBuilding(scheduledMatch.building);
+        return;
       }
     }
-    try {
-      if (scheduledBuildingObj && coords && (scheduledBuildingObj.latitude != null) && (scheduledBuildingObj.longitude != null)) {
-        const schedLat = Number(scheduledBuildingObj.latitude);
-        const schedLon = Number(scheduledBuildingObj.longitude);
-        const schedRadius = Number(scheduledBuildingObj.radius ?? scheduledBuildingObj.building_radius ?? 0);
-        const distToScheduled = getDistanceMeters(coords.latitude, coords.longitude, schedLat, schedLon);
-        if (!Number.isNaN(distToScheduled) && distToScheduled <= (schedRadius + BUILDING_TOLERANCE_METERS)) {
-          setCurrentBuilding(scheduledBuildingObj);
-          return;
-        }
-      }
-    } catch (e) { }
+
+    const best = findNearestContainingBuilding(buildings);
     setCurrentBuilding(best ? best.building : null);
-  }, [coords, buildings, scheduledBuildingObj]);
+  }, [coords, buildings, activeSchedule, scheduledGroupBuildings]);
 
   const findNearestRoom = React.useCallback((coords) => {
     if (!coords || !rooms.length) return null;
@@ -953,10 +1477,21 @@ export default function AttendanceIndex() {
 
   const computeActionState = React.useCallback((rec, group = null) => {
     if (!rec) return { allowed: false, action: null, allowAt: null, predictedFlag: null };
+    if (isAttendanceExemptRecord(rec)) {
+      return {
+        allowed: false,
+        action: null,
+        allowAt: null,
+        predictedFlag: null,
+        substituted: isSubstitutedRecord(rec),
+        onLeave: isOnLeaveRecord(rec),
+      };
+    }
     const now = new Date();
     const classStart = new Date(`${rec.date}T${rec.start_time}`);
     const classEnd = new Date(`${rec.date}T${rec.end_time}`);
-    const groupRecords = Array.isArray(group) && group.length ? group : [rec];
+    const groupRecords = (Array.isArray(group) && group.length ? group : [rec])
+      .filter(item => !isAttendanceExemptRecord(item));
 
     let action = null;
     if (groupRecords.some(item => !item.time_in)) action = 'check-in';
@@ -985,11 +1520,8 @@ export default function AttendanceIndex() {
     return { allowed: true, allowAt: null, action, predictedFlag: 'present' };
   }, []);
 
-  const computeNextSchedule = React.useCallback(() => {
-    if (!records || !records.length) {
-      setNextSchedule(null); setNextStartDate(null); setNextSecondsLeft(null);
-      return;
-    }
+  const nextScheduleState = React.useMemo(() => {
+    if (!records || !records.length) return { schedule: null, startDate: null };
     const now = new Date();
     let best = null;
     let bestStart = null;
@@ -1004,31 +1536,10 @@ export default function AttendanceIndex() {
       }
     }
 
-    if (!best) {
-      setNextSchedule(null); setNextStartDate(null); setNextSecondsLeft(null);
-      return;
-    }
-    setNextSchedule(best);
-    setNextStartDate(bestStart);
-    setNextSecondsLeft(Math.max(0, Math.ceil((bestStart.getTime() - Date.now()) / 1000)));
-  }, [records]);
-
-  React.useEffect(() => {
-    computeNextSchedule();
-  }, [records, computeNextSchedule]);
-
-  React.useEffect(() => {
-    if (!nextStartDate) {
-      setNextSecondsLeft(null);
-      return;
-    }
-    const tick = () => {
-      setNextSecondsLeft(Math.max(0, Math.ceil((nextStartDate.getTime() - Date.now()) / 1000)));
-    };
-    tick();
-    const iv = setInterval(tick, 1000);
-    return () => clearInterval(iv);
-  }, [nextStartDate]);
+    return { schedule: best, startDate: bestStart };
+  }, [records, scheduleEpoch]);
+  const nextSchedule = nextScheduleState.schedule;
+  const nextStartDate = nextScheduleState.startDate;
 
   React.useEffect(() => {
     const active = findActiveSchedule();
@@ -1037,8 +1548,7 @@ export default function AttendanceIndex() {
     setActionAllowed(st.allowed);
     setAllowAt(st.allowAt);
     setCurrentAction(st.action);
-    computeNextSchedule();
-  }, [records, findActiveSchedule, findMatchingScheduleGroup, computeActionState, computeNextSchedule]);
+  }, [records, scheduleEpoch, findActiveSchedule, findMatchingScheduleGroup, computeActionState]);
 
   const filteredRecords = React.useMemo(() => {
     if (!Array.isArray(records)) return [];
@@ -1052,34 +1562,32 @@ export default function AttendanceIndex() {
       })
       .map(item => item.record);
     try {
-      if (filterMode === 'today') {
-        return activeFirst(records.filter(r => r.date === todayStr));
-      }
-      if (filterMode === 'past') {
-        return activeFirst(records.filter(r => {
-          if (!r.date || !r.end_time) return false;
-          return new Date(`${r.date}T${r.end_time}`).getTime() < now.getTime();
-        }));
-      }
-      if (filterMode === 'future') {
-        return activeFirst(records.filter(r => {
-          if (!r.date || !r.start_time) return false;
-          return new Date(`${r.date}T${r.start_time}`).getTime() > now.getTime();
-        }));
-      }
+      return activeFirst(records.filter(r => r.date === todayStr));
     } catch (e) {
-      return activeFirst(records);
+      return [];
     }
-    return activeFirst(records);
-  }, [records, filterMode]);
+  }, [records, scheduleEpoch]);
 
-  const currentDist = React.useMemo(() => (coords && currentRoomObj) 
-    ? getDistanceMeters(coords.latitude, coords.longitude, Number(currentRoomObj.latitude), Number(currentRoomObj.longitude)) 
-    : null, 
-  [coords, currentRoomObj]);
+  const matchedScheduledRoom = React.useMemo(() => {
+    if (!coords || scheduledGroupRooms.length === 0) return null;
+    let nearest = null;
+    for (const room of scheduledGroupRooms) {
+      if (!isInsideBox(coords, room)) continue;
+      const distance = getDistanceMeters(coords.latitude, coords.longitude, Number(room.latitude), Number(room.longitude));
+      if (!nearest || distance < nearest.distance) nearest = { room, distance };
+    }
+    return nearest?.room || null;
+  }, [coords, scheduledGroupRooms]);
 
-  const isInRoomBox = coords && currentRoomObj ? isInsideBox(coords, currentRoomObj) : false;
-  const isOutOfRange = currentRoomObj ? !isInRoomBox : false;
+  const currentDist = React.useMemo(() => {
+    if (!coords || scheduledGroupRooms.length === 0) return null;
+    const distances = scheduledGroupRooms
+      .filter(room => room.latitude != null && room.longitude != null)
+      .map(room => getDistanceMeters(coords.latitude, coords.longitude, Number(room.latitude), Number(room.longitude)));
+    return distances.length > 0 ? Math.min(...distances) : null;
+  }, [coords, scheduledGroupRooms]);
+
+  const isOutOfRange = Boolean(currentRoomObj && !matchedScheduledRoom);
 
   const scannedFloorInRange = React.useMemo(() => {
     try {
@@ -1109,51 +1617,31 @@ export default function AttendanceIndex() {
     return detectFloorFromAltitude(attendanceAltitude.normalized, bId);
   }, [coords, attendanceAltitude, detectFloorFromAltitude, currentBuilding]);
 
-  const isOutsideBuilding = React.useMemo(() => {
-    if (!currentRoomObj) return false;
-    try {
-      if (scheduledBuildingObj && coords && (scheduledBuildingObj.latitude != null) && (scheduledBuildingObj.longitude != null)) {
-        const schedLat = Number(scheduledBuildingObj.latitude);
-        const schedLon = Number(scheduledBuildingObj.longitude);
-        const schedRadius = Number(scheduledBuildingObj.radius ?? scheduledBuildingObj.building_radius ?? 0);
-        const distToScheduled = getDistanceMeters(coords.latitude, coords.longitude, schedLat, schedLon);
-        if (!Number.isNaN(distToScheduled) && distToScheduled <= (schedRadius + BUILDING_TOLERANCE_METERS)) {
-          return false;
-        }
-      }
-    } catch (e) { }
+  const scheduledBuildingRange = React.useMemo(() => {
+    if (!activeSchedule || !coords || scheduledGroupBuildings.length === 0) return null;
+    let nearest = null;
+    for (const building of scheduledGroupBuildings) {
+      const latitude = Number(building.latitude ?? building.lat);
+      const longitude = Number(building.longitude ?? building.lon ?? building.lng);
+      const radius = Number(building.radius ?? building.building_radius ?? 0);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !Number.isFinite(radius) || radius <= 0) continue;
+      const distance = getDistanceMeters(coords.latitude, coords.longitude, latitude, longitude);
+      const candidate = { building, distance, outsideBy: Math.max(0, distance - radius), inside: distance <= radius };
+      if (!nearest || candidate.outsideBy < nearest.outsideBy || (candidate.outsideBy === nearest.outsideBy && distance < nearest.distance)) nearest = candidate;
+    }
+    return nearest;
+  }, [activeSchedule, coords, scheduledGroupBuildings]);
 
-    if (!currentBuilding) return true; 
-    return Number(currentBuilding.building_id) !== Number(currentRoomObj.building_id);
-  }, [currentRoomObj, currentBuilding, scheduledBuildingObj, coords]);
+  const isOutsideBuilding = Boolean(currentRoomObj && scheduledBuildingRange && !scheduledBuildingRange.inside);
+  const detectedDifferentBuilding = React.useMemo(() => {
+    if (!isOutsideBuilding || !currentBuilding) return null;
+    const isAllowed = scheduledGroupBuildings.some(building => Number(building.building_id) === Number(currentBuilding.building_id));
+    return isAllowed ? null : currentBuilding;
+  }, [isOutsideBuilding, currentBuilding, scheduledGroupBuildings]);
 
-  const notInAnyBuilding = React.useMemo(() => (!currentBuilding && Array.isArray(buildings) && buildings.length > 0), [currentBuilding, buildings]);
-
-  React.useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        if (currentBuilding && currentBuilding.building_id) {
-          const bId = Number(currentBuilding.building_id);
-          const [roomsData, floorsData] = await Promise.all([
-            apiGet(`rooms?building_id=${bId}`),
-            apiGet(`floors?building_id=${bId}`)
-          ]);
-          if (!mounted) return;
-          if (Array.isArray(roomsData) && roomsData.length) setRooms(roomsData);
-          if (Array.isArray(floorsData) && floorsData.length) setFloors(floorsData);
-        } else {
-          const [roomsData, floorsData] = await Promise.all([apiGet('rooms'), apiGet('floors')]);
-          if (!mounted) return;
-          if (Array.isArray(roomsData)) setRooms(roomsData);
-          if (Array.isArray(floorsData)) setFloors(floorsData);
-        }
-      } catch (e) {
-        console.warn('Failed to load building-scoped rooms/floors', e);
-      }
-    })();
-    return () => { mounted = false; };
-  }, [currentBuilding]);
+  const notInAnyBuilding = React.useMemo(() => (
+    !activeSchedule && !currentBuilding && Array.isArray(buildings) && buildings.length > 0
+  ), [activeSchedule, currentBuilding, buildings]);
 
   const renderWrongFloorMessage = () => {
     const info = wrongFloorInfo;
@@ -1182,105 +1670,105 @@ export default function AttendanceIndex() {
     );
   };
 
-  const nextCountdownStr = () => {
-    if (nextSecondsLeft == null) return null;
-    if (nextSecondsLeft <= 0) return 'now';
-    const days = Math.floor(nextSecondsLeft / 86400);
-    const hours = Math.floor((nextSecondsLeft % 86400) / 3600);
-    const mins = Math.floor((nextSecondsLeft % 3600) / 60);
-    const secs = nextSecondsLeft % 60;
-      
-    const h = String(hours).padStart(2, '0');
-    const m = String(mins).padStart(2, '0');
-    const s = String(secs).padStart(2, '0');
-      
-    if (days > 0) return `${days}d ${h}:${m}:${s}`;
-    return `${h}:${m}:${s}`;
-  };
-
   const openScannerWithPermission = async () => {
     const rec = findTargetSchedule();
-    if (!rec) return alert('No active or upcoming schedule within 30 minutes — scanning disabled');
-    if (cameraPermission === 'denied') {
-      setErrorMessage('Camera permission is denied — enable it in browser settings.');
+    if (isAttendanceExemptRecord(rec)) {
+      const onLeave = isOnLeaveRecord(rec);
+      await showAttendanceToast({
+        icon: 'info',
+        title: onLeave ? 'On Leave' : 'Attendance Transferred',
+        text: onLeave
+          ? 'This class is covered by your approved leave. GPS, room-range checks, and QR scanning are not required.'
+          : 'This class attendance has been assigned to a substitute teacher. No attendance action is required from you.',
+        timer: 3500,
+      });
       return;
     }
-    if (cameraPermission === 'prompt') {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-        try { stream.getTracks().forEach(t => t.stop()); } catch (e) {}
-        setCameraPermission('granted');
-      } catch (e) {
-        setCameraPermission('denied');
-        setErrorMessage('Camera access denied.');
-        return;
-      }
-    }
-    try {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-        pausedPollingRef.current = true;
-      }
-    } catch(e) {}
+    if (!rec || !referenceDataLoaded || !qrLocationOperational) return;
+    setQrVerificationMode('scan');
+    setManualFloorCode('');
+    setManualCodeError('');
     setIsCameraVisible(true);
   };
 
-  React.useEffect(() => {
-    if (!isCameraVisible && pausedPollingRef.current) {
-      try {
-        if (!pollingRef.current && userId) {
-          pollingRef.current = setInterval(loadMyAttendance, 5000);
-        }
-        loadMyAttendance().catch(()=>{});
-      } catch (e) {}
-      pausedPollingRef.current = false;
-    }
-  }, [isCameraVisible, userId, loadMyAttendance]);
-
-  const ensureSwalLoaded = async () => {
-    if (typeof window === 'undefined') return;
-    if (window.Swal) return;
-    if (!document.querySelector('link[data-swal]')) {
-      const l = document.createElement('link');
-      l.rel = 'stylesheet';
-      l.href = 'https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css';
-      l.setAttribute('data-swal', '1');
-      document.head.appendChild(l);
-    }
-    if (document.querySelector('script[data-swal]')) {
-      const existing = document.querySelector('script[data-swal]');
-      if ((existing.getAttribute('data-loaded')) === '1' && window.Swal) return;
-      await new Promise((resolve, reject) => {
-        existing.addEventListener('load', () => resolve());
-        existing.addEventListener('error', () => reject(new Error('Failed to load SweetAlert')));
-      });
-      if (window.Swal) return;
-    }
-    await new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js';
-      s.async = true;
-      s.setAttribute('data-swal', '1');
-      s.onload = () => { s.setAttribute('data-loaded', '1'); resolve(); };
-      s.onerror = () => reject(new Error('Failed to load SweetAlert script'));
-      document.head.appendChild(s);
-    });
-    if (!window.Swal) throw new Error('SweetAlert failed to initialize');
+  const closeQrVerificationModal = () => {
+    setIsCameraVisible(false);
+    setQrVerificationMode('scan');
+    setManualFloorCode('');
+    setManualCodeError('');
   };
+
+  const showAttendanceToast = React.useCallback(async ({ icon = 'info', title, text, timer = 3000 }) => {
+    try {
+      await ensureSwalLoaded();
+      await window.Swal.fire({
+        toast: true,
+        position: 'top-end',
+        icon,
+        title,
+        text,
+        timer,
+        timerProgressBar: true,
+        showConfirmButton: false,
+      });
+      return true;
+    } catch (error) {
+      console.warn('SweetAlert notification unavailable:', error);
+      return false;
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!activeAttendanceBlocked || !activeSchedule) {
+      substitutedNoticeKeyRef.current = '';
+      return;
+    }
+    const noticeKey = String(
+      activeSchedule.attendance_id
+      || `${activeSchedule.schedule_id || ''}|${activeSchedule.date || ''}`
+    );
+    if (!noticeKey || substitutedNoticeKeyRef.current === noticeKey) return;
+    substitutedNoticeKeyRef.current = noticeKey;
+    showAttendanceToast({
+      icon: 'info',
+      title: activeAttendanceOnLeave ? 'On Leave' : 'Attendance Transferred',
+      text: activeAttendanceOnLeave
+        ? 'This current class is covered by your approved leave. GPS, room-range checks, and QR scanning are not required.'
+        : 'This current class attendance has been assigned to a substitute teacher. No attendance action is required from you.',
+      timer: 3500,
+    });
+  }, [activeAttendanceBlocked, activeAttendanceOnLeave, activeSchedule, showAttendanceToast]);
 
   const handleCheckNow = React.useCallback(async (scannedQrToken = null) => {
     setErrorMessage(null); 
     setWrongFloorInfo(null);
 
     const rec = findActiveSchedule();
+    if (isAttendanceExemptRecord(rec)) {
+      const onLeave = isOnLeaveRecord(rec);
+      await showAttendanceToast({
+        icon: 'info',
+        title: onLeave ? 'On Leave' : 'Attendance Transferred',
+        text: onLeave
+          ? 'This class is covered by your approved leave. No attendance action is required.'
+          : 'This class attendance has been assigned to a substitute teacher. No attendance action is required from you.',
+        timer: 3500,
+      });
+      if (scannedQrToken) setIsCameraVisible(false);
+      return;
+    }
     if (!rec) {
-      if (scannedQrToken) {
-        alert('No active schedule found.');
-        setIsCameraVisible(false);
-      } else {
-        alert('No active schedule found.');
-      }
+      if (scannedQrToken) setIsCameraVisible(false);
+      return;
+    }
+    if (!referenceDataLoaded) {
+      setErrorMessage('Location information is still loading. Please try again in a moment.');
+      if (scannedQrToken) setIsCameraVisible(false);
+      return;
+    }
+    if (!attendanceLocationOperational) {
+      setErrorMessage('Attendance is unavailable because the assigned room, floor, building, or campus is inactive or archived. Please contact your administrator.');
+      if (scannedQrToken) setIsCameraVisible(false);
       return;
     }
 
@@ -1290,30 +1778,46 @@ export default function AttendanceIndex() {
 
     if (!scannedQrToken) {
       if (!actionState.allowed) return alert('Action not allowed at this time.');
-      if (!coords) return alert('Waiting for GPS coordinates.');
+      if (!coords) {
+        await showAttendanceToast({
+          icon: 'info',
+          title: 'Location Still Loading',
+          text: 'Your location is still being detected. Keep location services enabled and try again in a moment.',
+          timer: 3000,
+        });
+        return;
+      }
       if (!currentRoomObj) {
         console.warn('Room lookup failed for schedule:', rec);
         try {
           const refreshed = await apiGet('rooms');
           if (Array.isArray(refreshed) && refreshed.length) {
-            setRooms(refreshed);
-            const found = refreshed.find(r => Number(r.room_id) === Number(rec.room_id));
+            const operationalRooms = refreshed.filter((room) => String(room?.status || '').toLowerCase() === 'active');
+            setRooms(operationalRooms);
+            const found = operationalRooms.find(r => Number(r.room_id) === Number(rec.room_id));
             if (!found) {
-              alert('Room data not found after refreshing rooms. Contact admin.');
+              console.warn('Room data not found after refreshing rooms. Contact admin.');
               return;
             }
           } else {
-            alert('Room data not found (rooms API empty).');
+            console.warn('Room data not found (rooms API empty).');
             return;
           }
         } catch (e) {
           console.error('Failed to refresh rooms:', e);
-          alert('Room data not found and refresh failed.');
           return;
         }
       }
-      if (isOutOfRange) return alert('You are out of range. Move closer to the room.');
-      if (coords.accuracy > ACCURACY_THRESHOLD_METERS) return alert('Poor GPS accuracy.');
+      if (isOutOfRange) return;
+      if (coords.accuracy > ACCURACY_THRESHOLD_METERS) {
+        await showAttendanceToast({
+          icon: 'warning',
+          title: 'Location Accuracy Too Low',
+          text: 'Your current GPS accuracy is not sufficient to verify attendance. Move to an open area and try again.',
+          timer: 3500,
+        });
+        return;
+      }
 
       const poorAltitude = (!coords.altitudeAccuracy && coords.altitudeAccuracy !== 0) || (coords.altitudeAccuracy > ALTITUDE_ACCURACY_THRESHOLD_METERS);
       if (poorAltitude) {
@@ -1397,7 +1901,12 @@ export default function AttendanceIndex() {
       }
 
       const groupCount = Number(data?.group_count || updatedRecords.length || 1);
-      alert(`Success: ${data.message || 'OK'}${groupCount > 1 ? ` (${groupCount} schedules updated)` : ''}`);
+      await showAttendanceToast({
+        icon: 'success',
+        title: 'Attendance Recorded',
+        text: `${data.message || 'Attendance was recorded successfully.'}${groupCount > 1 ? ` ${groupCount} schedules were updated.` : ''}`,
+        timer: 2500,
+      });
       setIsCameraVisible(false);
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
@@ -1405,32 +1914,13 @@ export default function AttendanceIndex() {
       if (body && body.error === 'wrong_floor') {
         setWrongFloorInfo(body);
         setErrorMessage('wrong_floor');
-        if (devicePlatform === 'ios' && !scannedQrToken) {
-          try {
-            await ensureSwalLoaded();
-            const res = await window.Swal.fire({
-              title: 'iOS altitude needs calibration',
-              text: 'Scan the floor QR once so the app can align this device altitude with the floor baseline.',
-              icon: 'warning',
-              showCancelButton: true,
-              confirmButtonText: 'Scan QR',
-              cancelButtonText: 'Cancel'
-            });
-            if (res.isConfirmed) openScannerWithPermission();
-          } catch (e) {
-            const ok = window.confirm('iOS altitude needs floor calibration. Scan the floor QR now?');
-            if (ok) openScannerWithPermission();
-          }
-          return;
-        }
       } else {
         setWrongFloorInfo(null);
-        setErrorMessage(body && body.error ? body.error : msg);
+        setErrorMessage(body && (body.message || body.error) ? (body.message || body.error) : msg);
       }
-      alert(`Error: ${body && body.error ? body.error : msg}`);
       if (scannedQrToken) setIsCameraVisible(false);
     }
-  }, [findActiveSchedule, findMatchingScheduleGroup, computeActionState, coords, attendanceAltitude, devicePlatform, currentRoomObj, isOutOfRange, userId, currentAction, floors, loadMyAttendance]);
+  }, [findActiveSchedule, findMatchingScheduleGroup, computeActionState, coords, attendanceAltitude, devicePlatform, currentRoomObj, referenceDataLoaded, attendanceLocationOperational, isOutOfRange, userId, currentAction, floors, loadMyAttendance, showAttendanceToast]);
 
   React.useEffect(() => {
     handleCheckNowRef.current = handleCheckNow;
@@ -1439,14 +1929,14 @@ export default function AttendanceIndex() {
   const lastAutoTriggerRef = React.useRef(0);
   React.useEffect(() => {
     if (!userId) return;
-    if (actionAllowed && !isOutOfRange && currentAction) {
+    if (actionAllowed && attendanceLocationOperational && !isOutOfRange && currentAction) {
       const now = Date.now();
-      if (now - lastAutoTriggerRef.current > 30000) {
+      if (now - lastAutoTriggerRef.current > 15000) {
         lastAutoTriggerRef.current = now;
         handleCheckNow(scannedQrToken).catch(() => {});
       }
     }
-  }, [actionAllowed, isOutOfRange, currentAction, userId, scannedQrToken, handleCheckNow]);
+  }, [actionAllowed, attendanceLocationOperational, isOutOfRange, currentAction, userId, scannedQrToken, handleCheckNow]);
 
   const ensureHtml5QrcodeLoaded = async () => {
     if (typeof window === 'undefined') return;
@@ -1498,10 +1988,66 @@ export default function AttendanceIndex() {
     throw lastErr || new Error('All CDNs failed for html5-qrcode');
   };
 
+  const handleManualFloorCodeSubmit = async (event) => {
+    event?.preventDefault?.();
+    if (manualCodeVerifying) return;
+
+    const code = String(manualFloorCode || '').trim().toUpperCase();
+    setManualCodeError('');
+    if (!/^[A-Z0-9]{6,16}$/.test(code)) {
+      setManualCodeError('Enter the 6–16 character code printed below the QR.');
+      return;
+    }
+
+    const target = findTargetSchedule ? findTargetSchedule() : null;
+    if (!target) {
+      setManualCodeError('No active class schedule is available for manual floor verification.');
+      return;
+    }
+
+    setManualCodeVerifying(true);
+    try {
+      const data = await apiPost('attendance/verify-floor-code', { manual_code: code });
+      const matchedFloor = floors.find((floor) => String(floor.floor_id) === String(data.floor_id)) || {
+        floor_id: data.floor_id,
+        floor_name: data.floor_name,
+        building_id: data.building_id,
+        building_name: data.building_name,
+        status: data.status,
+      };
+      const targetGroup = findTargetScheduleGroup(target);
+      const scheduledFloorIds = new Set();
+      for (const record of targetGroup.length ? targetGroup : [target]) {
+        const room = rooms.find((candidate) => Number(candidate.room_id) === Number(record.room_id));
+        if (room?.floor_id !== undefined && room.floor_id !== null) scheduledFloorIds.add(Number(room.floor_id));
+      }
+
+      if (scheduledFloorIds.size === 0 || !scheduledFloorIds.has(Number(data.floor_id))) {
+        setManualCodeError('This floor does not match your active class schedule.');
+        return;
+      }
+
+      setScannedQrToken(data.qr_token);
+      setScannedFloor(matchedFloor);
+      setManualFloorCode('');
+      setManualCodeError('');
+      setIsCameraVisible(false);
+      try {
+        await ensureSwalLoaded();
+        window.Swal.fire({ toast:true, position:'top', icon:'success', title:`Verified: ${data.floor_name || 'floor'}`, showConfirmButton:false, timer:2000 });
+      } catch (e) {}
+    } catch (err) {
+      const body = err?.body || {};
+      setManualCodeError(body.message || 'Manual floor code is not recognized.');
+    } finally {
+      setManualCodeVerifying(false);
+    }
+  };
+
   React.useEffect(() => {
-    if (!isCameraVisible) return;
+    if (!isCameraVisible || qrVerificationMode !== 'scan') return;
+    const sessionId = ++scannerSessionRef.current;
     let activeScanner = null;
-    let usingScannerUI = false;
     let stopped = false;
 
     const startScanner = async () => {
@@ -1510,56 +2056,17 @@ export default function AttendanceIndex() {
           try {
             await ensureHtml5QrcodeLoaded();
           } catch (err) {
+            if (stopped || scannerSessionRef.current !== sessionId) return;
             setErrorMessage('QR library failed to load: ' + (err && err.message ? err.message : String(err)));
             return;
           }
         }
-        try {
-          if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia && debugVideoRef.current) {
-            const previewStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-            previewStreamRef.current = previewStream;
-            try { debugVideoRef.current.srcObject = previewStream; } catch (e) {}
-            try { const p = debugVideoRef.current.play(); if (p && p.then) p.catch(()=>{}); } catch(e){}
-            setPreviewActive(true);
-          }
-        } catch (err) {
-          setErrorMessage('Camera preview failed: ' + (err && err.message ? err.message : String(err)));
-        }
-
-        let cameraId = null;
-        if (typeof window.Html5Qrcode !== 'undefined') {
-          try {
-            const cams = await window.Html5Qrcode.getCameras();
-            if (Array.isArray(cams) && cams.length) {
-              let preferred = cams.find(c => /back|rear|environment|rear camera/i.test(c.label));
-              if (!preferred) preferred = cams[cams.length - 1];
-              cameraId = preferred && (preferred.id || preferred.deviceId || preferred.cameraId) ? (preferred.id || preferred.deviceId || preferred.cameraId) : null;
-            }
-          } catch (e) {
-            cameraId = null;
-          }
-        }
-
-        const stopPreviewIfAny = () => {
-          try {
-            if (previewStreamRef.current) {
-              previewStreamRef.current.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
-              previewStreamRef.current = null;
-            }
-            setPreviewActive(false);
-            if (debugVideoRef.current) {
-              try { debugVideoRef.current.srcObject = null; } catch (e) {}
-            }
-          } catch (e) {}
-        };
-
-        stopPreviewIfAny();
-        if (scannerStartedRef.current) return;
+        if (stopped || scannerSessionRef.current !== sessionId || scannerStartedRef.current) return;
         const html5QrCode = new window.Html5Qrcode('qr-scanner-container');
         activeScanner = html5QrCode;
 
         const config = { fps: 10, qrbox: { width: 250, height: 250 } };
-        const cameraOrConstr = cameraId || { facingMode: 'environment' };
+        const cameraOrConstr = { facingMode: 'environment' };
 
         try {
           await html5QrCode.start(
@@ -1568,7 +2075,7 @@ export default function AttendanceIndex() {
             (decodedText) => {
               try { html5QrCode.stop(); } catch (e) {}
               try { html5QrCode.clear(); } catch (e) {}
-              if (!stopped) {
+              if (!stopped && scannerSessionRef.current === sessionId) {
                 const matchedFloor = floors.find(f => f.qr_token === decodedText);
                 const target = findTargetSchedule ? findTargetSchedule() : null;
                 const targetGroup = target ? findTargetScheduleGroup(target) : [];
@@ -1582,9 +2089,7 @@ export default function AttendanceIndex() {
 
                 // 1. CRITICAL SECURITY FIX: Reject if no target schedule exists
                 if (!target) {
-                   (async () => {
-                     try { await ensureSwalLoaded(); window.Swal.fire({ toast:true, position:'top', icon:'error', title: 'No active or upcoming class found', showConfirmButton:false, timer:3500 }); } catch (e) { alert('No active or upcoming class found'); }
-                   })();
+                  setIsCameraVisible(false);
                 } 
                 // 2. Reject if QR is invalid
                 else if (!matchedFloor) {
@@ -1611,12 +2116,19 @@ export default function AttendanceIndex() {
             },
             (_error) => { }
           );
+          if (stopped || scannerSessionRef.current !== sessionId) {
+            try { await html5QrCode.stop(); } catch (e) {}
+            try { html5QrCode.clear(); } catch (e) {}
+            return;
+          }
           scannerStartedRef.current = true;
+          setCameraPermission('granted');
         } catch (startErr) {
           const em = (startErr && startErr.message) ? startErr.message : String(startErr);
           if (em.toLowerCase().includes('notreadable') || em.toLowerCase().includes('could not start video')) {
             setErrorMessage('Camera busy or inaccessible. Close other apps/tabs using the camera and try again.');
           } else if (em.toLowerCase().includes('notallowed') || em.toLowerCase().includes('permission')) {
+            setCameraPermission('denied');
             setErrorMessage('Camera permission denied. Allow camera access in browser/site settings.');
           } else {
             setErrorMessage('Failed to start QR scanner: ' + em);
@@ -1634,6 +2146,7 @@ export default function AttendanceIndex() {
 
     return () => {
       stopped = true;
+      if (scannerSessionRef.current === sessionId) scannerSessionRef.current += 1;
       scannerStartedRef.current = false;
       try {
         if (previewStreamRef.current) {
@@ -1646,17 +2159,14 @@ export default function AttendanceIndex() {
       (async () => {
         try {
           if (!activeScanner) return;
-          if (!usingScannerUI && typeof activeScanner.stop === 'function') {
+          if (typeof activeScanner.stop === 'function') {
             try { await activeScanner.stop(); } catch (e) {}
-            try { activeScanner.clear(); } catch (e) {}
-          }
-          if (usingScannerUI) {
             try { activeScanner.clear(); } catch (e) {}
           }
         } catch (e) {}
       })();
     };
-  }, [isCameraVisible, floors, rooms, findTargetSchedule, findTargetScheduleGroup]);
+  }, [isCameraVisible, qrVerificationMode, floors, rooms, findTargetSchedule, findTargetScheduleGroup]);
 
   React.useEffect(() => {
     try {
@@ -1683,16 +2193,9 @@ export default function AttendanceIndex() {
 
   React.useEffect(() => {
     let timer = null;
+    if (!qrStorageReady) return;
     try {
-      const now = new Date();
-      const todayStr = formatDateYMD(now);
-      const todays = records.filter(r => r.date === todayStr);
-      const active = todays.find(r => {
-        if (!r.start_time || !r.end_time) return false;
-        const start = new Date(`${r.date}T${r.start_time}`);
-        const end = new Date(`${r.date}T${r.end_time}`);
-        return now >= start && now <= end;
-      }) || null;
+      const active = findTargetSchedule();
     
       if (!active) {
         setScannedQrToken(null);
@@ -1721,13 +2224,18 @@ export default function AttendanceIndex() {
       try { localStorage.removeItem(LOCAL_STORAGE_KEY); } catch(e){}
     }
     return () => { if (timer) clearTimeout(timer); };
-  }, [records]);
+  }, [qrStorageReady, records, findTargetSchedule, scheduleEpoch]);
 
   const nearestRoomLabel = coords ? getNearestRoomLabel(coords) : null;
   const roomGuideLabel = scannedFloor ? 'Scanned-floor room' : 'Estimated room';
   const altitudeLabel = attendanceAltitude.normalized !== null ? `${Number(attendanceAltitude.normalized).toFixed(1)}m` : 'N/A';
   const rawAltitudeLabel = attendanceAltitude.raw !== null ? `${Number(attendanceAltitude.raw).toFixed(1)}m` : 'N/A';
   const altitudeDisplayLabel = attendanceAltitude.calibrated ? `${altitudeLabel} (raw ${rawAltitudeLabel})` : altitudeLabel;
+  const gpsAccuracy = Number(coords?.accuracy);
+  const gpsAccuracyTooLow = Number.isFinite(gpsAccuracy) && gpsAccuracy > ACCURACY_THRESHOLD_METERS;
+  const gpsInlineMessage = locationIssue?.message || (gpsAccuracyTooLow
+    ? `GPS accuracy is ${gpsAccuracy.toFixed(1)} metres. It must be ${ACCURACY_THRESHOLD_METERS} metres or better. Move to an open area and wait for GPS to improve.`
+    : '');
 
   // Helper to render a status badge with color
   const renderStatusBadge = (flagId, label) => {
@@ -1766,7 +2274,8 @@ export default function AttendanceIndex() {
   // Helper to get parallel class data for a schedule
   const getParallelClassData = (schedule) => {
     if (!schedule) return [];
-    return records.filter(r => isSameScheduleGroup(r, schedule));
+    const parallelSchedules = records.filter(r => isParallelSchedulePair(r, schedule));
+    return parallelSchedules.length > 0 ? [schedule, ...parallelSchedules] : [];
   };
 
   // Handle view parallel classes
@@ -1779,6 +2288,8 @@ export default function AttendanceIndex() {
   // Render schedule card (used for both CURRENT and NEXT)
   const renderScheduleCard = (title, schedule, isCurrent) => {
     const isParallel = schedule && getParallelClassData(schedule).length > 1;
+    const isSubstituted = isSubstitutedRecord(schedule);
+    const isOnLeave = isOnLeaveRecord(schedule);
     const dayOfWeek = schedule ? getDayOfWeek(schedule.date) : '';
     const checkIn = getCheckStatus(schedule, 'in');
     const checkMid = getCheckStatus(schedule, 'mid');
@@ -1788,14 +2299,26 @@ export default function AttendanceIndex() {
       <div style={{ backgroundColor: '#e2e8f0', borderRadius: '16px', overflow: 'hidden', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)' }}>
         <div style={{ backgroundColor: isCurrent ? '#15803d' : '#a3b1ab', color: isCurrent ? '#ffffff' : '#1e293b', padding: '12px 20px', fontSize: '1rem', fontWeight: '700', letterSpacing: '0.05em', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span>{title}</span>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {isSubstituted && (
+            <span style={{ backgroundColor: '#4f46e5', color: '#ffffff', padding: '2px 10px', borderRadius: '12px', fontSize: '0.7rem', fontWeight: '800' }}>
+              SUBSTITUTED
+            </span>
+          )}
+          {isOnLeave && (
+            <span style={{ backgroundColor: '#0891b2', color: '#ffffff', padding: '2px 10px', borderRadius: '12px', fontSize: '0.7rem', fontWeight: '800' }}>
+              ON LEAVE
+            </span>
+          )}
           {isParallel && (
             <span style={{ backgroundColor: isCurrent ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)', padding: '2px 10px', borderRadius: '12px', fontSize: '0.7rem', fontWeight: '800' }}>
               PARALLEL
             </span>
           )}
+          </div>
         </div>
         {schedule ? (
-          <div style={{ padding: '20px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', fontSize: '0.9rem', color: '#334155', fontWeight: '600', lineHeight: '1.6' }}>
+          <div className="attendance-schedule-grid" style={{ padding: 'clamp(14px, 3vw, 20px)', display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '16px', fontSize: '0.9rem', color: '#334155', fontWeight: '600', lineHeight: '1.6' }}>
             <div>
               <div style={{ marginBottom: '4px' }}>SECTION: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.section_name || '—'}</span></div>
               <div style={{ marginBottom: '16px' }}>SUBJECT: <span style={{ fontWeight: '700', color: '#0f172a' }}>{schedule.subject_code ? `${schedule.subject_code} - ${schedule.subject_name || ''}` : '—'}</span></div>
@@ -1836,50 +2359,126 @@ export default function AttendanceIndex() {
 
   // --- Render ---
   return (
-    <div className="attendance-container" style={{ padding: '24px', fontFamily: 'system-ui, -apple-system, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh' }}>
+    <div className="attendance-container" style={{ padding: 'clamp(12px, 3vw, 24px)', fontFamily: 'system-ui, -apple-system, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh', width: '100%', maxWidth: '100%', overflowX: 'hidden' }}>
+      <style>{`
+        .attendance-container,
+        .attendance-container * {
+          box-sizing: border-box;
+        }
+
+        .attendance-container {
+          overflow-wrap: anywhere;
+        }
+
+        .attendance-card {
+          min-width: 0;
+        }
+
+        .attendance-shell-grid,
+        .attendance-schedule-grid,
+        .attendance-gps-grid,
+        .attendance-location-grid {
+          min-width: 0;
+        }
+
+        .attendance-container button {
+          max-width: 100%;
+          white-space: normal;
+        }
+
+        #qr-scanner-container,
+        #qr-scanner-container video,
+        #qr-scanner-container canvas {
+          max-width: 100% !important;
+        }
+
+        @media (max-width: 640px) {
+          .attendance-card {
+            padding: 16px !important;
+            border-radius: 16px !important;
+          }
+
+          .attendance-page-title {
+            font-size: clamp(1.45rem, 9vw, 2.2rem) !important;
+            line-height: 1.1 !important;
+          }
+
+          .attendance-card-title {
+            font-size: 1.35rem !important;
+          }
+
+          .attendance-top-actions {
+            width: 100%;
+            align-items: stretch !important;
+          }
+
+          .attendance-top-actions > button {
+            flex: 1 1 120px;
+          }
+
+          .attendance-schedule-grid,
+          .attendance-gps-grid,
+          .attendance-location-grid {
+            grid-template-columns: 1fr !important;
+          }
+
+          .attendance-filter-tabs,
+          .attendance-record-flags {
+            flex-wrap: wrap;
+          }
+
+          .attendance-action-button {
+            width: 100% !important;
+            min-width: 0 !important;
+            padding-inline: 14px !important;
+          }
+        }
+      `}</style>
       
       {/* HEADER SECTION - Matches Reference Image Top Bar */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
-        <h1 style={{ margin: 0, fontSize: '2.2rem', fontWeight: '800', color: '#0f172a', letterSpacing: '-0.025em' }}>
+        <h1 className="attendance-page-title" style={{ margin: 0, fontSize: '2.2rem', fontWeight: '800', color: '#0f172a', letterSpacing: '-0.025em' }}>
           {teacherName || 'John Lester Zarsosa'}
         </h1>
         <div style={{ backgroundColor: '#15803d', color: '#ffffff', padding: '10px 24px', borderRadius: '12px', fontSize: '1.2rem', fontWeight: '700', boxShadow: '0 4px 6px -1px rgba(21, 128, 61, 0.3)', letterSpacing: '0.025em' }}>
-          {formatClockDate(nowClock)}
+          <ClockDisplay />
         </div>
       </div>
 
       {/* MAIN CONTAINER CARD */}
-      <div className="attendance-card" style={{ backgroundColor: '#ffffff', borderRadius: '20px', padding: '28px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01)', border: '1px solid #e2e8f0' }}>
+      <div className="attendance-card" style={{ backgroundColor: '#ffffff', borderRadius: '20px', padding: 'clamp(16px, 3vw, 28px)', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01)', border: '1px solid #e2e8f0' }}>
         
         {/* CARD TOP BAR: Title & Scan QR Button */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
-          <h2 style={{ margin: 0, fontSize: '1.75rem', fontWeight: '700', color: '#1e293b' }}>My Attendance</h2>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            {!coords && !errorMessage && (
-              <button onClick={startLocationTracking} style={{ border: 'none', backgroundColor: '#e2e8f0', color: '#475569', padding: '10px 18px', borderRadius: '10px', fontWeight: '600', cursor: 'pointer', fontSize: '0.95rem' }}>
-                GPS
+          <h2 className="attendance-card-title" style={{ margin: 0, fontSize: '1.75rem', fontWeight: '700', color: '#1e293b' }}>My Attendance</h2>
+          <div className="attendance-top-actions" style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            {!activeAttendanceBlocked && (
+              <button onClick={toggleGpsTracking} aria-pressed={gpsEnabled} style={{ border: 'none', backgroundColor: gpsEnabled ? '#dc2626' : '#15803d', color: '#ffffff', padding: '10px 18px', borderRadius: '10px', fontWeight: '700', cursor: 'pointer', fontSize: '0.95rem', boxShadow: gpsEnabled ? '0 3px 6px rgba(220, 38, 38, 0.24)' : '0 3px 6px rgba(21, 128, 61, 0.24)' }}>
+                {gpsEnabled ? 'Turn off GPS' : 'Turn on GPS'}
               </button>
             )}
             <button 
               onClick={openScannerWithPermission} 
-              disabled={cameraPermission === 'denied'}
-              style={{ border: 'none', backgroundColor: '#e2e8f0', color: '#1e293b', padding: '10px 24px', borderRadius: '10px', fontWeight: '700', cursor: 'pointer', fontSize: '0.95rem', transition: 'background-color 0.2s' }}
+              disabled={qrScannerDisabled}
+              style={{ border: 'none', backgroundColor: '#e2e8f0', color: '#1e293b', padding: '10px 24px', borderRadius: '10px', fontWeight: '700', cursor: qrScannerDisabled ? 'not-allowed' : 'pointer', opacity: qrScannerDisabled ? 0.55 : 1, fontSize: '0.95rem', transition: 'background-color 0.2s' }}
             >
-              Scan QR
+              {targetAttendanceBlocked ? 'QR Not Required' : 'Scan QR'}
             </button>
           </div>
         </div>
 
         {/* BANNERS (Building / Errors / Warnings) */}
         <div className="attendance-banners" style={{ marginBottom: '20px' }}>
-          {(currentBuilding || scheduledBuildingObj || scannedFloor || usingDbFloor || detectedFloor) && (
+          {!activeAttendanceBlocked && (currentBuilding || scheduledBuildingObj || scannedFloor || usingDbFloor || detectedFloor) && (
             <div style={{ backgroundColor: '#f1f5f9', padding: '12px 16px', borderRadius: '10px', fontSize: '0.85rem', color: '#475569', marginBottom: '12px' }}>
               {currentBuilding && <div>Detected building: {currentBuilding.building_name || 'Building'} (radius {Math.round(Number(currentBuilding.radius || currentBuilding.building_radius || 0))}m)</div>}
-              {currentRoomObj && <div style={{ marginTop:4 }}>Scheduled building: {currentBuilding ? (scheduledBuildingObj? (scheduledBuildingObj.building_name || 'Building'): 'X') : 'X'}</div>}
+              {currentRoomObj && <div style={{ marginTop:4 }}>Scheduled building{scheduledGroupBuildings.length > 1 ? 's' : ''}: {scheduledGroupBuildings.map(building => building.building_name || 'Building').join(', ') || 'X'}</div>}
 
-              {isOutsideBuilding && currentRoomObj && scheduledBuildingObj && coords && (
+              {isOutsideBuilding && currentRoomObj && scheduledBuildingRange && (
                 <div style={{ color: '#dc2626', fontWeight: '600', marginTop: 4 }}>
-                  You are outside {scheduledBuildingObj.building_name || 'the scheduled building'} by {Math.max(0, Math.round(getDistanceMeters(coords.latitude, coords.longitude, Number(scheduledBuildingObj.latitude), Number(scheduledBuildingObj.longitude)) - Number(scheduledBuildingObj.radius || scheduledBuildingObj.building_radius || 0)))}m — attendance denied
+                  {detectedDifferentBuilding
+                    ? `You appear to be inside ${detectedDifferentBuilding.building_name || 'another building'}, but your current class is assigned to ${scheduledBuildingRange.building.building_name || 'a different building'}. You are ${Math.round(scheduledBuildingRange.outsideBy)}m outside the scheduled building range.`
+                    : `You are ${Math.round(scheduledBuildingRange.outsideBy)}m outside ${scheduledBuildingRange.building.building_name || 'the scheduled building'}. Move closer to the scheduled building.`}
                 </div>
               )}
 
@@ -1900,18 +2499,35 @@ export default function AttendanceIndex() {
             </div>
           )}
 
-          {errorMessage && <div style={{ backgroundColor: '#fee2e2', color: '#b91c1c', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '600', fontSize: '0.9rem' }}>{errorMessage}</div>}
-          {renderWrongFloorMessage()}
-          {notInAnyBuilding && <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>You are not inside any known building. Move closer to the building or check location permissions.</div>}
-          {isOutsideBuilding && currentRoomObj && !scheduledBuildingObj && (
+          {activeAttendanceBlocked && (
+            <div style={{ backgroundColor: activeAttendanceOnLeave ? '#cffafe' : '#e0e7ff', color: activeAttendanceOnLeave ? '#0e7490' : '#4338ca', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '700', fontSize: '0.9rem' }}>
+              {activeAttendanceOnLeave
+                ? 'This attendance is marked On Leave. GPS, room-range checks, and QR scanning are not required for you.'
+                : 'This attendance has been transferred to the assigned substitute teacher. GPS, room-range checks, and QR scanning are not required for you.'}
+            </div>
+          )}
+          {!activeAttendanceBlocked && referenceDataLoaded && activeSchedule && !attendanceLocationOperational && (
+            <div style={{ backgroundColor: '#fee2e2', color: '#991b1b', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '700', fontSize: '0.9rem' }}>
+              Attendance is unavailable because the assigned room, floor, building, or campus is inactive or archived. Please contact your administrator.
+            </div>
+          )}
+          {!activeAttendanceBlocked && gpsInlineMessage && (
+            <div style={{ backgroundColor: locationIssue?.type === 'permission-denied' ? '#fee2e2' : '#fef3c7', color: locationIssue?.type === 'permission-denied' ? '#991b1b' : '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '600', fontSize: '0.9rem' }}>
+              {gpsInlineMessage}
+            </div>
+          )}
+          {!activeAttendanceBlocked && errorMessage && <div style={{ backgroundColor: '#fee2e2', color: '#b91c1c', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '600', fontSize: '0.9rem' }}>{errorMessage}</div>}
+          {!activeAttendanceBlocked && renderWrongFloorMessage()}
+          {!activeAttendanceBlocked && notInAnyBuilding && <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>You are not inside any known building. Move closer to the building or check location permissions.</div>}
+          {!activeAttendanceBlocked && isOutsideBuilding && currentRoomObj && !scheduledBuildingObj && (
              <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>You are not in the correct building for the active class. Move to the assigned building or scan the floor QR.</div>
           )}
-          {activeParallelRoomNames.length > 1 && (
+          {!activeAttendanceBlocked && activeParallelRoomNames.length > 1 && (
             <div style={{ backgroundColor: '#e0f2fe', color: '#0369a1', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontSize: '0.9rem' }}>
               Parallel class detected for the current time. Rooms in this class group: {activeParallelRoomNames.join(', ')}. Active schedules are shown first.
             </div>
           )}
-          {isOutOfRange && currentRoomObj && (
+          {!activeAttendanceBlocked && isOutOfRange && currentRoomObj && (
             <div style={{ backgroundColor: '#fef3c7', color: '#92400e', padding: '12px 16px', borderRadius: '10px', marginBottom: '12px', fontWeight: '500', fontSize: '0.9rem' }}>
               You are out of range for the active class ({currentDist ? Math.round(currentDist) : 'N/A'}m away). Move closer to room '{currentRoomObj.room_name}'{activeOtherParallelRoomNames.length > 0 ? ` or another parallel room: ${activeOtherParallelRoomNames.join(', ')}` : ''}.
             </div>
@@ -1919,7 +2535,7 @@ export default function AttendanceIndex() {
         </div>
 
         {/* TWO-COLUMN UI LAYOUT EXACTLY MATCHING THE DESIGN */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: '24px' }}>
+        <div className="attendance-shell-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))', gap: 'clamp(16px, 3vw, 24px)' }}>
           
           {/* LEFT COLUMN: Schedules */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -1932,16 +2548,17 @@ export default function AttendanceIndex() {
 
             {/* PRESERVED FILTER PILLS & LIST FOR EXTENDED USAGE */}
             <div style={{ marginTop: '10px' }}>
-              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
-                {['today', 'past', 'future'].map(mode => (
-                  <button 
-                    key={mode} 
-                    onClick={() => setFilterMode(mode)} 
-                    style={{ border: 'none', padding: '6px 14px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: '600', cursor: 'pointer', backgroundColor: filterMode === mode ? '#0f172a' : '#e2e8f0', color: filterMode === mode ? '#ffffff' : '#475569', transition: 'all 0.2s' }}
-                  >
-                    {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                  </button>
-                ))}
+              <div className="attendance-filter-tabs" style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                <button type="button" style={{ border: 'none', padding: '6px 14px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: '600', cursor: 'default', backgroundColor: '#0f172a', color: '#ffffff' }}>
+                  Today
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { window.location.hash = '#/attendance-history'; }}
+                  style={{ border: 'none', padding: '6px 14px', borderRadius: '20px', fontSize: '0.8rem', fontWeight: '600', cursor: 'pointer', backgroundColor: '#e2e8f0', color: '#475569', transition: 'all 0.2s' }}
+                >
+                  View Past/Future Record(s)
+                </button>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '250px', overflowY: 'auto' }}>
                 {filteredRecords.length > 0 ? filteredRecords.map(item => {
@@ -1959,7 +2576,7 @@ export default function AttendanceIndex() {
                       <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Class:</strong> {item.subject_code || ''} - {item.section_name || ''}</div>
                       <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Time:</strong> {formatTime12(item.start_time)} - {formatTime12(item.end_time)}</div>
                       <div style={{ color: '#475569' }}><strong style={{ color: '#1e293b' }}>Room:</strong> {item.room_name || ''}</div>
-                      <div style={{ display: 'flex', gap: '12px', marginTop: '6px', fontSize: '0.75rem', fontWeight: '600', color: '#334155' }}>
+                      <div className="attendance-record-flags" style={{ display: 'flex', gap: '12px', marginTop: '6px', fontSize: '0.75rem', fontWeight: '600', color: '#334155' }}>
                         <span>In: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_in_id)}</span></span>
                         <span>Mid: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_check_id)}</span></span>
                         <span>Out: <span style={{ color: '#0f172a' }}>{getFlagLabel(item.flag_out_id)}</span></span>
@@ -1975,7 +2592,7 @@ export default function AttendanceIndex() {
           </div>
 
           {/* RIGHT COLUMN: Action & Status Panel */}
-          <div style={{ backgroundColor: '#d1d5db', borderRadius: '20px', padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px', boxShadow: 'inset 0 2px 4px 0 rgba(0, 0, 0, 0.05)' }}>
+          <div style={{ backgroundColor: '#d1d5db', borderRadius: '20px', padding: 'clamp(16px, 3vw, 24px)', display: 'flex', flexDirection: 'column', gap: '20px', boxShadow: 'inset 0 2px 4px 0 rgba(0, 0, 0, 0.05)', minWidth: 0 }}>
             
             {/* CURRENT ACTION */}
             <div>
@@ -1983,19 +2600,24 @@ export default function AttendanceIndex() {
               <div style={{ display: 'flex', justifyContent: 'center' }}>
                 <button 
                   onClick={() => handleCheckNow(scannedQrToken)}
-                  style={{ backgroundColor: '#15803d', color: '#ffffff', border: 'none', padding: '12px 28px', borderRadius: '10px', fontWeight: '700', fontSize: '0.95rem', boxShadow: '0 4px 6px -1px rgba(21, 128, 61, 0.3)', cursor: 'pointer', transition: 'transform 0.1s', width: 'auto', minWidth: '220px' }}
+                  disabled={activeAttendanceBlocked}
+                  className="attendance-action-button"
+                  style={{ backgroundColor: activeAttendanceOnLeave ? '#0891b2' : activeAttendanceBlocked ? '#4f46e5' : '#15803d', color: '#ffffff', border: 'none', padding: '12px 28px', borderRadius: '10px', fontWeight: '700', fontSize: '0.95rem', boxShadow: activeAttendanceBlocked ? 'none' : '0 4px 6px -1px rgba(21, 128, 61, 0.3)', cursor: activeAttendanceBlocked ? 'not-allowed' : 'pointer', transition: 'transform 0.1s', width: 'auto', minWidth: 'min(220px, 100%)' }}
                 >
-                  {actionAllowed && !isOutOfRange ? (currentAction ? `AUTOMATIC ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK') : (currentAction ? `READY: ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK')}
+                  {activeAttendanceBlocked
+                    ? (activeAttendanceOnLeave ? 'ON LEAVE - ATTENDANCE NOT REQUIRED' : 'SUBSTITUTED - ATTENDANCE TRANSFERRED')
+                    : actionAllowed && !isOutOfRange ? (currentAction ? `AUTOMATIC ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK') : (currentAction ? `READY: ${currentAction.replace('-', ' ').toUpperCase()}` : 'AUTOMATIC CHECK')}
                 </button>
               </div>
               {!actionAllowed && allowAt && <div style={{ fontSize: '0.8rem', color: '#475569', textAlign: 'center', marginTop: '8px', fontWeight: '600' }}>Allowed at: {new Date(allowAt).toLocaleTimeString()}</div>}
               {nextSchedule && (
                 <div style={{ fontSize: '0.8rem', color: '#334155', textAlign: 'center', marginTop: '8px', fontWeight: '600' }}>
-                   Next: {nextSchedule.subject_code} at {formatTime12(nextSchedule.start_time)} ({nextSecondsLeft != null ? `Starts in ${nextCountdownStr()}` : ''})
+                   Next: {nextSchedule.subject_code} at {formatTime12(nextSchedule.start_time)} (Starts in <CountdownDisplay targetDate={nextStartDate} />)
                 </div>
               )}
             </div>
 
+            {!activeAttendanceBlocked && <React.Fragment>
             {/* QR STATUS */}
             <div>
               <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#1e293b', marginBottom: '10px', letterSpacing: '0.025em' }}>QR STATUS</div>
@@ -2027,14 +2649,14 @@ export default function AttendanceIndex() {
             {/* GPS COORDINATE */}
             <div>
               <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#1e293b', marginBottom: '10px', letterSpacing: '0.025em' }}>GPS COORDINATE</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '0.85rem', color: '#334155', fontWeight: '600', marginBottom: '8px' }}>
+              <div className="attendance-gps-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '8px', fontSize: '0.85rem', color: '#334155', fontWeight: '600', marginBottom: '8px' }}>
                 <div>LATITUDE: <span style={{ color: '#0f172a' }}>{coords?.latitude ? coords.latitude.toFixed(7) : '—'}</span></div>
                 <div>LONGITUDE: <span style={{ color: '#0f172a' }}>{coords?.longitude ? coords.longitude.toFixed(7) : '—'}</span></div>
               </div>
               <div style={{ fontSize: '0.85rem', color: '#334155', fontWeight: '600', marginBottom: '14px' }}>
                 ALTITUDE: <span style={{ color: '#0f172a' }}>{attendanceAltitude.normalized !== null ? Number(attendanceAltitude.normalized).toFixed(3) : '—'}</span>
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.1fr', gap: '12px', alignItems: 'center' }}>
+              <div className="attendance-location-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.1fr)', gap: '12px', alignItems: 'center' }}>
                 <div style={{ fontSize: '0.85rem', color: '#334155', fontWeight: '600', lineHeight: '1.6' }}>
                   <div>CAMPUS: <span style={{ color: '#0f172a' }}>{activeSchedule?.campus_name || '—'}</span></div>
                   <div>BUILDING: <span style={{ color: '#0f172a' }}>{currentBuilding?.building_name || activeSchedule?.building_name || '—'}</span></div>
@@ -2047,6 +2669,8 @@ export default function AttendanceIndex() {
               </div>
             </div>
 
+            </React.Fragment>}
+
             {/* PRESERVED WIFI SPEED & MINI DEBUG */}
             <div style={{ borderTop: '1px solid #9ca3af', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
               {connectionQuality && (
@@ -2054,7 +2678,11 @@ export default function AttendanceIndex() {
                   <div style={{ fontSize: '0.75rem', fontWeight: '700', color: '#475569', marginBottom: '4px' }}>WIFI SPEED</div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <span style={{ fontWeight: '700', color: connectionQuality.color }}>● {connectionQuality.label}</span>
-                    <span style={{ color: '#475569' }}>{connectionQuality.rtt !== null ? `${connectionQuality.rtt}ms` : ''}{connectionQuality.effectiveType && connectionQuality.effectiveType !== 'offline' ? `, ${connectionQuality.effectiveType}` : ''}</span>
+                    <span style={{ color: '#475569' }}>
+                      {connectionQuality.rtt !== null ? `${connectionQuality.rtt}ms` : ''}
+                      {connectionQuality.downlink !== null && typeof connectionQuality.downlink !== 'undefined' ? `${connectionQuality.rtt !== null ? ', ' : ''}${connectionQuality.downlink.toFixed(1)} Mbps` : ''}
+                      {connectionQuality.effectiveType && !['offline', 'unknown'].includes(connectionQuality.effectiveType) ? `, ${connectionQuality.effectiveType}` : ''}
+                    </span>
                   </div>
                 </div>
               )}
@@ -2072,7 +2700,7 @@ export default function AttendanceIndex() {
 
         {/* PARALLEL CLASS MODAL */}
         <Modal show={showParallelModal} title="Parallel Classes" onClose={() => setShowParallelModal(false)}>
-          <div style={{ minWidth: 400, maxHeight: '70vh', overflowY: 'auto' }}>
+          <div style={{ width: 'min(100%, 520px)', maxHeight: '70vh', overflowY: 'auto' }}>
             {parallelModalData && parallelModalData.length > 0 ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 {parallelModalData.map((item, idx) => {
@@ -2121,17 +2749,87 @@ export default function AttendanceIndex() {
           </div>
         </Modal>
 
-        {/* PRESERVED MODAL FOR CAMERA QR SCANNING */}
-        <Modal show={isCameraVisible} title="Scan QR Code" onClose={() => setIsCameraVisible(false)}>
-          <div style={{ position: 'relative', minWidth: 300, minHeight: 300 }}>
-            {previewActive && (
-              <div style={{ marginBottom: 8, textAlign: 'center' }}>
-                <video ref={debugVideoRef} autoPlay playsInline muted id="debug-camera-preview" style={{ width: '100%', maxHeight: 220, objectFit: 'cover', borderRadius: 6 }} />
-              </div>
-            )}
-            <div id="qr-scanner-container" style={{ width: '100%', height: '100%' }}></div>
-            <div style={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: 250, height: 250, border: '2px solid #00FF00', pointerEvents: 'none', borderRadius: 6 }}></div>
+        {/* QR and manual-code verification use separate views in one modal. */}
+        <Modal show={isCameraVisible} title="Floor Verification" onClose={closeQrVerificationModal}>
+          <div
+            role="tablist"
+            aria-label="Choose floor verification method"
+            style={{display:'grid',gridTemplateColumns:'repeat(2, minmax(0, 1fr))',gap:6,padding:5,marginBottom:18,border:'1px solid #dbe4df',borderRadius:12,background:'#f1f5f9'}}
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={qrVerificationMode === 'scan'}
+              onClick={() => setQrVerificationMode('scan')}
+              style={{border:0,borderRadius:9,padding:'10px 12px',background:qrVerificationMode === 'scan' ? '#15803d' : 'transparent',color:qrVerificationMode === 'scan' ? '#ffffff' : '#475569',fontWeight:800,fontSize:13,cursor:'pointer',boxShadow:qrVerificationMode === 'scan' ? '0 3px 8px rgba(21,128,61,.2)' : 'none'}}
+            >
+              QR SCANNING
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={qrVerificationMode === 'code'}
+              onClick={() => setQrVerificationMode('code')}
+              style={{border:0,borderRadius:9,padding:'10px 12px',background:qrVerificationMode === 'code' ? '#15803d' : 'transparent',color:qrVerificationMode === 'code' ? '#ffffff' : '#475569',fontWeight:800,fontSize:13,cursor:'pointer',boxShadow:qrVerificationMode === 'code' ? '0 3px 8px rgba(21,128,61,.2)' : 'none'}}
+            >
+              Enter Code
+            </button>
           </div>
+
+          {qrVerificationMode === 'scan' ? (
+            <div role="tabpanel" aria-label="QR scanning">
+              <div style={{marginBottom:12,padding:'10px 12px',borderRadius:10,background:'#ecfdf3',color:'#166534',fontSize:13,lineHeight:1.45}}>
+                Point your camera at the QR code displayed on your assigned floor.
+              </div>
+              <div style={{ position: 'relative', width: 'min(100%, 420px)', minHeight: 'min(300px, 80vw)', margin: '0 auto' }}>
+                {previewActive && (
+                  <div style={{ marginBottom: 8, textAlign: 'center' }}>
+                    <video ref={debugVideoRef} autoPlay playsInline muted id="debug-camera-preview" style={{ width: '100%', maxHeight: 220, objectFit: 'cover', borderRadius: 6 }} />
+                  </div>
+                )}
+                <div id="qr-scanner-container" style={{ width: '100%', minHeight: 'min(300px, 80vw)' }}></div>
+                <div style={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: 'min(250px, 72vw)', height: 'min(250px, 72vw)', border: '2px solid #00FF00', pointerEvents: 'none', borderRadius: 6 }}></div>
+              </div>
+            </div>
+          ) : (
+            <div role="tabpanel" aria-label="Enter floor code" style={{width:'min(100%, 420px)',margin:'0 auto'}}>
+              <div style={{marginBottom:16,padding:'12px 14px',borderRadius:10,background:'#f8fafc',border:'1px solid #e2e8f0'}}>
+                <div style={{fontSize:14,fontWeight:800,color:'#1f2937'}}>Enter the code below the floor QR</div>
+                <div style={{marginTop:4,fontSize:12,color:'#64748b',lineHeight:1.45}}>Use this option when the camera cannot scan the printed QR code.</div>
+              </div>
+              <form onSubmit={handleManualFloorCodeSubmit}>
+                <label htmlFor="manual-floor-code" style={{display:'block',fontSize:14,fontWeight:700,color:'#1f2937',marginBottom:7}}>
+                  Manual QR code
+                </label>
+                <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                  <input
+                    id="manual-floor-code"
+                    type="text"
+                    value={manualFloorCode}
+                    onChange={(event) => {
+                      setManualFloorCode(event.target.value.toUpperCase().replace(/\s+/g, ''));
+                      setManualCodeError('');
+                    }}
+                    maxLength={16}
+                    autoFocus
+                    autoCapitalize="characters"
+                    autoComplete="off"
+                    placeholder="MW2A7K9"
+                    aria-invalid={Boolean(manualCodeError)}
+                    style={{flex:'1 1 210px',minWidth:0,border:`1px solid ${manualCodeError ? '#dc2626' : '#cbd5e1'}`,borderRadius:8,padding:'11px 12px',fontWeight:700,letterSpacing:'0.08em',textTransform:'uppercase',outline:'none'}}
+                  />
+                  <button
+                    type="submit"
+                    disabled={manualCodeVerifying || !manualFloorCode.trim()}
+                    style={{flex:'0 0 auto',border:0,borderRadius:8,padding:'11px 18px',background:'#15803d',color:'#fff',fontWeight:700,opacity:(manualCodeVerifying || !manualFloorCode.trim()) ? 0.55 : 1,cursor:(manualCodeVerifying || !manualFloorCode.trim()) ? 'not-allowed' : 'pointer'}}
+                  >
+                    {manualCodeVerifying ? 'Verifying...' : 'Verify'}
+                  </button>
+                </div>
+                {manualCodeError && <div style={{marginTop:8,color:'#dc2626',fontSize:13,fontWeight:600}}>{manualCodeError}</div>}
+              </form>
+            </div>
+          )}
         </Modal>
 
       </div>

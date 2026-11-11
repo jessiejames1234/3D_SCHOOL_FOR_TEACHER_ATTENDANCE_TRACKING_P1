@@ -1,8 +1,18 @@
 import React from 'react';
 import Table from '../../components/Table.jsx';
 import Modal from '../../components/Modal.jsx';
+import UserStatusBadge from '../../components/UserStatusBadge.jsx';
 import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet, apiPost, apiPut } from '../../services/api.js'; 
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import { MasterPageHeader, MasterStats, MasterToolbar, MasterSearch, MasterResults, MasterSelect } from '../../components/MasterDataPage.jsx';
+
+const leaveStatusLabel = (status) => {
+  const normalized = String(status || '').toLowerCase();
+  if (normalized === 'approve') return 'Approved';
+  if (normalized === 'void') return 'Cancelled';
+  return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : 'Unknown';
+};
 
 export default function LeavesFiles() {
   const { user } = React.useContext(AuthContext);
@@ -11,7 +21,7 @@ export default function LeavesFiles() {
   
   // -- State --
   const [rows, setRows] = React.useState([]);
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   
   // File/Edit Leave Modal State
   const [showModal, setShowModal] = React.useState(false);
@@ -27,26 +37,56 @@ export default function LeavesFiles() {
   const [teachers, setTeachers] = React.useState([]);
   const [teacherSearch, setTeacherSearch] = React.useState('');
   const [teacherFilter, setTeacherFilter] = React.useState('');
-  const [formTeacherFilter, setFormTeacherFilter] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState(''); 
   const [resolvedDeptId, setResolvedDeptId] = React.useState('');
+  const [page, setPage] = React.useState(1);
+  const [pagination, setPagination] = React.useState({ page: 1, page_size: 10, total: 0, total_pages: 1 });
+  const [leaveStats, setLeaveStats] = React.useState({ total: 0, activeToday: 0, upcoming: 0 });
+  const [debouncedTeacherSearch, setDebouncedTeacherSearch] = React.useState('');
 
   React.useEffect(() => {
     if (!user) return;
     const rid = Number(user.role_id);
-    if (![1, 2, 4, 6].includes(rid)) { window.location.hash = '#/dashboard'; }
+    if (![2, 6].includes(rid)) { window.location.hash = '#/dashboard'; }
   }, [user]);
 
-  const fetch = async () => {
-    setLoading(true);
+  React.useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedTeacherSearch(teacherSearch.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [teacherSearch]);
+
+  React.useEffect(() => { setPage(1); }, [debouncedTeacherSearch, teacherFilter, statusFilter]);
+
+  const fetchRows = React.useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
-      const [d, types, usersList, teacherList] = await Promise.all([
-        apiGet('leaves'),
+      const params = new URLSearchParams({ paginate: '1', page: String(page), page_size: '10' });
+      if (debouncedTeacherSearch) params.set('search', debouncedTeacherSearch);
+      if (teacherFilter) params.set('teacher_id', teacherFilter);
+      if (statusFilter) params.set('status', statusFilter);
+      const d = await apiGet(`leaves?${params.toString()}`);
+      const list = Array.isArray(d?.rows) ? d.rows : (Array.isArray(d) ? d : []);
+      setRows(list.map(r => ({ ...r, _status: String(r.req_status || '').toLowerCase() })));
+      if (d?.pagination) {
+        setPagination(d.pagination);
+        if (Number(d.pagination.page || 1) !== page) setPage(Number(d.pagination.page || 1));
+      }
+      if (d?.summary) setLeaveStats({
+        total: Number(d.summary.total || 0),
+        activeToday: Number(d.summary.active_today || 0),
+        upcoming: Number(d.summary.upcoming || 0),
+      });
+    } catch (e) { console.error(e); }
+    if (!silent) setLoading(false);
+  }, [page, debouncedTeacherSearch, teacherFilter, statusFilter]);
+
+  const loadOptions = React.useCallback(async () => {
+    try {
+      const [types, usersList, teacherList] = await Promise.all([
         apiGet('leaves/types').catch(() => []),
-        apiGet('users').catch(() => []),
+        apiGet('users?list=1&teaching_roles=1&include_inactive=1').catch(() => []),
         apiGet('teachers').catch(() => [])
       ]);
-      const list = Array.isArray(d) ? d : [];
       setLeaveTypes(Array.isArray(types) ? types : []);
 
       // Use users endpoint for role-aware filtering; fallback to teachers endpoint if needed.
@@ -54,7 +94,7 @@ export default function LeavesFiles() {
         ? usersList
         : (Array.isArray(teacherList) ? teacherList.map(t => ({ ...t, role_id: 5, status: t.status ?? 'active' })) : []);
 
-      const activeRoleUsers = mergedUsers
+      const teachingUsers = mergedUsers
         .map(u => ({
           ...u,
           user_id: Number(u.user_id || 0),
@@ -63,62 +103,51 @@ export default function LeavesFiles() {
           status: String(u.status ?? 'active').toLowerCase(),
         }))
         .filter(u => u.user_id > 0)
-        .filter(u => [5, 2, 3, 4, 6].includes(Number(u.role_id)))
-        .filter(u => u.status === '' || u.status === 'active' || u.status === '1' || u.status === 'true');
+        .filter(u => [2, 3, 4, 5].includes(Number(u.role_id)));
 
-      setTeachers(activeRoleUsers);
+      setTeachers(teachingUsers);
 
-      const isAdmin = Number(user?.role_id) === 1;
       const userDept = (user && user.dept_id != null && String(user.dept_id) !== '')
         ? String(user.dept_id)
         : '';
       const fallbackDept = userDept
-        || String(activeRoleUsers.find(u => Number(u.user_id) === Number(user?.user_id))?.dept_id || '');
+        || String(teachingUsers.find(u => Number(u.user_id) === Number(user?.user_id))?.dept_id || '');
 
       setResolvedDeptId(fallbackDept);
 
-      const deptFiltered = (!isAdmin && fallbackDept)
-        ? list.filter(l => String(l.dept_id) === fallbackDept)
-        : (!isAdmin && !fallbackDept)
-          ? []
-        : list;
-
-      setRows(deptFiltered.map(r => ({ ...r, _status: String(r.req_status || '').toLowerCase() })));
     } catch (e) { console.error(e); }
-    setLoading(false);
-  };
+  }, [user]);
 
   React.useEffect(() => {
     if (!user) return;
-    fetch();
-  }, [user]);
+    loadOptions();
+  }, [user, loadOptions]);
 
-  const displayedRows = React.useMemo(() => {
-    let filtered = rows;
-    if (teacherSearch) {
-      const q = teacherSearch.trim().toLowerCase();
-      filtered = filtered.filter(r => (`${r.first_name || ''} ${r.last_name || ''}`).toLowerCase().includes(q));
-    }
-    if (teacherFilter) {
-      filtered = filtered.filter(r => String(r.teacher_id || '') === String(teacherFilter));
-    }
-    if (statusFilter) {
-      filtered = filtered.filter(r => r._status === statusFilter.toLowerCase());
-    }
-    return filtered;
-  }, [rows, teacherSearch, teacherFilter, statusFilter]);
+  React.useEffect(() => {
+    if (!user) return;
+    fetchRows();
+  }, [user, fetchRows]);
+
+  useAutoRefresh({
+    refresh: () => fetchRows({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.WORKFLOW,
+    enabled: Boolean(user) && !showModal,
+  });
+
+  const displayedRows = rows;
 
   const availableTeachersForForm = React.useMemo(() => {
     if (!user || !teachers) return [];
-    // include teachers (5), deans (2), department admins (6), program heads (3), and secretaries (4)
-    const allowedRoles = new Set([5, 2, 6, 3, 4]);
-    const roleOrder = { 5: 1, 2: 2, 6: 3, 3: 4, 4: 5 };
+    // Teaching staff: deans (2), program heads (3), secretaries (4), and teachers (5).
+    const allowedRoles = new Set(currentRoleId === 6 ? [2, 3, 4, 5] : [3, 4, 5]);
+    const roleOrder = { 2: 1, 3: 2, 4: 3, 5: 4 };
     const source = Number(user.role_id) === 1
       ? teachers
       : teachers.filter(t => resolvedDeptId && String(t.dept_id) === String(resolvedDeptId));
 
     return source
       .filter(t => allowedRoles.has(Number(t.role_id)))
+      .filter(t => ['active', '1', 'true'].includes(String(t.status || 'active').trim().toLowerCase()))
       .slice()
       .sort((a, b) => {
         const ra = roleOrder[Number(a.role_id)] || 99;
@@ -128,7 +157,7 @@ export default function LeavesFiles() {
         const bName = `${b.last_name || ''} ${b.first_name || ''}`.trim().toLowerCase();
         return aName.localeCompare(bName);
       });
-  }, [teachers, user, resolvedDeptId]);
+  }, [teachers, user, resolvedDeptId, currentRoleId]);
 
   const roleLabel = React.useCallback((roleId) => {
     const r = Number(roleId);
@@ -142,27 +171,24 @@ export default function LeavesFiles() {
 
   const availableTeachersForFilter = React.useMemo(() => {
     const map = new Map();
-    availableTeachersForForm.forEach((t) => {
+    teachers
+      .filter((t) => resolvedDeptId && String(t.dept_id) === String(resolvedDeptId))
+      .forEach((t) => {
       const id = String(t.user_id);
       if (!id) return;
       if (!map.has(id)) map.set(id, t);
     });
     return Array.from(map.values());
-  }, [availableTeachersForForm]);
+  }, [teachers, resolvedDeptId]);
 
-  const filteredAvailableTeachersForForm = React.useMemo(() => {
-    const q = formTeacherFilter.trim().toLowerCase();
-    if (!q) return availableTeachersForForm;
-    return availableTeachersForForm.filter((t) => {
-      const name = `${t.first_name || ''} ${t.last_name || ''}`.trim().toLowerCase();
-      const role = roleLabel(t.role_id).toLowerCase();
-      return name.includes(q) || role.includes(q) || String(t.user_id).includes(q);
-    });
-  }, [availableTeachersForForm, formTeacherFilter, roleLabel]);
+  const canManageLeaveRecord = React.useCallback((row) => {
+    if (!canManageLeaves) return false;
+    if (!['active', '1', 'true'].includes(String(row?.user_status || '').trim().toLowerCase())) return false;
+    return currentRoleId === 6 || Number(row?.role_id) !== 2;
+  }, [canManageLeaves, currentRoleId]);
 
   const openModal = (row = null) => {
     setEditing(row);
-    setFormTeacherFilter('');
     if (row) { 
         setForm({ 
             date_from: row.date_from, 
@@ -183,15 +209,13 @@ export default function LeavesFiles() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      if (!canManageLeaves) throw new Error('Only dean and department admin can file or edit leave records.');
+      if (!canManageLeaves) throw new Error('Only the Dean or Department Admin can record or edit leave records.');
       const payloadTeacher = Number(form.teacher_id) || null;
       if (!payloadTeacher) throw new Error('Teacher is required');
-      
-      if ([2, 6].includes(currentRoleId)) {
-        const t = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
-        if (!resolvedDeptId) throw new Error('Your department is not set on your account');
-        if (!t || String(t.dept_id) !== String(resolvedDeptId)) throw new Error('Selected teacher is not in your department');
-      }
+      const target = teachers.find(x => Number(x.user_id) === Number(payloadTeacher));
+      if (!resolvedDeptId) throw new Error('Your department is not set on your account');
+      if (!target || String(target.dept_id) !== String(resolvedDeptId)) throw new Error('Selected teacher is not in your department');
+      if (currentRoleId === 2 && Number(target.role_id) === 2) throw new Error("Only the Department Admin can manage a Dean's leave.");
 
       const payload = { 
           teacher_id: payloadTeacher, 
@@ -200,6 +224,17 @@ export default function LeavesFiles() {
           date_to: form.date_to, 
           reason: form.reason 
       };
+
+      const teacherName = target ? `${target.first_name || ''} ${target.last_name || ''}`.trim() : 'the selected teacher';
+      const confirmation = window.Swal ? await window.Swal.fire({
+        title: editing ? 'Update Approved Leave?' : 'Record Approved Leave?',
+        text: `${teacherName}: ${form.date_from} to ${form.date_to}. Matching attendance records may be changed to On Leave.`,
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: editing ? 'Update Record' : 'Record Approved Leave',
+        confirmButtonColor: '#198754'
+      }) : { isConfirmed: confirm(`${editing ? 'Update' : 'Record'} approved leave for ${teacherName}?`) };
+      if (!confirmation.isConfirmed) return;
       
       if (editing && editing.leave_id) {
         payload.req_status = form.req_status;
@@ -207,23 +242,30 @@ export default function LeavesFiles() {
         window.Swal && window.Swal.fire('Update Successful', 'The leave record has been securely updated.', 'success');
       } else {
         await apiPost('leaves', payload);
-        window.Swal && window.Swal.fire('Leave Filed & Approved', 'The leave request has been successfully recorded and approved automatically.', 'success');
+        window.Swal && window.Swal.fire('Approved Leave Recorded', 'The approved leave has been successfully recorded.', 'success');
       }
       setShowModal(false);
-      fetch();
+      fetchRows();
     } catch (err) {
       console.error(err);
       
-      const errorString = String(err?.response?.data?.message || err?.message || err).toLowerCase();
+      const errorCode = String(err?.body?.error || err?.code || '').toLowerCase();
+      const errorString = String(err?.body?.message || err?.message || err).toLowerCase();
 
-      if (errorString.includes('duplicate_leave') || errorString.includes('overlap') || err?.response?.status === 409) {
+      if (errorCode === 'leave_has_substitutions') {
+          window.Swal && window.Swal.fire(
+              'Cancellation Blocked',
+              err?.body?.message || 'This leave cannot be cancelled or moved because an affected class already has a substitute.',
+              'warning'
+          );
+      } else if (errorCode === 'duplicate_leave' || errorString.includes('overlap')) {
           window.Swal && window.Swal.fire(
               'Date Overlap Detected', 
               'The selected dates overlap with an already existing active leave for this teacher. Please adjust the dates.', 
               'warning'
           );
       } else {
-          let cleanMsg = err?.response?.data?.message || err?.message || 'An unknown error occurred.';
+          let cleanMsg = err?.body?.message || err?.message || 'An unknown error occurred.';
           if (cleanMsg.includes('Network request failed') || cleanMsg.includes('http')) {
               cleanMsg = 'Failed to process the request. Please verify your data or check your connection.';
           }
@@ -234,21 +276,19 @@ export default function LeavesFiles() {
 
   const columns = [
     { key: 'rownum', label: '#', render: (r, pIdx, gIdx) => gIdx + 1 },
-    { key: 'teacher', label: 'Teacher', render: (r) => `${r.first_name || ''} ${r.last_name || ''}` },
+    { key: 'teacher', label: 'Teacher', render: (r) => <div className="flex flex-col gap-1"><span>{`${r.first_name || ''} ${r.last_name || ''}`}</span><UserStatusBadge status={r.user_status} /></div> },
     { key: 'date', label: 'From - To', render: (r) => `${r.date_from} → ${r.date_to}` },
     { key: 'type', label: 'Type', render: (r) => r.name_type || r.leave_type || 'N/A' },
     { key: 'status', label: 'Status', render: (r) => (
         <span className={`badge ${r.req_status === 'approve' ? 'bg-green-600 text-white' : 'bg-red-500 text-white'}`}>
-          {String(r.req_status).toUpperCase()}
+          {leaveStatusLabel(r.req_status)}
         </span>
       ) },
     { key: 'actions', label: 'Actions', actions: (row) => {
         const actions = [];
-        const isDean = [2, 6].includes(currentRoleId);
-
         actions.push({ label: 'View', onClick: () => openDetail(row) });
 
-        if (isDean) {
+        if (canManageLeaveRecord(row)) {
           actions.push({ label: 'Edit', onClick: () => openModal(row), variant: 'primary' });
         }
         
@@ -265,13 +305,14 @@ export default function LeavesFiles() {
             <div className="w-12 h-12 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-lg">{detailItem ? (detailItem.first_name || '').charAt(0) : ''}</div>
             <div>
               <div className="text-lg font-semibold">{detailItem ? `${detailItem.first_name || ''} ${detailItem.last_name || ''}` : '—'}</div>
+              <UserStatusBadge status={detailItem?.user_status} />
               <div className="text-sm text-gray-500">{detailItem && (detailItem.dept_name || detailItem.department || '')}</div>
             </div>
           </div>
           <div className="text-right">
             {detailItem && (
               <div className={`inline-block px-3 py-1 rounded-full text-sm font-semibold ${detailItem.req_status === 'approve' ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
-                {String(detailItem.req_status || '').toUpperCase()}
+                {leaveStatusLabel(detailItem.req_status)}
               </div>
             )}
           </div>
@@ -293,64 +334,66 @@ export default function LeavesFiles() {
   );
 
   return (
-    <div className="p-6">
-      
-      {/* Top Header Section */}
-      <div className="flex items-center justify-between mb-6">
-        <h2 className="text-2xl font-semibold">Leaves (File)</h2>
-        { canManageLeaves && (
+    <div className="mdp-page">
+      <MasterPageHeader
+        eyebrow="Faculty coverage"
+        title="Approved Leave Records"
+        description="Record externally approved faculty leave and make covered class dates available for substitute assignment."
+        action={canManageLeaves ? (
           <button 
-            className="px-4 py-2 bg-green-600 text-white rounded-md text-base font-medium shadow hover:bg-green-700" 
+            className="mdp-primary"
             onClick={() => openModal()}
           >
-            File Leave
+            <i className="bi bi-calendar2-plus mr-2" aria-hidden="true"></i>
+            Record Leave
           </button>
-        )}
-      </div>
+        ) : null}
+      />
 
-      {/* Aligned & Enlarged Filter Section */}
-      <div className="flex flex-wrap items-center gap-4 mb-4">
-        <div className="flex items-center gap-2">
-          <label className="text-base font-medium text-gray-700">Filter Status:</label>
-          <select 
-            value={statusFilter} 
-            onChange={e => setStatusFilter(e.target.value)}
-            className="px-3 py-2 border rounded-md text-base bg-white shadow-sm focus:ring-2 focus:ring-indigo-400 focus:outline-none min-w-[140px]"
-          >
-            <option value="">All Status</option>
-            <option value="approve">Approved</option>
-            <option value="void">Void</option>
-          </select>
-        </div>
+      <MasterStats loading={loading} items={[
+        { label: 'Recorded Leaves', value: leaveStats.total, help: 'All leave records in your department', tone: 'green', icon: <i className="bi bi-journal-check" /> },
+        { label: 'Active Today', value: leaveStats.activeToday, help: 'Approved leave covering today', tone: 'blue', icon: <i className="bi bi-calendar2-check" /> },
+        { label: 'Upcoming', value: leaveStats.upcoming, help: 'Approved leave starting later', tone: 'amber', icon: <i className="bi bi-calendar-event" /> },
+      ]} />
 
-        <input
-          placeholder="Search teacher..."
-          value={teacherSearch}
-          onChange={e => setTeacherSearch(e.target.value)}
-          className="px-3 py-2 border rounded-md text-base bg-white shadow-sm focus:ring-2 focus:ring-indigo-400 focus:outline-none w-64 lg:w-80"
-        />
-
-        <div className="flex items-center gap-2">
-          <label className="text-base font-medium text-gray-700">Teacher Filter:</label>
-          <select
-            value={teacherFilter}
-            onChange={e => setTeacherFilter(e.target.value)}
-            className="px-3 py-2 border rounded-md text-base bg-white shadow-sm focus:ring-2 focus:ring-indigo-400 focus:outline-none min-w-[220px]"
-          >
-            <option value="">All People</option>
-            {availableTeachersForFilter.map((t) => (
-              <option key={t.user_id} value={t.user_id}>
-                {t.first_name} {t.last_name} ({roleLabel(t.role_id)})
-              </option>
-            ))}
-          </select>
+      <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 flex items-start gap-3 text-sm text-green-900">
+        <div className="w-9 h-9 rounded-lg bg-white border border-green-200 flex items-center justify-center flex-none text-green-700"><i className="bi bi-diagram-3" aria-hidden="true"></i></div>
+        <div>
+          <div className="font-bold">Coverage workflow</div>
+          <div className="text-green-800 mt-0.5">External leave approval → record approved leave here → assign substitutes only to attendance dates inside the leave period.</div>
         </div>
       </div>
 
-      <Table columns={columns} data={displayedRows} pageSize={10} loading={loading} />
+      <MasterToolbar>
+        <MasterSelect label="Status" value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="approve">Approved</option>
+          <option value="void">Cancelled</option>
+        </MasterSelect>
+
+        <MasterSearch value={teacherSearch} onChange={e => setTeacherSearch(e.target.value)} placeholder="Search teacher…" />
+
+        <MasterSelect label="Teacher" value={teacherFilter} onChange={e => setTeacherFilter(e.target.value)}>
+          <option value="">All people</option>
+          {availableTeachersForFilter.map((t) => (
+            <option key={t.user_id} value={t.user_id}>
+              {t.first_name} {t.last_name} ({roleLabel(t.role_id)})
+            </option>
+          ))}
+        </MasterSelect>
+      </MasterToolbar>
+
+      <MasterResults
+        title="Leave Registry"
+        count={Number(pagination.total || 0)}
+        loading={loading}
+        description="Approved and cancelled leave records available to your department."
+      >
+        <Table columns={columns} data={displayedRows} pageSize={10} loading={loading} serverPagination totalItems={Number(pagination.total || 0)} page={page} onPageChange={setPage} />
+      </MasterResults>
 
       {/* File/Edit Leave Modal */}
-      <Modal show={showModal} title={editing ? 'Edit Leave' : 'File Leave'} onClose={() => setShowModal(false)} size="md">
+      <Modal show={showModal} title={editing ? 'Edit Leave' : 'Record Approved Leave'} onClose={() => setShowModal(false)} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">
           <div><label className="block text-sm font-medium">From</label><input type="date" required name="date_from" value={form.date_from} onChange={(e) => setForm(s => ({ ...s, date_from: e.target.value }))} className="form-control" /></div>
           <div><label className="block text-sm font-medium">To</label><input type="date" required name="date_to" value={form.date_to} onChange={(e) => setForm(s => ({ ...s, date_to: e.target.value }))} className="form-control" /></div>
@@ -364,23 +407,16 @@ export default function LeavesFiles() {
           {canManageLeaves && (
             <div>
               <label className="block text-sm font-medium">Teacher</label>
-              <input
-                type="text"
-                value={formTeacherFilter}
-                onChange={(e) => setFormTeacherFilter(e.target.value)}
-                placeholder="Filter teacher / dean / department admin / program head / secretary..."
-                className="form-control mb-2"
-              />
               <select required value={form.teacher_id} onChange={(e) => setForm(s => ({ ...s, teacher_id: e.target.value }))} className="form-select">
                 <option value="">Select Teacher</option>
-                {filteredAvailableTeachersForForm.map((teacher) => (
+                {availableTeachersForForm.map((teacher) => (
                   <option key={teacher.user_id} value={teacher.user_id}>
                     {teacher.first_name} {teacher.last_name} ({roleLabel(teacher.role_id)})
                   </option>
                 ))}
               </select>
-              {!filteredAvailableTeachersForForm.length && (
-                <div className="text-xs text-gray-500 mt-1">No matching users in your department.</div>
+              {!availableTeachersForForm.length && (
+                <div className="text-xs text-gray-500 mt-1">No eligible teaching staff were found in your department.</div>
               )}
             </div>
           )}
@@ -390,7 +426,7 @@ export default function LeavesFiles() {
               <label className="block text-sm font-medium">Status</label>
               <select required value={form.req_status} onChange={(e) => setForm(s => ({ ...s, req_status: e.target.value }))} className="form-select">
                 <option value="approve">Approved</option>
-                <option value="void">Void</option>
+                <option value="void">Cancelled</option>
               </select>
             </div>
           )}
@@ -398,7 +434,7 @@ export default function LeavesFiles() {
           <div><label className="block text-sm font-medium">Reason</label><textarea required value={form.reason} onChange={(e) => setForm(s => ({ ...s, reason: e.target.value }))} className="form-control" /></div>
           <div className="flex justify-end gap-2 pt-2">
             <button type="button" onClick={() => setShowModal(false)} className="px-3 py-2 rounded border">Cancel</button>
-            <button type="submit" className="px-4 py-2 rounded bg-green-600 hover:bg-green-700 text-white font-medium shadow">{editing ? 'Update Record' : 'File & Auto-Approve'}</button>
+            <button type="submit" className="px-4 py-2 rounded bg-green-600 hover:bg-green-700 text-white font-medium shadow">{editing ? 'Update Record' : 'Record Approved Leave'}</button>
           </div>
         </form>
       </Modal>

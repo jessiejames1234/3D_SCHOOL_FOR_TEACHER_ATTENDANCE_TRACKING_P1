@@ -1,40 +1,37 @@
 import React from 'react';
 import Table from '../../components/Table.jsx';
 import Modal from '../../components/Modal.jsx';
+import UserStatusBadge from '../../components/UserStatusBadge.jsx';
+import { AuthContext } from '../../context/AuthContext.jsx';
 import { apiGet, apiPut } from '../../services/api.js';
 import { attendanceFlagKey, attendanceFlagLabel } from '../../utils/attendanceFlags.js';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
 
 export default function AttendanceEditRequestPage() {
+  const { user } = React.useContext(AuthContext) || {};
+  const reviewerRole = Number(user?.role_id || 0);
+  const canDecideRequest = (row) => Boolean(row)
+    && [2, 6].includes(reviewerRole)
+    && Number(user?.dept_id || 0) > 0
+    && Number(row.teacher_dept_id) === Number(user.dept_id)
+    && Number(row.requested_by) !== Number(user?.user_id)
+    && Number(row.teacher_id) !== Number(user?.user_id)
+    && [2, 3, 4, 5].includes(Number(row.teacher_role_id))
+    && (Number(row.teacher_role_id) !== 2 || reviewerRole === 6);
   const [rows, setRows] = React.useState([]);
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState('pending');
+  const [search, setSearch] = React.useState('');
+  const [startDate, setStartDate] = React.useState('');
+  const [endDate, setEndDate] = React.useState('');
+  const [sortBy, setSortBy] = React.useState('newest');
+  const [mobilePage, setMobilePage] = React.useState(1);
   const [actioningId, setActioningId] = React.useState(null);
   const [viewRow, setViewRow] = React.useState(null);
   const [showViewModal, setShowViewModal] = React.useState(false);
   const [targetRequestId, setTargetRequestId] = React.useState(null);
-  const [approvalForm, setApprovalForm] = React.useState({
-    flag_in_id: 1,
-    flag_check_id: 1,
-    flag_out_id: 1,
-    remarks: '',
-  });
   const triedAllForTargetRef = React.useRef(false);
-
-  const FLAG_OPTIONS = [
-    { id: 1, name: 'Upcoming' },
-    { id: 2, name: 'Present' },
-    { id: 3, name: 'Absent' },
-    { id: 4, name: 'Substituted' },
-    { id: 5, name: 'Late' },
-    { id: 7, name: 'On Leave' },
-    { id: 8, name: 'Pending' },
-  ];
-
-  const toFlagId = (value, fallback = 1) => {
-    const n = Number(value);
-    return Number.isInteger(n) && n > 0 ? n : fallback;
-  };
 
   const notifyDecisionSuccess = async (decision) => {
     const title = decision === 'approved'
@@ -75,24 +72,29 @@ export default function AttendanceEditRequestPage() {
     window.history.replaceState(null, '', nextHash);
   };
 
-  const load = async () => {
-    setLoading(true);
-    setError('');
+  const load = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    if (!silent) setError('');
     try {
-      const q = statusFilter === 'all' ? '' : `?status=${statusFilter}`;
-      const data = await apiGet(`request-edit/attendance${q}`);
+      const data = await apiGet('request-edit/attendance');
       setRows(Array.isArray(data) ? data : []);
     } catch (e) {
       const msg = e?.body?.message || e?.body?.error || e?.message || 'Failed to load attendance edit requests';
-      setError(String(msg));
+      if (!silent) setError(String(msg));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   React.useEffect(() => {
     load();
-  }, [statusFilter]);
+  }, []);
+
+  useAutoRefresh({
+    refresh: () => load({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.WORKFLOW,
+    enabled: !showViewModal && actioningId === null,
+  });
 
   React.useEffect(() => {
     if (typeof window === 'undefined') return undefined;
@@ -105,14 +107,24 @@ export default function AttendanceEditRequestPage() {
     return () => window.removeEventListener('hashchange', syncTargetFromHash);
   }, []);
 
-  const decide = async (requestId, decision, changes = null) => {
+  const decide = async (requestId, decision) => {
+    if (!canDecideRequest(rows.find((row) => Number(row.request_id) === Number(requestId)))) return;
+    const approving = decision === 'approved';
+    const confirmation = typeof window !== 'undefined' && window.Swal
+      ? await window.Swal.fire({
+          title: approving ? 'Approve Attendance Request?' : 'Reject Attendance Request?',
+          text: approving ? 'All requested attendance checkpoints will be marked Present.' : 'The request will be rejected and attendance will remain unchanged.',
+          icon: approving ? 'warning' : 'question',
+          showCancelButton: true,
+          confirmButtonText: approving ? 'Approve & Mark All Present' : 'Reject',
+          confirmButtonColor: approving ? '#1D8551' : '#dc2626'
+        })
+      : { isConfirmed: window.confirm(approving ? 'Approve and mark all checkpoints Present?' : 'Reject this attendance request?') };
+    if (!confirmation.isConfirmed) return;
     setActioningId(requestId);
     setError('');
     try {
       const payload = { decision };
-      if (decision === 'approved' && changes && Object.keys(changes).length > 0) {
-        payload.changes = changes;
-      }
       await apiPut(`request-edit/attendance/${requestId}`, payload);
       await load();
       await notifyDecisionSuccess(decision);
@@ -133,12 +145,6 @@ export default function AttendanceEditRequestPage() {
   };
 
   const openView = (row) => {
-    setApprovalForm({
-      flag_in_id: toFlagId(row.flag_in_id, 1),
-      flag_check_id: toFlagId(row.flag_check_id, 1),
-      flag_out_id: toFlagId(row.flag_out_id, 1),
-      remarks: row.attendance_remarks || '',
-    });
     setViewRow(row);
     setShowViewModal(true);
   };
@@ -186,6 +192,30 @@ export default function AttendanceEditRequestPage() {
     return dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
   };
 
+  const parseRequestDate = (value) => {
+    if (!value) return null;
+    const date = new Date(String(value).replace(' ', 'T'));
+    return Number.isNaN(date.getTime()) ? null : date;
+  };
+
+  const formatRequestDateTime = (value) => {
+    const date = parseRequestDate(value);
+    if (!date) return '-';
+    return date.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+  };
+
+  const getWaitingInfo = (row) => {
+    if (String(row?.status || '').toLowerCase() !== 'pending') return { label: 'Decision completed', tone: 'normal', hours: 0 };
+    const created = parseRequestDate(row?.created_at);
+    if (!created) return { label: 'Waiting', tone: 'normal', hours: 0 };
+    const hours = Math.max(0, (Date.now() - created.getTime()) / 3600000);
+    const days = Math.floor(hours / 24);
+    const label = days > 0 ? `Waiting ${days} day${days === 1 ? '' : 's'}` : `Waiting ${Math.max(1, Math.floor(hours))} hour${Math.floor(hours) === 1 ? '' : 's'}`;
+    return { label, tone: hours >= 72 ? 'urgent' : (hours >= 24 ? 'warning' : 'normal'), hours };
+  };
+
+  const getInitials = (name) => String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
+
   const getFlagLabel = (flagId, flagName) => {
     return attendanceFlagLabel(flagId, flagName);
   };
@@ -212,26 +242,60 @@ export default function AttendanceEditRequestPage() {
   const pendingInView = String(viewRow?.status || '').toLowerCase() === 'pending';
   const remarksLabel = pendingInView ? 'Current Attendance Remarks' : 'Reviewer Message';
 
-  const buildApprovalChanges = () => {
-    if (!viewRow) return {};
-    const changes = {};
-    const nextIn = toFlagId(approvalForm.flag_in_id, toFlagId(viewRow.flag_in_id, 1));
-    const nextMid = toFlagId(approvalForm.flag_check_id, toFlagId(viewRow.flag_check_id, 1));
-    const nextOut = toFlagId(approvalForm.flag_out_id, toFlagId(viewRow.flag_out_id, 1));
-    if (nextIn !== toFlagId(viewRow.flag_in_id, 1)) changes.flag_in_id = nextIn;
-    if (nextMid !== toFlagId(viewRow.flag_check_id, 1)) changes.flag_check_id = nextMid;
-    if (nextOut !== toFlagId(viewRow.flag_out_id, 1)) changes.flag_out_id = nextOut;
-    const nextRemarks = String(approvalForm.remarks || '').trim();
-    const prevRemarks = String(viewRow.attendance_remarks || '').trim();
-    if (nextRemarks !== prevRemarks) changes.remarks = nextRemarks;
-    return changes;
-  };
+  const requestCounts = React.useMemo(() => ({
+    pending: rows.filter((row) => String(row.status || '').toLowerCase() === 'pending').length,
+    approved: rows.filter((row) => String(row.status || '').toLowerCase() === 'approved').length,
+    rejected: rows.filter((row) => String(row.status || '').toLowerCase() === 'rejected').length,
+    all: rows.length,
+  }), [rows]);
+
+  const filteredRows = React.useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const filtered = rows.filter((row) => {
+      const status = String(row.status || 'pending').toLowerCase();
+      if (statusFilter !== 'all' && status !== statusFilter) return false;
+      if (startDate && String(row.attendance_date || '') < startDate) return false;
+      if (endDate && String(row.attendance_date || '') > endDate) return false;
+      if (query) {
+        const haystack = [row.teacher_name, row.subject_code, row.subject_name, row.section_name, row.room_name, row.reason, row.requested_by_name]
+          .filter(Boolean).join(' ').toLowerCase();
+        if (!haystack.includes(query)) return false;
+      }
+      return true;
+    });
+    return filtered.sort((a, b) => {
+      const aTime = parseRequestDate(a.created_at)?.getTime() || 0;
+      const bTime = parseRequestDate(b.created_at)?.getTime() || 0;
+      if (sortBy === 'oldest') return aTime - bTime;
+      if (sortBy === 'waiting') {
+        const aPending = String(a.status || '').toLowerCase() === 'pending';
+        const bPending = String(b.status || '').toLowerCase() === 'pending';
+        if (aPending !== bPending) return aPending ? -1 : 1;
+        return aTime - bTime;
+      }
+      return bTime - aTime;
+    });
+  }, [rows, statusFilter, search, startDate, endDate, sortBy]);
+
+  React.useEffect(() => { setMobilePage(1); }, [statusFilter, search, startDate, endDate, sortBy]);
+  const mobilePageSize = 8;
+  const mobileTotalPages = Math.max(1, Math.ceil(filteredRows.length / mobilePageSize));
+  const mobileRows = filteredRows.slice((mobilePage - 1) * mobilePageSize, mobilePage * mobilePageSize);
 
   const columns = [
-    { key: 'teacher', label: 'Teacher', render: (row) => row.teacher_name || '-' },
-    { key: 'date', label: 'Date', render: (row) => row.attendance_date || '-' },
-    { key: 'subject', label: 'Subject', render: (row) => <span className="font-semibold">{row.subject_code || '-'}</span> },
-    { key: 'schedule', label: 'Schedule', render: (row) => `${formatTimeAmPm(row.schedule_start_time)} - ${formatTimeAmPm(row.schedule_end_time)}` },
+    { key: 'teacher', label: 'Teacher', render: (row) => (
+      <div className="flex min-w-[170px] items-center gap-3">
+        <div className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-emerald-100 text-xs font-black text-emerald-700">{getInitials(row.teacher_name)}</div>
+        <div className="min-w-0"><div className="font-bold text-slate-800">{row.teacher_name || '-'}</div><UserStatusBadge status={row.teacher_user_status} className="mt-1" /><div className="truncate text-xs text-slate-500">Requested by {row.requested_by_name || '-'}</div></div>
+      </div>
+    ) },
+    { key: 'class', label: 'Class and Schedule', render: (row) => (
+      <div className="min-w-[190px]">
+        <div className="font-bold text-slate-800">{row.subject_code || '-'}{row.section_name ? ` / ${row.section_name}` : ''}</div>
+        <div className="mt-1 text-xs text-slate-500">{row.room_name || 'No room'} · {formatTimeAmPm(row.schedule_start_time)}–{formatTimeAmPm(row.schedule_end_time)}</div>
+      </div>
+    ) },
+    { key: 'date', label: 'Attendance Date', render: (row) => <span className="whitespace-nowrap font-semibold text-slate-700">{row.attendance_date || '-'}</span> },
     {
       key: 'current_status',
       label: 'Current Status',
@@ -245,14 +309,17 @@ export default function AttendanceEditRequestPage() {
     },
     {
       key: 'reason',
-      label: 'Teacher Reason',
+      label: 'Reason',
       render: (row) => (
         <div className="max-w-xs whitespace-normal break-words leading-snug">
           {row.reason || '-'}
         </div>
       )
     },
-    { key: 'requester', label: 'Requester', render: (row) => row.requested_by_name || '-' },
+    { key: 'submitted', label: 'Submitted', render: (row) => {
+      const waiting = getWaitingInfo(row);
+      return <div className="min-w-[145px]"><div className="text-xs font-semibold text-slate-700">{formatRequestDateTime(row.created_at)}</div><div className={`mt-1 text-[11px] font-bold ${waiting.tone === 'urgent' ? 'text-red-600' : waiting.tone === 'warning' ? 'text-amber-600' : 'text-slate-500'}`}>{waiting.label}</div></div>;
+    } },
     {
       key: 'status',
       label: 'Status',
@@ -265,52 +332,92 @@ export default function AttendanceEditRequestPage() {
     {
       key: 'actions',
       label: 'Actions',
-      actions: (row) => [{ label: 'View', onClick: () => openView(row) }]
+      actions: (row) => [{ label: 'View Request', onClick: () => openView(row) }]
     }
   ];
 
   return (
-    <div className="p-4 md:p-8">
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
-        <div>
-          <h2 className="text-2xl font-bold text-gray-800">Attendance Edit Requests</h2>
-          <p className="text-sm text-gray-500">Department review queue filtered by your department.</p>
+    <div className="min-h-screen bg-slate-50 p-3 sm:p-4 md:p-8">
+      <div className="mb-5 rounded-2xl bg-[#1D8551] px-5 py-5 text-white shadow-md md:px-7 md:py-6">
+        <div className="flex items-center">
+          <div className="flex min-w-0 items-start gap-4">
+            <div className="flex h-12 w-12 flex-none items-center justify-center rounded-2xl border border-white/20 bg-white/15">
+              <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l5 5v11a2 2 0 0 1-2 2Z" /></svg>
+            </div>
+            <div className="min-w-0">
+              <div className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-100">Attendance Governance</div>
+              <h2 className="mt-1 text-2xl font-black tracking-tight sm:text-3xl">Attendance Review Center</h2>
+              <p className="mt-2 max-w-2xl text-sm text-emerald-50/90">Review attendance correction requests from teachers in your department and keep every decision traceable.</p>
+            </div>
+          </div>
         </div>
-        <button
-          type="button"
-          onClick={load}
-          className="px-4 py-2 rounded-lg bg-[#1D8551] text-white text-sm font-semibold hover:bg-[#176b41] w-full md:w-auto"
-          disabled={loading}
-        >
-          {loading ? 'Refreshing...' : 'Refresh'}
-        </button>
       </div>
 
-      <div className="flex gap-2 mb-4">
-        {['pending', 'approved', 'rejected', 'all'].map((f) => (
-          <button
-            key={f}
-            type="button"
-            onClick={() => setStatusFilter(f)}
-            className={`px-3 py-1.5 rounded-lg border text-sm font-bold ${statusFilter === f ? 'bg-[#1D8551] text-white border-[#1D8551]' : 'bg-white text-gray-700 border-gray-300'}`}
-          >
-            {f === 'all' ? 'All' : f[0].toUpperCase() + f.slice(1)}
-          </button>
-        ))}
+      <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {[['pending', 'Pending Review', 'Requires a decision'], ['approved', 'Approved', 'Requests accepted'], ['rejected', 'Rejected', 'Requests declined'], ['all', 'Total Requests', 'All review activity']].map(([key, label, help]) => {
+          const selected = statusFilter === key;
+          const tone = key === 'pending' ? 'border-amber-200 bg-amber-50 text-amber-700' : key === 'approved' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : key === 'rejected' ? 'border-red-200 bg-red-50 text-red-700' : 'border-blue-200 bg-blue-50 text-blue-700';
+          return (
+            <button key={key} type="button" onClick={() => setStatusFilter(key)} aria-pressed={selected} className={`rounded-2xl border bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${selected ? 'border-emerald-500 ring-2 ring-emerald-100' : 'border-slate-200'}`}>
+              <div className={`mb-3 inline-flex h-9 min-w-9 items-center justify-center rounded-xl border px-2 text-xs font-black ${tone}`}>{key === 'pending' ? '!' : key === 'approved' ? '✓' : key === 'rejected' ? '×' : 'ALL'}</div>
+              <div className="text-2xl font-black text-slate-900">{requestCounts[key]}</div>
+              <div className="mt-1 text-xs font-extrabold uppercase tracking-wide text-slate-600">{label}</div>
+              <div className="mt-1 hidden text-xs text-slate-400 sm:block">{help}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mb-5 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-[minmax(240px,1fr)_170px_170px_190px_auto]">
+          <label className="relative col-span-2 lg:col-span-1">
+            <span className="sr-only">Search requests</span>
+            <svg className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" strokeWidth="2"/><path strokeLinecap="round" strokeWidth="2" d="m20 20-3.5-3.5"/></svg>
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search teacher, subject, section, room, or reason" className="h-11 w-full rounded-xl border border-slate-300 pl-10 pr-3 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          <label className="min-w-0 text-[10px] font-extrabold uppercase tracking-wide text-slate-500">From
+            <input type="date" value={startDate} max={endDate || undefined} onChange={(event) => setStartDate(event.target.value)} className="mt-1 h-11 w-full min-w-0 rounded-xl border border-slate-300 px-2 text-xs font-semibold normal-case text-slate-700 outline-none focus:border-emerald-500" />
+          </label>
+          <label className="min-w-0 text-[10px] font-extrabold uppercase tracking-wide text-slate-500">To
+            <input type="date" value={endDate} min={startDate || undefined} onChange={(event) => setEndDate(event.target.value)} className="mt-1 h-11 w-full min-w-0 rounded-xl border border-slate-300 px-2 text-xs font-semibold normal-case text-slate-700 outline-none focus:border-emerald-500" />
+          </label>
+          <label className="col-span-2 min-w-0 text-[10px] font-extrabold uppercase tracking-wide text-slate-500 lg:col-span-1">Sort
+            <select value={sortBy} onChange={(event) => setSortBy(event.target.value)} className="mt-1 h-11 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold normal-case text-slate-700 outline-none focus:border-emerald-500">
+              <option value="newest">Newest requests</option><option value="oldest">Oldest requests</option><option value="waiting">Waiting longest</option>
+            </select>
+          </label>
+          <button type="button" onClick={() => { setSearch(''); setStartDate(''); setEndDate(''); setSortBy('newest'); }} className="col-span-2 h-11 self-end rounded-xl border border-slate-300 px-4 text-sm font-bold text-slate-600 hover:bg-slate-50 lg:col-span-1">Clear</button>
+        </div>
       </div>
 
       {error ? (
         <div className="mb-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>
       ) : null}
 
-      <Table
-        columns={columns}
-        data={rows}
-        rowKey="request_id"
-        loading={loading}
-        emptyText={loading ? 'Loading...' : 'No attendance edit requests found.'}
-        pageSize={10}
-      />
+      <div className="hidden md:block">
+        <Table columns={columns} data={filteredRows} rowKey="request_id" loading={loading} emptyText={loading ? 'Loading...' : 'No requests match the selected review filters.'} pageSize={10} wrapCells rowClassName={(row) => { const waiting = getWaitingInfo(row); return waiting.tone === 'urgent' ? 'bg-red-50/30' : waiting.tone === 'warning' ? 'bg-amber-50/30' : ''; }} />
+      </div>
+
+      <div className="space-y-3 md:hidden">
+        {!loading && mobileRows.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-12 text-center"><div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-50 text-xl text-emerald-600">✓</div><div className="mt-3 font-bold text-slate-800">Review queue is clear</div><p className="mt-1 text-sm text-slate-500">No requests match the selected filters.</p></div>
+        ) : mobileRows.map((row) => {
+          const waiting = getWaitingInfo(row);
+          return (
+            <article key={row.request_id} className={`overflow-hidden rounded-2xl border bg-white shadow-sm ${waiting.tone === 'urgent' ? 'border-red-300' : waiting.tone === 'warning' ? 'border-amber-300' : 'border-slate-200'}`}>
+              <div className={`h-1 ${waiting.tone === 'urgent' ? 'bg-red-500' : waiting.tone === 'warning' ? 'bg-amber-400' : 'bg-emerald-500'}`} />
+              <div className="p-4">
+                <div className="flex items-start justify-between gap-3"><div className="flex min-w-0 items-center gap-3"><div className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-emerald-100 text-xs font-black text-emerald-700">{getInitials(row.teacher_name)}</div><div className="min-w-0"><div className="truncate font-bold text-slate-900">{row.teacher_name || '-'}</div><UserStatusBadge status={row.teacher_user_status} className="mt-1" /><div className="text-xs text-slate-500">{row.attendance_date || '-'}</div></div></div><span className={`flex-none rounded-full border px-2 py-1 text-[10px] font-black uppercase ${statusClass(row.status)}`}>{row.status || 'pending'}</span></div>
+                <div className="mt-4 rounded-xl bg-slate-50 p-3"><div className="font-bold text-slate-800">{row.subject_code || '-'}{row.section_name ? ` / ${row.section_name}` : ''}</div><div className="mt-1 text-xs text-slate-500">{row.room_name || 'No room'} · {formatTimeAmPm(row.schedule_start_time)}–{formatTimeAmPm(row.schedule_end_time)}</div></div>
+                <div className="mt-3 flex flex-wrap gap-1"><FlagBubble flagId={row.flag_in_id} flagName={row.flag_in_name} prefix="IN" /><FlagBubble flagId={row.flag_check_id} flagName={row.flag_check_name} prefix="MID" /><FlagBubble flagId={row.flag_out_id} flagName={row.flag_out_name} prefix="OUT" /></div>
+                <p className="mt-3 line-clamp-2 text-sm leading-relaxed text-slate-600">{row.reason || 'No reason provided.'}</p>
+                <div className="mt-4 flex items-center justify-between gap-3 border-t border-slate-100 pt-3"><div><div className="text-[10px] font-semibold text-slate-500">{formatRequestDateTime(row.created_at)}</div><div className={`text-[11px] font-bold ${waiting.tone === 'urgent' ? 'text-red-600' : waiting.tone === 'warning' ? 'text-amber-600' : 'text-slate-500'}`}>{waiting.label}</div></div><button type="button" onClick={() => openView(row)} className="rounded-lg bg-[#1D8551] px-3 py-2 text-xs font-bold text-white">View Request</button></div>
+              </div>
+            </article>
+          );
+        })}
+        {filteredRows.length > mobilePageSize ? <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-2"><button type="button" disabled={mobilePage <= 1} onClick={() => setMobilePage((page) => Math.max(1, page - 1))} className="rounded-lg border px-3 py-2 text-xs font-bold disabled:opacity-40">Previous</button><span className="text-xs font-semibold text-slate-500">Page {mobilePage} of {mobileTotalPages}</span><button type="button" disabled={mobilePage >= mobileTotalPages} onClick={() => setMobilePage((page) => Math.min(mobileTotalPages, page + 1))} className="rounded-lg border px-3 py-2 text-xs font-bold disabled:opacity-40">Next</button></div> : null}
+      </div>
 
       <Modal
         show={showViewModal}
@@ -327,7 +434,7 @@ export default function AttendanceEditRequestPage() {
             >
               Close
             </button>
-            {pendingInView ? (
+            {canDecideRequest(viewRow) && pendingInView ? (
               <>
                 <button
                   type="button"
@@ -339,11 +446,11 @@ export default function AttendanceEditRequestPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => decide(viewRow.request_id, 'approved', buildApprovalChanges())}
+                  onClick={() => decide(viewRow.request_id, 'approved')}
                   className="px-4 py-2 rounded-lg bg-[#1D8551] text-white text-sm font-semibold hover:bg-[#176b41] disabled:opacity-60"
                   disabled={actioningId === viewRow.request_id}
                 >
-                  {actioningId === viewRow.request_id ? 'Approving...' : 'Approve & Update Attendance'}
+                  {actioningId === viewRow.request_id ? 'Approving...' : 'Approve & Mark All Present'}
                 </button>
               </>
             ) : null}
@@ -359,6 +466,7 @@ export default function AttendanceEditRequestPage() {
                 <div>
                   <div className="text-xs uppercase tracking-wider text-[#1D8551] font-bold">Attendance Edit Request</div>
                   <div className="text-xl font-bold text-gray-900 mt-1">{viewRow.teacher_name || '-'}</div>
+                  <UserStatusBadge status={viewRow.teacher_user_status} className="mt-2" />
                   <div className="text-sm text-gray-600 mt-1">
                     {viewRow.subject_code || '-'}{viewRow.subject_name ? ` - ${viewRow.subject_name}` : ''} | {viewRow.section_name || '-'} | {viewRow.attendance_date || '-'}
                   </div>
@@ -371,6 +479,16 @@ export default function AttendanceEditRequestPage() {
                   <div className="text-xs text-gray-500 mt-2">Request #{viewRow.request_id || '-'}</div>
                 </div>
               </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              {[['Requested', true], ['Under Review', true], [String(viewRow.status || 'pending').toLowerCase() === 'pending' ? 'Decision' : String(viewRow.status || '').replace(/^./, (letter) => letter.toUpperCase()), !pendingInView]].map(([label, active], index) => (
+                <div key={`${label}-${index}`} className="relative text-center">
+                  {index < 2 ? <div className={`absolute left-1/2 top-3 h-0.5 w-full ${active || !pendingInView ? 'bg-emerald-300' : 'bg-slate-200'}`} aria-hidden="true" /> : null}
+                  <div className={`relative mx-auto flex h-6 w-6 items-center justify-center rounded-full border text-[10px] font-black ${active ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-300 bg-white text-slate-400'}`}>{active ? '✓' : index + 1}</div>
+                  <div className={`mt-2 text-[10px] font-extrabold uppercase tracking-wide ${active ? 'text-emerald-700' : 'text-slate-400'}`}>{label}</div>
+                </div>
+              ))}
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -414,63 +532,17 @@ export default function AttendanceEditRequestPage() {
               <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">{viewRow.reason || '-'}</div>
             </div>
 
-            {pendingInView ? (
+            {canDecideRequest(viewRow) && pendingInView ? (
               <div className="rounded-xl border border-[#b7e0c9] bg-[#e8f5ee]/60 p-4">
-                <div className="text-xs uppercase tracking-wide text-[#1D8551] font-semibold mb-3">Edit Flags Before Approve</div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-600 mb-1">IN Status</label>
-                    <select
-                      value={approvalForm.flag_in_id}
-                      onChange={(e) => setApprovalForm((prev) => ({ ...prev, flag_in_id: toFlagId(e.target.value, 1) }))}
-                      className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1D8551]/35"
-                    >
-                      {FLAG_OPTIONS.map((opt) => (
-                        <option key={`flag-in-${opt.id}`} value={opt.id}>{opt.name}</option>
-                      ))}
-                    </select>
-                    <div className="mt-2"><FlagBubble flagId={approvalForm.flag_in_id} /></div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-600 mb-1">MID Status</label>
-                    <select
-                      value={approvalForm.flag_check_id}
-                      onChange={(e) => setApprovalForm((prev) => ({ ...prev, flag_check_id: toFlagId(e.target.value, 1) }))}
-                      className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1D8551]/35"
-                    >
-                      {FLAG_OPTIONS.map((opt) => (
-                        <option key={`flag-mid-${opt.id}`} value={opt.id}>{opt.name}</option>
-                      ))}
-                    </select>
-                    <div className="mt-2"><FlagBubble flagId={approvalForm.flag_check_id} /></div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-600 mb-1">OUT Status</label>
-                    <select
-                      value={approvalForm.flag_out_id}
-                      onChange={(e) => setApprovalForm((prev) => ({ ...prev, flag_out_id: toFlagId(e.target.value, 1) }))}
-                      className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1D8551]/35"
-                    >
-                      {FLAG_OPTIONS.map((opt) => (
-                        <option key={`flag-out-${opt.id}`} value={opt.id}>{opt.name}</option>
-                      ))}
-                    </select>
-                    <div className="mt-2"><FlagBubble flagId={approvalForm.flag_out_id} /></div>
-                  </div>
+                <div className="text-xs uppercase tracking-wide text-[#1D8551] font-semibold mb-2">Approval Result</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <FlagBubble flagId={2} prefix="IN" />
+                  <FlagBubble flagId={2} prefix="MID" />
+                  <FlagBubble flagId={2} prefix="OUT" />
                 </div>
-
-                <div className="mt-3">
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">Message to Teacher (optional)</label>
-                  <textarea
-                    value={approvalForm.remarks}
-                    onChange={(e) => setApprovalForm((prev) => ({ ...prev, remarks: e.target.value }))}
-                    rows={3}
-                    className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1D8551]/35"
-                    placeholder="Add a note the teacher can see after approval"
-                  />
-                </div>
+                <p className="mt-3 text-sm text-gray-700">
+                  Approving this request automatically marks all three attendance checkpoints as Present. Statuses cannot be changed manually.
+                </p>
               </div>
             ) : null}
 

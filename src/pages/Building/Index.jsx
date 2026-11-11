@@ -1,8 +1,10 @@
 import React from 'react';
-import { apiGet, apiPost, apiPut } from '../../services/api.js';
+import { apiFetch, apiGet, apiPost, apiPut } from '../../services/api.js';
 import Table from "../../components/Table.jsx";
 import Modal from "../../components/Modal.jsx";
 import { useLiveGeolocation } from '../../utils/useLiveGeolocation.js';
+import useAutoRefresh, { AUTO_REFRESH_INTERVALS } from '../../utils/useAutoRefresh.js';
+import { MasterPageHeader, MasterStats, MasterToolbar, MasterSearch, MasterResults, MasterSelect } from '../../components/MasterDataPage.jsx';
 
 function BuildingIndex(){
   const [buildings, setBuildings] = React.useState([]);
@@ -10,9 +12,13 @@ function BuildingIndex(){
   const [showModal, setShowModal] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
   const [form, setForm] = React.useState({ building_name: '', school_id: '', latitude: '', longitude: '', radius: '' });
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState('');
   const [lastCoords, setLastCoords] = React.useState(null);
+  const [search, setSearch] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState('active');
+  const [modelFile, setModelFile] = React.useState(null);
+  const [modelInputKey, setModelInputKey] = React.useState(0);
 
   const runWithFallback = async (primary, fallback) => {
     try { return await primary(); } catch (err) {
@@ -21,48 +27,33 @@ function BuildingIndex(){
     }
   };
 
-  const loadData = React.useCallback(async () => {
+  const loadData = React.useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
     try{
       const [d, s] = await Promise.all([apiGet('buildings'), apiGet('school')]);
-      const list = Array.isArray(d) ? d.filter(x => String(x.status || '').toLowerCase() !== 'archive') : [];
-      setBuildings(list);
-      setSchools(Array.isArray(s) ? s.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
-    }catch(e){ console.error(e); setError('Failed to load buildings'); }
+      setBuildings(Array.isArray(d) ? d : []);
+      setSchools(Array.isArray(s) ? s.filter(x => String(x.status || '').toLowerCase() === 'active') : []);
+    }catch(e){ console.error(e); if (!silent) setError('Failed to load buildings'); }
+    finally { if (!silent) setLoading(false); }
   }, []);
 
   React.useEffect(() => {
     loadData();
   }, [loadData]);
 
-  React.useEffect(() => {
-    let timer = null;
-    let stopped = false;
-
-    const pollBuildings = async () => {
-      if (stopped) return;
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      await loadData();
-    };
-
-    // HTTPS polling interval (30s) for buildings updates
-    timer = setInterval(pollBuildings, 30000);
-
-    const onVisibility = () => { if (!stopped) pollBuildings(); };
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', onVisibility);
-    }
-
-    return () => {
-      stopped = true;
-      if (timer) clearInterval(timer);
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', onVisibility);
-      }
-    };
-  }, [loadData]);
+  useAutoRefresh({
+    refresh: () => loadData({ silent: true }),
+    intervalMs: AUTO_REFRESH_INTERVALS.ADMIN,
+    enabled: !showModal,
+  });
 
   const openModal = (b=null) => {
     setError('');
+    setModelFile(null);
+    setModelInputKey((value) => value + 1);
     if (b) {
       setEditing(b);
       setForm({ building_name: b.building_name || '', school_id: b.school_id || '', latitude: b.latitude ?? '', longitude: b.longitude ?? '', radius: b.radius ?? '' });
@@ -76,6 +67,8 @@ function BuildingIndex(){
     stopLiveGps();
     setLastCoords({ latitude: 0, longitude: 0 });
     setShowModal(false);
+    setModelFile(null);
+    setModelInputKey((value) => value + 1);
   };
   const handleChange = (e) => setForm(p=>({...p,[e.target.name]: e.target.value}));
 
@@ -145,11 +138,44 @@ function BuildingIndex(){
     return null;
   };
 
+  const handleModelFileChange = (event) => {
+    const file = event.target.files?.[0] || null;
+    if (!file) {
+      setModelFile(null);
+      return;
+    }
+    if (!String(file.name || '').toLowerCase().endsWith('.glb')) {
+      setError('Only binary .glb building models are allowed.');
+      event.target.value = '';
+      setModelFile(null);
+      return;
+    }
+    if (file.size <= 0 || file.size > 40 * 1024 * 1024) {
+      setError('The GLB must be larger than 0 bytes and no more than 40 MB.');
+      event.target.value = '';
+      setModelFile(null);
+      return;
+    }
+    setError('');
+    setModelFile(file);
+  };
+
+  const uploadBuildingModel = async (buildingId, file) => {
+    const payload = new FormData();
+    payload.append('model', file, file.name);
+    return apiFetch(`buildings/${buildingId}/model`, { method: 'POST', body: payload });
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
     const v = validateForm();
     if (v) { try { if (window.Swal) await window.Swal.fire({ icon:'warning', title:'Validation', text: v }); else alert(v); } catch(e){} setLoading(false); return; }
+
+    if (editing?.model_path && modelFile) {
+      const confirmation = window.Swal ? await window.Swal.fire({ title:'Replace Building Model?', text:`${modelFile.name} will replace the current model for ${editing.building_name || 'this building'} after the upload succeeds.`, icon:'warning', showCancelButton:true, confirmButtonText:'Replace Model', confirmButtonColor:'#dc2626' }) : { isConfirmed:confirm('Replace the current building model?') };
+      if (!confirmation.isConfirmed) { setLoading(false); return; }
+    }
 
     try{
       const payload = {
@@ -159,17 +185,38 @@ function BuildingIndex(){
         longitude: form.longitude !== '' ? Number(form.longitude) : null,
         radius: form.radius !== '' ? Number(form.radius) : 0
       };
+      let savedBuildingId = editing?.building_id || null;
       if (editing && editing.building_id) {
         await runWithFallback(
           () => apiPut(`buildings/${editing.building_id}`, payload),
           () => apiPost(`buildings/${editing.building_id}/update`, payload)
         );
       } else {
-        await apiPost('buildings', payload);
+        const created = await apiPost('buildings', payload);
+        savedBuildingId = created?.building_id || null;
+      }
+
+      if (modelFile) {
+        if (!savedBuildingId) throw new Error('The building was saved, but its ID was not returned for the GLB upload.');
+        try {
+          await uploadBuildingModel(savedBuildingId, modelFile);
+        } catch (modelError) {
+          const refreshed = await apiGet('buildings').catch(() => buildings);
+          const refreshedBuildings = Array.isArray(refreshed) ? refreshed : buildings;
+          setBuildings(refreshedBuildings);
+          const savedBuilding = refreshedBuildings.find((building) => String(building.building_id) === String(savedBuildingId));
+          if (savedBuilding) setEditing(savedBuilding);
+          const modelMessage = modelError?.body?.message || modelError?.message || 'Unable to upload the GLB.';
+          const partialMessage = `The building details were saved, but the GLB upload failed: ${modelMessage}`;
+          setError(partialMessage);
+          if (window.Swal) await window.Swal.fire({ icon: 'warning', title: 'Building Saved Without GLB', text: partialMessage });
+          else alert(partialMessage);
+          return;
+        }
       }
 
       const d = await apiGet('buildings');
-      setBuildings(Array.isArray(d) ? d.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      setBuildings(Array.isArray(d) ? d : []);
       closeModal();
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: editing ? 'Building updated' : 'Building added', timer: 1400, showConfirmButton: false }); } catch(e){}
     } catch (err) {
@@ -183,13 +230,16 @@ function BuildingIndex(){
   const handleToggle = async (b) => {
     if (!b || !b.building_id) return;
     const newStatus = String(b.status) === 'active' ? 'inactive' : 'active';
+    const action = newStatus === 'active' ? 'Activate' : 'Deactivate';
+    const answer = window.Swal ? await window.Swal.fire({ title: `${action} building?`, text: `${b.building_name || 'This building'} will be ${newStatus}.`, icon: 'question', showCancelButton: true, confirmButtonText: action }) : { isConfirmed: confirm(`${action} this building?`) };
+    if (!answer.isConfirmed) return;
     try{
       await runWithFallback(
         () => apiPut(`buildings/${b.building_id}`, { status: newStatus }),
         () => apiPost(`buildings/${b.building_id}/update`, { status: newStatus })
       );
       const d = await apiGet('buildings');
-      setBuildings(Array.isArray(d)? d.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      setBuildings(Array.isArray(d) ? d : []);
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Status updated', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) {
       console.error(err);
@@ -207,11 +257,30 @@ function BuildingIndex(){
         () => apiPost(`buildings/${b.building_id}/update`, { status: 'archive' })
       );
       const d = await apiGet('buildings');
-      setBuildings(Array.isArray(d)? d.filter(x => String(x.status || '').toLowerCase() !== 'archive') : []);
+      setBuildings(Array.isArray(d) ? d : []);
       try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Archived', timer:1200, showConfirmButton:false }); } catch(e){}
     } catch (err) {
       console.error(err);
-      try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to archive' }); else alert(err.body?.error || err.message || 'Failed to archive'); } catch(e){}
+      const message = err.body?.message || err.body?.error || err.message || 'Failed to archive';
+      try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Cannot archive building', text: message }); else alert(message); } catch(e){}
+    }
+  };
+
+  const handleUnarchive = async (b) => {
+    if (!b || !b.building_id) return;
+    try{
+      const res = window.Swal ? await window.Swal.fire({ title: 'Restore building?', text: 'The building will be restored as inactive for review.', icon: 'question', showCancelButton: true }) : { isConfirmed: confirm('Restore building as inactive?') };
+      if (!res.isConfirmed) return;
+      await runWithFallback(
+        () => apiPut(`buildings/${b.building_id}`, { status: 'inactive' }),
+        () => apiPost(`buildings/${b.building_id}/update`, { status: 'inactive' })
+      );
+      const d = await apiGet('buildings');
+      setBuildings(Array.isArray(d) ? d : []);
+      try { if (window.Swal) await window.Swal.fire({ icon:'success', title: 'Building restored as inactive', timer:1200, showConfirmButton:false }); } catch(e){}
+    } catch (err) {
+      console.error(err);
+      try { if (window.Swal) await window.Swal.fire({ icon:'error', title:'Error', text: err.body?.error || err.message || 'Failed to unarchive' }); else alert(err.body?.error || err.message || 'Failed to unarchive'); } catch(e){}
     }
   };
 
@@ -222,27 +291,37 @@ function BuildingIndex(){
     { key: 'latitude', label: 'Latitude' },
     { key: 'longitude', label: 'Longitude' },
     { key: 'radius', label: 'Radius (m)' },
+    { key: 'model_filename', label: '3D Model', render: (r) => r.model_path
+      ? <span className="text-green-700 font-medium">{r.model_filename || 'GLB available'}</span>
+      : <span className="text-gray-500">No GLB</span> },
     { key: 'status', label: 'Status', render: (r) => {
       const s = (r.status || '').toLowerCase();
       const cls = s === 'active' ? 'bg-success' : (s === 'inactive' ? 'bg-danger' : 'bg-secondary');
-      const text = s === 'active' ? 'Active' : (s === 'inactive' ? 'Inactive' : (r.status || 'N/A'));
-      return (<span className={`badge ${cls}`}>{text}</span>);
+      const text = s === 'active' ? 'Active' : (s === 'inactive' ? 'Inactive' : 'Archived');
+      return (<span className={`mdp-status mdp-status-${s}`}>{text}</span>);
     }},
-    { key: 'actions', label: 'Actions', actions: [
-      { label: 'Edit', onClick: (row) => openModal(row) },
-      { label: 'Toggle', onClick: (row) => handleToggle(row) },
-      { label: 'Archive', variant: 'danger', onClick: (row) => handleArchive(row) }
-    ] }
+    { key: 'actions', label: 'Actions', actions: (row) => String(row.status || '').toLowerCase() === 'archive'
+      ? [{ label: 'Unarchive', variant: 'success', onClick: () => handleUnarchive(row) }]
+      : [
+          { label: 'Edit', onClick: () => openModal(row) },
+          { label: 'Toggle', onClick: () => handleToggle(row) },
+          { label: 'Archive', variant: 'danger', onClick: () => handleArchive(row) }
+        ] }
   ];
 
+  const filteredBuildings = buildings.filter((building) => {
+    const query = search.trim().toLowerCase();
+    const buildingStatus = String(building.status || '').toLowerCase();
+    const matchesStatus = buildingStatus === statusFilter;
+    return (!query || `${building.building_name || ''} ${building.school_name || ''}`.toLowerCase().includes(query)) && matchesStatus;
+  });
+  const buildingStatusCount = (status) => buildings.filter((item) => String(item.status || '').toLowerCase() === status).length;
+
   return (
-    <div className="p-6">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-semibold">Buildings</h2>
-        <div className="flex gap-2">
-          <button className="btn btn-success" onClick={()=>openModal()}>Add Building</button>
-        </div>
-      </div>
+    <div className="mdp-page">
+      <MasterPageHeader title="Buildings" description="Manage campus buildings and GPS boundaries used for attendance validation." action={<button className="mdp-primary" onClick={()=>openModal()}>+ Add Building</button>} />
+      <MasterStats loading={loading} items={[{ label: 'Active', value: buildingStatusCount('active'), help: 'Available for use', icon: '\u2713', active: statusFilter === 'active', onClick: () => setStatusFilter('active') }, { label: 'Inactive', value: buildingStatusCount('inactive'), help: 'Currently unavailable', icon: 'I', tone: 'red', active: statusFilter === 'inactive', onClick: () => setStatusFilter('inactive') }, { label: 'Archived', value: buildingStatusCount('archive'), help: 'Available for restoration', icon: 'A', active: statusFilter === 'archive', onClick: () => setStatusFilter('archive') }]} />
+      <MasterToolbar><MasterSearch value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search building or school..." /><MasterSelect label="Status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="active">Active</option><option value="inactive">Inactive</option><option value="archive">Archived</option></MasterSelect></MasterToolbar>
 
       {error && <div className="mb-3 text-red-600">{error}</div>}
       {lastCoords && (
@@ -251,7 +330,7 @@ function BuildingIndex(){
         </div>
       )}
 
-      <Table columns={columns} data={buildings} pageSize={10} />
+      <MasterResults title="Building Directory" count={filteredBuildings.length} loading={loading} description="School placement and configured attendance boundaries."><Table columns={columns} data={filteredBuildings} loading={loading} pageSize={10} /></MasterResults>
 
       <Modal show={showModal} title={editing ? 'Edit Building' : 'Add Building'} onClose={closeModal} size="md">
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -266,6 +345,32 @@ function BuildingIndex(){
               <option value="">Select school (optional)</option>
               {schools.map(s => <option key={s.school_id} value={s.school_id}>{s.school_name}</option>)}
             </select>
+          </div>
+
+          <div className="rounded border border-gray-200 bg-gray-50 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium text-gray-700">3D Building Model</div>
+                <div className="text-xs text-gray-500">Optional GLB file, maximum 40 MB.</div>
+              </div>
+              <label className="cursor-pointer rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700">
+                {editing?.model_path ? 'Change GLB Building' : 'Add GLB Building'}
+                <input
+                  key={modelInputKey}
+                  type="file"
+                  accept=".glb,model/gltf-binary"
+                  className="hidden"
+                  onChange={handleModelFileChange}
+                />
+              </label>
+            </div>
+            <div className="text-sm text-gray-700">
+              {modelFile
+                ? `Selected: ${modelFile.name}`
+                : editing?.model_path
+                  ? `Current: ${editing.model_filename || editing.model_path}`
+                  : 'No GLB selected.'}
+            </div>
           </div>
 
           {/* location_description removed: backend handles optional description columns automatically */}
